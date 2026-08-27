@@ -51,6 +51,9 @@ class Plugin:
     ``self.bot`` to the current :class:`~protobot.Bot` before binding handlers
     and resets it to ``None`` after unbinding -- handlers and tasks must re-read
     ``self.bot`` each use, because reconnects replace the bot object.
+    ``self.manager`` points at the owning :class:`PluginManager` while the
+    plugin is enabled (set before ``on_enable``, cleared after ``on_disable``),
+    so plugins can list, toggle, or hot-load other plugins.
 
     Lifecycle: ``on_enable``/``on_disable`` run once per process (hot-reloaded
     plugins get a fresh instance, so their hooks run again); ``on_bot_ready``
@@ -65,6 +68,7 @@ class Plugin:
     def __init__(self) -> None:
         self.bot: Bot | None = None
         self.session: BotSession | None = None
+        self.manager: PluginManager | None = None
         self._subscriptions: list[tuple[str, EventHandler]] = []
         self._session_subscriptions: list[tuple[str, EventHandler]] = []
 
@@ -477,7 +481,7 @@ class PluginManager:
                     changed = True
         for closing in to_close:
             self._plugins.pop(closing, None)
-            self._sources.pop(closing, None)
+            # 来源记录保留在 _sources：set_enabled(True) 需要它来重新加载。
             for names in self._files.values():
                 if closing in names:
                     names.remove(closing)
@@ -494,11 +498,29 @@ class PluginManager:
                 closed.append(name)
         return closed
 
+    async def set_enabled(self, name: str, enabled: bool) -> Plugin | None:
+        """Runtime enable/disable toggle (used by plugins such as llm_agent).
+
+        Enabling re-loads the plugin from its recorded source file (a previous
+        ``hot_close`` keeps the source in ``_sources``); disabling goes through
+        :meth:`hot_close`, so plugins depending on it close too.  Returns the
+        target plugin, or ``None`` if no plugin had that name; a failed load
+        raises :class:`PluginError` and leaves the manager unchanged.
+        """
+        if enabled:
+            source = self._sources.get(name)
+            if source is None:
+                return None
+            await self.hot_load_file(source)
+            return self._plugins.get(name)
+        return await self.hot_close(name)
+
     # ---- internals ----
 
     async def _enable_one(self, plugin: Plugin) -> None:
         plugin.bot = self._current_bot
         plugin.session = self._current_session
+        plugin.manager = self  # 先于 on_enable：钩子里可操作管理器
         if self._current_bot is not None:
             plugin._bind(self._current_bot)
         if self._current_session is not None:
@@ -513,6 +535,7 @@ class PluginManager:
             plugin._unbind_session(self._current_session)
         plugin.bot = None
         plugin.session = None
+        plugin.manager = None
 
     async def _apply_order(self, new_order: list[Plugin]) -> None:
         """Reconcile the running set with a recomputed order.

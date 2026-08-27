@@ -317,6 +317,47 @@ class AutoReply(Plugin):
 - **配置开关**：`[plugins] disabled = ["auto_reply"]` 可禁用插件，依赖
   被禁用插件的插件会被一并禁用并提示。
 
+### LLM 智能体插件（llm_agent）
+
+`plugins/llm_agent.py` 把机器人变成游戏内 LLM 智能体（类 Hermes Agent）：
+维护 **agent 对话上下文**，通过 `read_chat` 工具查询最近 **200 条聊天记录**
+（可按玩家/关键词/系统广播过滤），并用 OpenAI 兼容的 function calling 执行
+动作——发消息、执行命令、行走/寻路、查看状态、开关插件、编写新插件，以及
+维护**按服务器分开的 Markdown 记忆**（`MEMORY.md`，可多文件）并自主更新。
+
+**首次运行**会自动生成 `plugins/llm_agent.json`——填好端点与密钥后保存一次
+`llm_agent.py` 触发热重载即可：
+
+```json
+{
+  "llm": {
+    "base_url": "https://api.openai.com/v1",   // 任意 OpenAI 兼容端点
+    "api_key": "sk-...",
+    "model": "gpt-4o-mini"
+  },
+  "reply": {
+    "all": false,               // true = 回应每条聊天
+    "name_mention": true,       // 聊天包含自己名字时回应
+    "prefix": "hey,claude",     // 特殊前缀（留空 "" 表示不使用）
+    "keywords": ["claude"]      // 额外关键词触发（忽略大小写）
+  },
+  "admins": ["你的名字"],       // 只有管理员能写插件/开关插件（[] = 不限制）
+  "system_prompt": "...",       // 可选，覆盖内置提示词
+  "history_limit": 200,         // read_chat 保留的聊天条数
+  "context_limit": 40,          // agent 对话上下文保留的消息条数
+  "memory_dir": "llm_agent_memory",
+  "generated_dir": "../plugins_llm"
+}
+```
+
+- **记忆**按服务器存放在 `llm_agent_memory/<host>_<port>/MEMORY.md`，智能体
+  通过 `read_memory` / `save_memory` / `write_memory` / `clear_memory` 自主
+  维护，每次对话都会带上。
+- **管理工具**（`write_plugin`、`set_plugin`）仅限 `admins` 名单；生成的插件
+  写入独立的 `plugins_llm/` 目录（与手工 `plugins/` 分开），重启后自动恢复。
+- `llm_agent.json`、记忆目录与 `plugins_llm/` 已加入 .gitignore——设置文件
+  含 api_key，切勿提交到版本库。
+
 ### 全屏 TUI 界面（可选）
 
 `protobot run` 支持 Claude Code 风格的全屏界面：上方滚动日志区（会话与
@@ -387,7 +428,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `tui.py` | Textual 全屏 TUI（可选 `tui` extra）与普通日志降级 |
 | `data/` | 内置各版本方块状态表 |
 | `cli.py` | 诊断控制台命令 |
-| `plugins/` | 示例插件（chat_logger、auto_reply） |
+| `plugins/` | 示例插件（chat_logger、auto_reply、llm_agent） |
 | `config.yaml` | 本地配置文件（首次启动向导生成，不入库） |
 
 ## 开发

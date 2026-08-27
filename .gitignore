@@ -13,4 +13,9 @@ config.yaml
 protobot-live.log
 .claude/settings.local.json
 
+# LLM 智能体插件数据（llm_agent.json 含 api_key，切勿提交）
+plugins/llm_agent.json
+plugins/llm_agent_memory/
+plugins_llm/
+
 /run/

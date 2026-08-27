@@ -134,6 +134,12 @@ mod-loader events; ordinary plugins do not need them.
 - State: `bot.player` (PlayerState: x/y/z, health, yaw/pitch), `bot.world`
   (chunks), `bot.entities`, `bot.containers`, `bot.session`, `bot.username`,
   `bot.uuid`, `bot.closed` (asyncio.Event), `bot.disconnect_reason`
+- Manager: `self.manager` (PluginManager, bound while the plugin is enabled):
+  `load_order()`, `plugins` (name → Plugin), `source_of(name)`,
+  `set_enabled(name, bool)` (runtime toggle; disables dependents too, keeps
+  the source so it can be re-enabled), `hot_load_file(path)`,
+  `hot_reload_file(path)`, `hot_close(name)` — a plugin can list, toggle, or
+  hot-load other plugins (see plugins/llm_agent.py for a full example)
 - Text: `from protobot.text import plain_text` (str/dict/list component →
   plain text; handles translate+fallback and the empty-key `{'': '123'}`
   server-plugin quirk)
