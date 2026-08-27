@@ -30,6 +30,8 @@ class PlayPacketIds:
     clientbound_move_entity_rot: int
     clientbound_ping: int
     clientbound_player_abilities: int
+    clientbound_player_chat: int
+    clientbound_profileless_chat: int
     clientbound_position: int
     clientbound_respawn: int
     clientbound_section_blocks_update: int
@@ -147,6 +149,7 @@ _PLAY_774 = PlayPacketIds(
     clientbound_container_set_content=0x12,
     clientbound_container_set_slot=0x14,
     clientbound_open_screen=0x39,
+    clientbound_profileless_chat=0x21,
     clientbound_remove_mob_effect=0x4C,
     clientbound_remove_entities=0x4B,
     clientbound_block_update=0x08,
@@ -162,6 +165,7 @@ _PLAY_774 = PlayPacketIds(
     clientbound_move_entity_rot=0x36,
     clientbound_ping=0x3B,
     clientbound_player_abilities=0x3E,
+    clientbound_player_chat=0x3F,
     clientbound_position=0x46,
     clientbound_respawn=0x50,
     clientbound_section_blocks_update=0x52,
@@ -207,6 +211,7 @@ _PLAY_775_776 = PlayPacketIds(
     clientbound_container_set_content=0x12,
     clientbound_container_set_slot=0x14,
     clientbound_open_screen=0x3B,
+    clientbound_profileless_chat=0x21,
     clientbound_remove_mob_effect=0x4E,
     clientbound_remove_entities=0x4D,
     clientbound_block_update=0x08,
@@ -222,6 +227,7 @@ _PLAY_775_776 = PlayPacketIds(
     clientbound_move_entity_rot=0x38,
     clientbound_ping=0x3D,
     clientbound_player_abilities=0x40,
+    clientbound_player_chat=0x41,
     clientbound_position=0x48,
     clientbound_respawn=0x52,
     clientbound_section_blocks_update=0x54,

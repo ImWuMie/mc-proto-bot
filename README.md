@@ -87,6 +87,13 @@ async def main():
     async def on_chat(component, overlay):
         print("chat:", component)
 
+    # Player messages arrive separately from server broadcasts: signed messages
+    # via the player-chat packet, unsigned ones via the profileless packet.
+    # Both are decoded and emitted here.
+    @bot.on("player_chat")
+    async def on_player_chat(sender_uuid, name, message, chat_type_id, target_name):
+        print("player:", name, "says", message)
+
     @bot.on("close")
     async def on_close(reason):
         print("disconnected:", reason)

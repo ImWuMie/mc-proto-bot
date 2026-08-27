@@ -118,6 +118,20 @@ _INTERACTION_HANDS = {"main_hand": 0, "mainhand": 0, "off_hand": 1, "offhand": 1
 _CLIENTBOUND_CONFIGURATION_TRANSFER = 0x0B
 DEFAULT_MINECRAFT_PORT = 25565
 
+
+def _parse_chat_text(text: str) -> object:
+    """Decode a chat message body, falling back to the raw string.
+
+    The protocol carries message bodies as JSON text components, but lenient
+    servers occasionally send plain text instead.
+    """
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
 class _UnsupportedItemComponents(Exception):
     pass
 
@@ -1450,6 +1464,10 @@ class Bot:
             value = reader.read_int()
             reader.expect_end()
             await self.send_raw(ids.serverbound_pong, PacketWriter().write_int(value).to_bytes())
+        elif packet.packet_id == ids.clientbound_player_chat:
+            await self._handle_player_chat(packet.payload)
+        elif packet.packet_id == ids.clientbound_profileless_chat:
+            await self._handle_profileless_chat(packet.payload)
         elif packet.packet_id == ids.clientbound_position:
             await self._handle_position(packet.payload)
         elif packet.packet_id == ids.clientbound_remove_mob_effect:
@@ -1522,6 +1540,84 @@ class Bot:
         overlay = reader.read_bool()
         reader.expect_end()
         await self.events.emit("system_chat", component, overlay)
+
+    def _read_chat_type_holder(self, reader: PacketReader) -> int | None:
+        """Read a ChatType holder: a registry id, or an inline custom type.
+
+        Returns the registry id, or ``None`` when the server inlined a custom
+        chat type (holder value 0); the inline definition is validated and
+        skipped, since decoration is left to the caller.
+        """
+
+        value = reader.read_varint()
+        if value != 0:
+            return value - 1
+        reader.read_string(max_chars=32767)  # translation key
+        parameter_count = reader.read_varint()
+        if parameter_count < 0 or parameter_count > 16:
+            raise ProtocolError(f"invalid chat type parameter count {parameter_count}")
+        for _ in range(parameter_count):
+            reader.read_varint()
+        read_anonymous_nbt(reader)  # style
+        return None
+
+    async def _handle_player_chat(self, payload: bytes) -> None:
+        """Decode a signed player chat message and emit ``player_chat``.
+
+        Layout per the 1.21.5+ protocol (verified against MCProtocolLib for
+        protocol 776): global index, sender, index, optional signature, the
+        message body, timestamp, salt, last-seen signatures, optional unsigned
+        content, a filter mask, a ChatType holder, then the name and optional
+        target name components.
+        """
+
+        reader = PacketReader(payload)
+        reader.read_varint()  # global index
+        sender = reader.read_uuid()
+        reader.read_varint()  # per-sender index
+        if reader.read_bool():
+            reader.read_raw(256)  # message signature
+        content = reader.read_string(max_chars=256)
+        reader.read_long()  # timestamp
+        reader.read_long()  # salt
+        seen_count = reader.read_varint()
+        if seen_count < 0 or seen_count > 20:
+            raise ProtocolError(f"invalid last-seen message count {seen_count}")
+        for _ in range(seen_count):
+            if reader.read_varint() == 0:
+                reader.read_raw(256)  # previous message signature
+        unsigned_content = None
+        if reader.read_bool():
+            unsigned_content = read_anonymous_nbt(reader)
+        filter_mask = reader.read_varint()
+        if filter_mask == 2:
+            mask_count = reader.read_varint()
+            if mask_count < 0 or mask_count > 1024:
+                raise ProtocolError(f"invalid chat filter mask length {mask_count}")
+            for _ in range(mask_count):
+                reader.read_long()
+        chat_type_id = self._read_chat_type_holder(reader)
+        name = read_anonymous_nbt(reader)
+        target_name = read_anonymous_nbt(reader) if reader.read_bool() else None
+        reader.expect_end()
+
+        message = unsigned_content if unsigned_content is not None else _parse_chat_text(content)
+        await self.events.emit("player_chat", sender, name, message, chat_type_id, target_name)
+
+    async def _handle_profileless_chat(self, payload: bytes) -> None:
+        """Decode a profileless (unsigned) chat message and emit ``player_chat``.
+
+        Servers that do not enforce chat signing broadcast this packet instead
+        of the signed variant; the sender uuid is therefore ``None``.
+        """
+
+        reader = PacketReader(payload)
+        message = read_anonymous_nbt(reader)
+        chat_type_id = self._read_chat_type_holder(reader)
+        name = read_anonymous_nbt(reader)
+        target_name = read_anonymous_nbt(reader) if reader.read_bool() else None
+        reader.expect_end()
+        await self.events.emit("player_chat", None, name, message, chat_type_id, target_name)
 
     async def _handle_game_event(self, payload: bytes) -> None:
         reader = PacketReader(payload)

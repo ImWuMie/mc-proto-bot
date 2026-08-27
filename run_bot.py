@@ -28,6 +28,26 @@ OFFLINE_USERNAME = "ProtoBot"
 CACHE_FILE = Path(__file__).parent / "auth_cache.json"
 
 
+def _plain_text(component) -> str:
+    """Extract readable text from a decoded chat component (str/dict/list)."""
+
+    if isinstance(component, str):
+        return component
+    if isinstance(component, list):
+        return "".join(_plain_text(item) for item in component)
+    if isinstance(component, dict):
+        parts: list[str] = []
+        if "text" in component:
+            parts.append(str(component["text"]))
+        if "translate" in component:
+            parts.append(str(component["translate"]))
+        for key in ("with", "extra"):
+            if key in component:
+                parts.append(_plain_text(component[key]))
+        return "".join(parts)
+    return str(component)
+
+
 def _save_profile(profile: MinecraftProfile, refresh_options: dict) -> None:
     CACHE_FILE.write_text(
         json.dumps(
@@ -144,7 +164,11 @@ async def main() -> None:
     # 注册事件监听器
     @bot.on("system_chat")
     async def on_system_chat(comp, overlay):
-        print(f"[聊天/系统] {comp}")
+        print(f"[聊天/系统] {_plain_text(comp)}")
+
+    @bot.on("player_chat")
+    async def on_player_chat(sender_uuid, name, message, chat_type_id, target_name):
+        print(f"[聊天] {_plain_text(name)}: {_plain_text(message)}")
 
     @bot.on("close")
     async def on_close(reason):

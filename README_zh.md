@@ -87,6 +87,12 @@ async def main():
     async def on_chat(component, overlay):
         print("聊天:", component)
 
+    # 玩家消息与服务器广播走不同的数据包：签名消息走 player_chat 包，
+    # 未签名消息走 profileless 包。两者都会被解码并从这里发出。
+    @bot.on("player_chat")
+    async def on_player_chat(sender_uuid, name, message, chat_type_id, target_name):
+        print("玩家:", name, "说", message)
+
     @bot.on("close")
     async def on_close(reason):
         print("断开连接:", reason)
