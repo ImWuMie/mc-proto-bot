@@ -220,7 +220,7 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
         try:
             async with app.run_test():
                 app._refresh_status()
-            self.assertEqual(app.status_texts["bot"], "FakeBot")
+            self.assertIn("FakeBot", app.status_texts["bot"])
             self.assertIn("X=10.5", app.status_texts["pos"])
             self.assertIn("Z=-20.2", app.status_texts["pos"])
             server = app.status_texts["server"]
@@ -239,7 +239,9 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
                 app._refresh_status()
             self.assertIn("未启动", app.status_texts["bot"])
             self.assertEqual(app.status_texts["pos"], "")
-            self.assertIn("时长 00:01:05", app.status_texts["server"])
+            server = app.status_texts["server"]
+            self.assertIn("时长 00:01:05", server)
+            self.assertIn("ctrl+c 退出", server)
         finally:
             task.cancel()
 
@@ -250,7 +252,7 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
         try:
             async with app.run_test():
                 app._refresh_status()
-            self.assertEqual(app.status_texts["bot"], "连接中...")
+            self.assertIn("连接中", app.status_texts["bot"])
         finally:
             task.cancel()
 
@@ -364,7 +366,7 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
             async with app.run_test() as pilot:
                 await pilot.press(".", "h", "e", "l", "p", "enter")
                 await wait_until(
-                    lambda: any(".quit" in line for line in app.log_lines)
+                    lambda: any(".run" in line for line in app.log_lines)
                 )
             for name in DOT_COMMANDS:
                 self.assertTrue(
@@ -387,11 +389,13 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel()
 
-    async def test_dot_quit_exits_the_app(self) -> None:
+    async def test_ctrl_c_exits_the_app(self) -> None:
+        # The app binds Ctrl+C to quit with priority (Textual 8 removed the
+        # default Ctrl+C-quit and binds it to copy in inputs).
         app, task = self._make_app(FakeSession(bot=None))
         try:
             async with app.run_test() as pilot:
-                await pilot.press(".", "q", "u", "i", "t", "enter")
+                await pilot.press("ctrl+c")
                 await wait_until(lambda: app.is_running is False)
         finally:
             task.cancel()

@@ -361,10 +361,9 @@ while typing `.`:
 | `.stop` | stops the bot (keeps the UI) |
 | `.plugins` | lists loaded plugins |
 | `.help` | shows available commands |
-| `.quit` | exits the UI |
 
 - **Real terminals** (Windows Terminal, VS Code terminal, macOS, Linux) get
-  the full-screen UI; Ctrl+C or `.quit` exits.
+  the full-screen UI; **Ctrl+C exits**.
 - **PyCharm consoles, pipes, and CI** fall back to plain line logging
   automatically (the bot then auto-starts as before, no `.run` needed); a
   missing extra prints a one-time hint and falls back too.

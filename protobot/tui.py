@@ -1,11 +1,11 @@
 """Textual TUI for ``protobot run`` (optional ``tui`` extra).
 
 Claude-Code-style layout: the log area fills the top, a bottom input row, and
-a three-column status bar (bot name / position / server info plus uptime) at
-the very bottom.  The input sends chat messages, ``/``-prefixed server
-commands, and dot-prefixed UI commands (``.run`` starts the bot, ``.stop``
-stops it, ``.plugins``, ``.help``, ``.quit``) with a live suggestion dropdown
-while typing.
+a Claude-Code-style status bar at the very bottom (state glyph on the left,
+position in the middle, ``·``-separated hints and server info on the right).
+The input sends chat messages, ``/``-prefixed server commands, and dot-prefixed
+UI commands (``.run`` starts the bot, ``.stop`` stops it, ``.plugins``,
+``.help``) with a live suggestion dropdown while typing; Ctrl+C exits.
 
 The module imports Textual lazily so the plain-log fallback keeps working
 without the extra installed: :func:`tui_enabled` decides, and
@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 
 try:
     from textual.app import App, ComposeResult
+    from textual.binding import Binding
     from textual.containers import Horizontal, Vertical
     from textual.css.query import NoMatches
     from textual.suggester import Suggester
@@ -38,12 +39,12 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 __all__ = ["ProtoBotApp", "StdoutProxy", "classify_submission", "tui_enabled"]
 
 #: Dot commands offered by the TUI input, with their help text.
+#: Exiting is Ctrl+C (Textual's built-in system binding), not a dot command.
 DOT_COMMANDS: dict[str, str] = {
     ".run": "启动 bot（连接服务器并开始运行）",
     ".stop": "停止 bot（保持界面）",
     ".plugins": "列出已加载插件",
     ".help": "显示可用命令",
-    ".quit": "退出界面",
 }
 
 
@@ -157,6 +158,13 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         teardown in cli_app can stop and await it.
         """
 
+        # Textual 8 no longer quits on Ctrl+C (it shows a hint and binds
+        # Ctrl+C to copy in inputs); the user wants Ctrl+C to exit, so bind it
+        # explicitly with priority over the Input's copy binding.
+        BINDINGS = [
+            Binding("ctrl+c", "quit", "退出", show=False, priority=True),
+        ]
+
         CSS = """
         Screen {
             background: #121212;
@@ -168,13 +176,22 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         }
         #statusbar {
             height: 1;
-            background: #1e1e2e;
-            color: #a6adc8;
+            border-top: solid #2b2b2b;
+            color: #6c7086;   /* muted, Claude-Code style */
         }
         #bot, #pos, #server {
             width: 1fr;
             height: 1;
-            padding: 0 1;
+            padding: 0;
+        }
+        #bot {
+            content-align: left middle;
+        }
+        #pos {
+            content-align: center middle;
+        }
+        #server {
+            content-align: right middle;
         }
         #cmd {
             border: none;
@@ -245,7 +262,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self.set_interval(1.0, self._drain_logs)
             self.set_interval(1.0, self._refresh_status)
             self._refresh_status()
-            self._log_write("[提示] 输入 .run 启动 bot，.help 查看可用命令。")
+            self._log_write("[提示] 输入 .run 启动 bot，.help 查看可用命令，Ctrl+C 退出。")
 
         # ---- session events (footer state) ----
 
@@ -295,12 +312,14 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             config = session.config
             bot = session.bot
 
+            # Claude-Code-style single line: a state glyph, ``·``-separated
+            # items, muted hints on the right.
             if not self.started:
-                bot_name = "未启动（输入 .run）"
+                bot_name = "⏸ 未启动"
             elif bot is not None:
-                bot_name = bot.username
+                bot_name = f"⏵ {bot.username}"
             else:
-                bot_name = "连接中..."
+                bot_name = "… 连接中"
             self.status_texts["bot"] = bot_name
             self.query_one("#bot", Static).update(bot_name)
 
@@ -323,6 +342,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                     f"{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
                 )
             server_text = (
+                f"? .help · ↩ 发送 · ctrl+c 退出 · "
                 f"{config.host}:{config.port} · {config.version} · {mode}{uptime}"
             )
             self.status_texts["server"] = server_text
@@ -371,8 +391,6 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 self._command_plugins()
             elif name == ".help":
                 self._command_help()
-            elif name == ".quit":
-                self.exit()
 
         def _command_run(self) -> None:
             if self.started:
@@ -419,7 +437,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self._log_write("[命令] 可用命令:")
             for name, description in DOT_COMMANDS.items():
                 self._log_write(f"  {name:<10s} {description}")
-            self._log_write("[提示] 普通文本 = 聊天消息；/命令 = 服务器命令。")
+            self._log_write("[提示] 普通文本 = 聊天消息；/命令 = 服务器命令；Ctrl+C 退出。")
 
 else:  # pragma: no cover - exercised on base installs
 

@@ -340,10 +340,9 @@ uv run protobot run              # 在真终端（Windows Terminal 等）中运�
 | `.stop` | 停止 bot（保持界面） |
 | `.plugins` | 列出已加载插件 |
 | `.help` | 显示可用命令 |
-| `.quit` | 退出界面 |
 
 - **真终端**（Windows Terminal / VS Code 终端 / macOS / Linux）自动启用
-  全屏界面，Ctrl+C 或 `.quit` 退出。
+  全屏界面，**Ctrl+C 退出**。
 - **PyCharm 控制台、管道、CI** 自动降级为普通逐行日志（此时 bot 照常
   自动启动，无需 `.run`）；未安装 extra 时会打印一次提示并同样降级。
 - 配置开关：`[tui] enabled = false` 可彻底关闭（默认 `true`）。
