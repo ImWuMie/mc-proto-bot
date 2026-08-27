@@ -10,6 +10,7 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 
 - **Full protocol stack** — handshake → login → configuration → play, keep-alive, teleport confirmation, chunk decoding, and server transfers, all bounds-checked and deterministic.
 - **Online & offline mode** — full support for Mojang session-server authenticated login (RSA/AES-CFB8 stream encryption) and Microsoft OAuth sign-in (authorization-code by default, device-code with your own Azure app), as well as offline-mode servers.
+- **SRV records** — `_minecraft._tcp` lookup like a vanilla client, so an address that publishes a backend host and port resolves to it.
 - **Multiple releases** — Minecraft `1.21.11`, `26.1`, `26.1.1`, `26.1.2`, and `26.2` out of the box (bundled per-version block-state tables).
 - **Client-side physics** — a 20 Hz deterministic physics engine that mirrors vanilla movement, including boats and hard entity collision.
 - **Navigation** — A\* path planning and execution over the decoded world with automatic replanning.
@@ -96,6 +97,36 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### Server addresses and SRV records
+
+Most public servers publish a backend host and port through a `_minecraft._tcp`
+SRV record, so what players type is not what they connect to. `connect()` follows
+those records the way a vanilla client does — only when no port was given, since
+an explicit port always wins:
+
+```python
+bot = await connect("play.example.com")                    # follows the SRV record
+bot = await connect("play.example.com", port=25565)         # explicit: connects as given
+bot = await connect("play.example.com", resolve_srv=False)   # never look up SRV
+```
+
+Without this, a server that only answers on its SRV target accepts the TCP
+connection at the typed address (or a DNS placeholder) and then closes it, which
+surfaces as `ConnectionClosed: server closed the connection`. Subscribe to
+`srv_resolved` to see the redirect, or read `bot.connected_host` /
+`bot.connected_port` for the address actually dialled:
+
+```python
+@bot.on("srv_resolved")
+def on_srv(original, host, port):
+    print(f"{original} -> {host}:{port}")
+```
+
+`resolve_minecraft_srv(host)` is exported if you want the lookup on its own. It
+uses the operating system resolver (so split-horizon and VPN DNS apply) and
+returns `None` — connect directly — for IP literals, missing records, and
+unreachable resolvers.
 
 ### Online-mode (Mojang / Microsoft authentication)
 
@@ -229,6 +260,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `protocol/` | Wire codec, framing, NBT, connection state machine, version tables |
 | `physics/` | Deterministic movement engine, collision geometry, boat physics |
 | `navigation.py` | A\* pathfinder |
+| `srv.py` | Dependency-free `_minecraft._tcp` SRV lookup |
 | `world.py` / `state.py` | World/chunk decoding, block-state registry, entity/inventory state |
 | `modlist.py` | Forge/NeoForge/Fabric loader adapters, Velocity forwarding |
 | `data/` | Bundled per-version block-state tables |

@@ -10,6 +10,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 
 - **完整协议栈**——握手 → 登录 → 配置 → 游戏全流程，含 keep-alive、传送确认、区块解码与服务器转移，全部经过边界检查、行为确定。
 - **正版与离线双支持**——完整支持 Mojang session-server 正版加密验证（RSA/AES-CFB8 8位流式加密）、微软 OAuth 交互登录（默认授权码流程，可选设备码流程）及离线模式。
+- **SRV 记录解析**——像原版客户端一样查询 `_minecraft._tcp`，自动连到地址所发布的后端主机与端口。
 - **多版本支持**——开箱支持 Minecraft `1.21.11`、`26.1`、`26.1.1`、`26.1.2`、`26.2`（内置各版本方块状态表）。
 - **客户端物理**——20 Hz 确定性物理引擎，精确复刻原版移动逻辑，含船载物理与实体硬碰撞。
 - **导航寻路**——基于解码后世界的 A\* 路径规划与执行，支持自动重规划。
@@ -97,6 +98,33 @@ async def main():
 asyncio.run(main())
 ```
 
+### 服务器地址与 SRV 记录
+
+多数公开服务器通过 `_minecraft._tcp` SRV 记录发布真实的后端主机与端口，也就是说
+玩家输入的地址往往并不是实际连接的地址。`connect()` 会像原版客户端那样跟随这类
+记录——仅在未指定端口时生效，显式端口始终优先：
+
+```python
+bot = await connect("play.example.com")                     # 跟随 SRV 记录
+bot = await connect("play.example.com", port=25565)          # 显式端口：按原样连接
+bot = await connect("play.example.com", resolve_srv=False)   # 完全不查 SRV
+```
+
+缺少这一步时，只在 SRV 目标上监听的服务器会接受你在输入地址上的 TCP 连接
+（或者你连到的其实是一个 DNS 占位地址），随后直接关闭，表现为
+`ConnectionClosed: server closed the connection`。可以订阅 `srv_resolved` 观察
+重定向，或读取 `bot.connected_host` / `bot.connected_port` 查看实际拨号的地址：
+
+```python
+@bot.on("srv_resolved")
+def on_srv(original, host, port):
+    print(f"{original} -> {host}:{port}")
+```
+
+如需单独使用，`resolve_minecraft_srv(host)` 也已导出。它走操作系统解析器（因此
+分离解析与 VPN DNS 都能生效），对 IP 字面量、无记录、解析器不可达等情况返回
+`None`，表示"直接连接即可"。
+
 ### 正版验证登录（Mojang / 微软账号）
 
 直接传入 `access_token` 与 `profile_uuid`：
@@ -114,30 +142,6 @@ async def main():
         version="26.2",
     )
     print("正版连接成功:", bot.username, bot.uuid)
-    await bot.close()
-
-asyncio.run(main())
-```
-
-或使用交互式微软账号登录。默认走**授权码流程**，配合公开的启动器 client ID
-即可，无需你自己注册 Azure 应用：
-
-```python
-import asyncio
-from protobot import authorization_code_login, connect
-
-async def main():
-    # 打印微软登录链接，然后要求粘贴回跳地址
-    profile = await authorization_code_login()
-
-    bot = await connect(
-        "mc.example.com",
-        username=profile.name,
-        access_token=profile.access_token,
-        profile_uuid=profile.id,
-        version="26.2",
-    )
-    print("已登录正版账号:", bot.username)
     await bot.close()
 
 asyncio.run(main())
@@ -243,6 +247,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `protocol/` | 传输编解码、封帧、NBT、连接状态机、版本表 |
 | `physics/` | 确定性移动引擎、碰撞几何、船载物理 |
 | `navigation.py` | A\* 寻路器 |
+| `srv.py` | 零依赖的 `_minecraft._tcp` SRV 查询 |
 | `world.py` / `state.py` | 世界/区块解码、方块状态注册表、实体/物品栏状态 |
 | `modlist.py` | Forge/NeoForge/Fabric 加载器适配、Velocity forwarding |
 | `data/` | 内置各版本方块状态表 |

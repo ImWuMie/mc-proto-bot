@@ -48,6 +48,7 @@ from .physics import (
     Vec3,
 )
 from .protocol.versions import SUPPORTED_VERSIONS, VersionSpec, get_version
+from .srv import resolve_minecraft_srv
 from .state import (
     ContainerState,
     EntityMetadataValue,
@@ -104,6 +105,7 @@ __all__ = [
     "connect",
     "get_version",
     "make_adapter",
+    "resolve_minecraft_srv",
     "minecraft_sha1_digest",
     "MinecraftProfile",
     "authorization_code_login",

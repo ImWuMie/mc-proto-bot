@@ -36,6 +36,7 @@ from .protocol.framing import make_handshake
 from .protocol.nbt import read_anonymous_nbt
 from .protocol.versions import VersionSpec, get_version
 from .registry import RegistryStore
+from .srv import resolve_minecraft_srv
 from .state import (
     ContainerState,
     EntityMetadataValue,
@@ -115,6 +116,7 @@ _CONTAINER_CLICK_TYPES = {
 }
 _INTERACTION_HANDS = {"main_hand": 0, "mainhand": 0, "off_hand": 1, "offhand": 1}
 _CLIENTBOUND_CONFIGURATION_TRANSFER = 0x0B
+DEFAULT_MINECRAFT_PORT = 25565
 
 class _UnsupportedItemComponents(Exception):
     pass
@@ -168,6 +170,7 @@ class Bot:
         username: str = "ProtoBot",
         version: str | VersionSpec = "26.2",
         connect_timeout: float = 10.0,
+        resolve_srv: bool = True,
         access_token: str | None = None,
         profile_uuid: str | uuid.UUID | None = None,
         session_server: str = "https://sessionserver.mojang.com",
@@ -204,6 +207,13 @@ class Bot:
         self.handshake_host = handshake_host
         self.username = username
         self.version = get_version(version)
+        if not isinstance(resolve_srv, bool):
+            raise TypeError("resolve_srv must be a bool")
+        self.resolve_srv = resolve_srv
+        # The address actually dialled, which differs from host/port whenever an
+        # SRV record redirects the connection.
+        self.connected_host = host
+        self.connected_port = port
         if profile_uuid is not None:
             self.uuid = uuid.UUID(str(profile_uuid)) if not isinstance(profile_uuid, uuid.UUID) else profile_uuid
         else:
@@ -307,21 +317,40 @@ class Bot:
         )
         self._reader_task = asyncio.create_task(self._read_loop(), name=f"protobot:{self.username}")
 
+    async def _resolve_endpoint(self, host: str, port: int) -> tuple[str, int]:
+        """Apply Minecraft SRV redirection the way a vanilla client does.
+
+        Vanilla only looks up ``_minecraft._tcp.<host>`` when the player typed no
+        port, so the lookup is confined to the default port. Any lookup failure
+        falls through to the address as given.
+        """
+
+        if not self.resolve_srv or port != DEFAULT_MINECRAFT_PORT:
+            return host, port
+        target = await asyncio.to_thread(resolve_minecraft_srv, host)
+        if target is None:
+            return host, port
+        await self.events.emit("srv_resolved", host, target[0], target[1])
+        return target
+
     async def _open_login_connection(
         self,
         host: str,
         port: int,
         handshake_host: str,
     ) -> None:
+        connect_host, connect_port = await self._resolve_endpoint(host, port)
+        self.connected_host = connect_host
+        self.connected_port = connect_port
         await asyncio.wait_for(
-            self._connection.open(host, port),
+            self._connection.open(connect_host, connect_port),
             timeout=self.connect_timeout,
         )
         self.state = ConnectionState.HANDSHAKING
         protocol_host = self.modlist.handshake_host(handshake_host)
         await self._connection.send_packet(
             0,
-            make_handshake(self.version.protocol, protocol_host, port, 2),
+            make_handshake(self.version.protocol, protocol_host, connect_port, 2),
         )
         self.state = ConnectionState.LOGIN
         login_start = PacketWriter().write_string(self.username, max_chars=16).write_uuid(self.uuid)
@@ -2698,6 +2727,7 @@ async def connect(
     username: str = "ProtoBot",
     version: str | VersionSpec = "26.2",
     timeout: float = 30.0,
+    resolve_srv: bool = True,
     access_token: str | None = None,
     profile_uuid: str | uuid.UUID | None = None,
     session_server: str = "https://sessionserver.mojang.com",
@@ -2729,6 +2759,7 @@ async def connect(
         username=username,
         version=version,
         connect_timeout=timeout,
+        resolve_srv=resolve_srv,
         access_token=access_token,
         profile_uuid=profile_uuid,
         session_server=session_server,
