@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -238,10 +239,39 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("idle", app.status_texts["bot"])
             self.assertIn("ctrl+c exit", app.status_texts["bot"])
             self.assertEqual(app.status_texts["pos"], "")
-            # No duration counter, no clock: just the server facts.
+            # Not connected yet: server facts only, no duration.
             self.assertEqual(
                 app.status_texts["server"], "wolfx.jp:25565 · 26.2 · online"
             )
+        finally:
+            task.cancel()
+
+    async def test_status_shows_the_running_duration(self) -> None:
+        session = FakeSession(bot=FakeBot())
+        app, task = self._make_app(session)
+        app.session_task = task  # pretend the session is running
+        try:
+            async with app.run_test():
+                app.connected_at = time.monotonic() - 65
+                app._refresh_status()
+            server = app.status_texts["server"]
+            self.assertIn("00:01:05", server)  # bare HH:MM:SS, no 时长 label
+            self.assertNotIn("时长", server)
+            self.assertIn("wolfx.jp:25565 · 26.2 · online · ", server)
+        finally:
+            task.cancel()
+
+    async def test_session_events_track_the_duration(self) -> None:
+        bot = FakeBot()
+        session = FakeSession(bot=bot)
+        app, task = self._make_app(session)
+        try:
+            async with app.run_test():
+                self.assertIsNone(app.connected_at)
+                await session.events.emit("session_ready", bot)
+                self.assertIsNotNone(app.connected_at)
+                await session.events.emit("session_disconnected", "bye", 1)
+                self.assertIsNone(app.connected_at)
         finally:
             task.cancel()
 

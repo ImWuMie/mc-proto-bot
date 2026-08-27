@@ -17,9 +17,9 @@ class ChatLogger(Plugin):
         self.subscribe("player_chat", self._on_player_chat)
 
     async def _on_system_chat(self, component, overlay) -> None:
-        log.info("[聊天/系统]", plain_text(component))
+        log.info("[sys]", plain_text(component))
 
     async def _on_player_chat(
         self, sender_uuid, name, message, chat_type_id, target_name
     ) -> None:
-        log.info("[聊天]", plain_text(name), ":", plain_text(message))
+        log.info("[chat]", plain_text(name), ":", plain_text(message))

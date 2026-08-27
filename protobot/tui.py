@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import sys
+import time
 from typing import TYPE_CHECKING, Any, TextIO
 
 try:
@@ -221,10 +222,18 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self.proxy = proxy
             self.log_drain_limit = log_drain_limit
             self.session_task: asyncio.Task | None = None
+            self.connected_at: float | None = None
             # Headless audit trails: every log line and the last footer texts,
             # so tests (and debugging) never need Textual widget internals.
             self.log_lines: list[str] = []
             self.status_texts: dict[str, str] = {"bot": "", "pos": "", "server": ""}
+            # Handlers carry a ``session`` infix: Textual dispatches its own
+            # lifecycle messages (Ready, ...) to methods named ``_on_<name>``,
+            # so names like ``_on_ready`` would be hijacked by the framework.
+            session.events.on("session_connecting", self._on_session_connecting)
+            session.events.on("session_ready", self._on_session_ready)
+            session.events.on("session_disconnected", self._on_session_disconnected)
+            session.events.on("session_stop", self._on_session_stop)
 
         # ---- composition ----
 
@@ -254,6 +263,20 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self.set_interval(1.0, self._refresh_status)
             self._refresh_status()
             self._log_write("[提示] 输入 .run 启动 bot，.help 查看可用命令，Ctrl+C 退出。")
+
+        # ---- session events (connection duration) ----
+
+        def _on_session_connecting(self, attempt: int) -> None:
+            self.connected_at = None
+
+        def _on_session_ready(self, bot: Any) -> None:
+            self.connected_at = time.monotonic()
+
+        def _on_session_disconnected(self, reason: str | None, attempt: int) -> None:
+            self.connected_at = None
+
+        def _on_session_stop(self) -> None:
+            self.connected_at = None
 
         # ---- periodic refresh ----
 
@@ -312,8 +335,15 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self.query_one("#pos", Static).update(position)
 
             mode = "online" if config.online_mode else "offline"
+            uptime = ""
+            if self.connected_at is not None:
+                seconds = int(time.monotonic() - self.connected_at)
+                uptime = (
+                    f" · {seconds // 3600:02d}:"
+                    f"{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+                )
             server_text = (
-                f"{config.host}:{config.port} · {config.version} · {mode}"
+                f"{config.host}:{config.port} · {config.version} · {mode}{uptime}"
             )
             self.status_texts["server"] = server_text
             self.query_one("#server", Static).update(server_text)
