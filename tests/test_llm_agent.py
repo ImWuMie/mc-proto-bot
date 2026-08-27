@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -202,12 +203,23 @@ class TriggerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin._queue.qsize(), 0)
         self.assertEqual(len(self.plugin._chat_log), 1)
 
-    async def test_own_name_echo_ignored(self) -> None:
+    async def test_own_echo_matched_by_recent_send_is_ignored(self) -> None:
+        # 回显按「近期发送过的内容」判定，不按名字：玩家与 bot 同名（同一
+        # 正版账号）时，玩家本人的消息不能被误判成回显。
+        self.plugin._sent_recent.append((time.monotonic(), "hey,claude 我自己"))
         await self.plugin._on_player_chat(
             None, "FakeBot", {"text": "hey,claude 我自己"}, None, None
         )
         self.assertEqual(self.plugin._queue.qsize(), 0)
         self.assertEqual(self.plugin._chat_log, [])
+
+    async def test_same_account_player_message_still_triggers(self) -> None:
+        # 玩家本人与 bot 同名（同一账号）时也必须能正常触发。
+        await self.plugin._on_player_chat(
+            None, "FakeBot", {"text": "hey,claude 在吗"}, None, None
+        )
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+        self.assertEqual(self.plugin._chat_log[-1]["name"], "FakeBot")
 
     async def test_system_chat_recorded(self) -> None:
         await self.plugin._on_system_chat({"text": "[服务器] 欢迎 Steve 加入"}, False)
@@ -389,6 +401,29 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             sum(len(entry["text"]) for entry in self.plugin._chat_log), 600
         )
+
+    async def test_duplicate_send_skipped(self) -> None:
+        first = await self.plugin._run_tool("send_message", {"text": "哈哈"})
+        self.assertIn("Sent", first)
+        second = await self.plugin._run_tool("send_message", {"text": "哈哈"})
+        self.assertIn("Skipped duplicate message", second)
+        self.assertEqual(self.plugin.bot.sent_messages, ["哈哈"])
+        self.assertEqual(len(self.plugin._chat_log), 1)
+
+    async def test_repeat_allowed_after_dedupe_window(self) -> None:
+        self.plugin._sent_recent = [(time.monotonic() - 200, "哈哈")]
+        result = await self.plugin._run_tool("send_message", {"text": "哈哈"})
+        self.assertIn("Sent", result)
+        self.assertEqual(self.plugin.bot.sent_messages, ["哈哈"])
+
+    async def test_partial_duplicate_only_skips_matching_chunk(self) -> None:
+        text = "x" * 600  # 分 3 段发送
+        await self.plugin._run_tool("send_message", {"text": text})
+        result = await self.plugin._run_tool(
+            "send_message", {"text": "x" * 250}
+        )
+        self.assertIn("Skipped duplicate message", result)
+        self.assertEqual(len(self.plugin.bot.sent_messages), 3)
 
     async def test_move_to_tool_calls_walk(self) -> None:
         result = await self.plugin._run_tool(
@@ -609,6 +644,18 @@ class LlmLoopTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.plugin._conversation[-1]["content"], "任务完成。"
         )
+
+    async def test_duplicate_tool_then_final_sent_once(self) -> None:
+        # 复现线上 bug：模型先调用 send_message 工具、最终回复又重复同一段
+        # 文字——去重后只应发送一次。
+        text = "哈哈，谁是美国豆包啊！找我有什么事嘛？"
+        fake = FakeLLM(
+            assistant(tool_calls=[tool_call("send_message", {"text": text})]),
+            assistant(content=text),
+        )
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("Steve", "在吗")
+        self.assertEqual(self.plugin.bot.sent_messages, [text])
 
     async def test_no_reply_marker_suppressed(self) -> None:
         self.plugin._post_json = FakeLLM(assistant(content="NO_REPLY"))

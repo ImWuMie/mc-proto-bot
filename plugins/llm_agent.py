@@ -287,6 +287,13 @@ TOOLS: list[dict] = [
 ]
 
 
+#: 自己消息回显的判定窗口（秒）：近期发送过相同内容即视为回显
+SENT_ECHO_WINDOW = 10.0
+#: 重复发送去重窗口（秒）与参与比较的最近条数
+SENT_DEDUPE_WINDOW = 120.0
+SENT_DEDUPE_MAX = 5
+
+
 # ======================== 辅助函数 ========================
 
 
@@ -348,6 +355,7 @@ class LLMAgent(Plugin):
         self._queue: asyncio.Queue | None = None
         self._worker_task: asyncio.Task | None = None
         self._requester: str | None = None  # 当前触发聊天的玩家名（权限判定用）
+        self._sent_recent: list[tuple[float, str]] = []  # 近期发送 (时间, 内容)
         self._post_json = _http_post_json  # 测试可替换为假实现
         self.subscribe("player_chat", self._on_player_chat)
         self.subscribe("system_chat", self._on_system_chat)
@@ -460,8 +468,9 @@ class LLMAgent(Plugin):
         self, sender_uuid, name, message, chat_type_id, target_name
     ) -> None:
         text = plain_text(message)
-        bot = self.bot
-        if bot is not None and name == bot.username:
+        # 回显判定按「近期发送过的内容」而不是按名字：正版账号下玩家本人与
+        # bot 同名，按名字会把玩家本人的消息也屏蔽掉。
+        if self._is_own_echo(text):
             return  # 自己消息的服务器回显：发送时已记录，且不能自我触发
         self._record_chat(system=False, name=name or "?", text=text)
         if self._should_reply(name, text):
@@ -488,6 +497,14 @@ class LLMAgent(Plugin):
             return True
         keywords = [str(k).lower() for k in (reply.get("keywords") or [])]
         return any(keyword and keyword in lowered for keyword in keywords)
+
+    def _is_own_echo(self, text: str) -> bool:
+        """近期自己发送过相同内容即视为回显（防止自我触发死循环）。"""
+        now = time.monotonic()
+        return any(
+            now - sent_at < SENT_ECHO_WINDOW and sent_text == text
+            for sent_at, sent_text in self._sent_recent[-SENT_DEDUPE_MAX:]
+        )
 
     def _record_chat(self, *, system: bool, name: str, text: str) -> None:
         entry = {
@@ -646,7 +663,11 @@ class LLMAgent(Plugin):
         return "\n".join(parts)
 
     async def _send_chat(self, text: str) -> str:
-        """分段发送聊天（250 字/段，最多 4 段）；失败向上抛，由调用方记录。"""
+        """分段发送聊天（250 字/段，最多 4 段）；失败向上抛，由调用方记录。
+
+        模型可能先调用 send_message 工具、又在最终回复里重复同一段文字，
+        因此发送前按近期发送记录去重（120 秒窗口），重复段直接跳过。
+        """
         bot = self.bot
         if bot is None:
             raise RuntimeError("Not connected to a server")
@@ -654,10 +675,32 @@ class LLMAgent(Plugin):
         if len(chunks) > 4:
             chunks = chunks[:4]
             log.warn("[LLM] 回复过长，只发送前 4 段。")
+        now = time.monotonic()
+        self._sent_recent = [
+            (sent_at, sent_text)
+            for sent_at, sent_text in self._sent_recent
+            if now - sent_at < SENT_DEDUPE_WINDOW
+        ]
+        # 只与「本次调用之前」的发送记录比较：同一条消息内出现相同分段是
+        # 合法的（如 600 字的长文前两段同为 250 字重复内容）。
+        recent_before = [
+            sent_text for _, sent_text in self._sent_recent[-SENT_DEDUPE_MAX:]
+        ]
+        sent_count = 0
+        skipped = 0
         for chunk in chunks:
+            if chunk in recent_before:
+                skipped += 1
+                log.debug(f"[LLM] 跳过重复消息: {chunk[:40]}")
+                continue
             await bot.send_message(chunk)
             self._record_chat(system=False, name=bot.username, text=chunk)
-        return f"Sent {len(chunks)} message(s)"
+            self._sent_recent.append((now, chunk))
+            sent_count += 1
+            log.debug(f"[LLM] 已发送聊天 ({len(chunk)} 字)")
+        if skipped and not sent_count:
+            return "Skipped duplicate message (already sent recently)"
+        return f"Sent {sent_count} message(s)"
 
     # ---- 工具分发 ----
 
