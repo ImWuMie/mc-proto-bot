@@ -6,6 +6,9 @@ A modern Python 3.12+ Minecraft protocol client supporting both **offline-mode**
 
 ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets — handshake, login, configuration, and play states — with zero required third-party dependencies for offline use and optional `cryptography` for authenticated encryption. It ships a deterministic client-side physics engine (walking, sprinting, jumping, sneaking, boats, spectator flight), an A\* pathfinder over exact collision shapes, and an event-driven high-level `Bot` API.
 
+> 🙏 **Credits** — the bot core and protocol foundation build on the work of
+> [ImAlexBlock](https://github.com/ImAlexBlock).
+
 ## Features
 
 - **Full protocol stack** — handshake → login → configuration → play, keep-alive, teleport confirmation, chunk decoding, and server transfers, all bounds-checked and deterministic.
