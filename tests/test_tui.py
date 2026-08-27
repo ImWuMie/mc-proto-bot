@@ -229,21 +229,19 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel()
 
-    async def test_status_without_a_bot_shows_the_clock(self) -> None:
-        import re
-
+    async def test_status_without_a_bot_shows_idle_state(self) -> None:
         session = FakeSession(bot=None)
         app, task = self._make_app(session)
         try:
             async with app.run_test():
                 app._refresh_status()
-            self.assertIn("未启动", app.status_texts["bot"])
-            self.assertIn("ctrl+c 退出", app.status_texts["bot"])
+            self.assertIn("idle", app.status_texts["bot"])
+            self.assertIn("ctrl+c exit", app.status_texts["bot"])
             self.assertEqual(app.status_texts["pos"], "")
-            server = app.status_texts["server"]
-            self.assertIn("wolfx.jp:25565", server)
-            self.assertRegex(server, r"\d{2}:\d{2}:\d{2}")  # wall-clock time
-            self.assertNotIn("时长", server)
+            # No duration counter, no clock: just the server facts.
+            self.assertEqual(
+                app.status_texts["server"], "wolfx.jp:25565 · 26.2 · online"
+            )
         finally:
             task.cancel()
 
@@ -254,7 +252,7 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
         try:
             async with app.run_test():
                 app._refresh_status()
-            self.assertIn("连接中", app.status_texts["bot"])
+            self.assertIn("connecting", app.status_texts["bot"])
         finally:
             task.cancel()
 

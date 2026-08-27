@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import queue
 import sys
-import time
 from typing import TYPE_CHECKING, Any, TextIO
 
 try:
@@ -240,7 +239,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 suggester=DotCommandSuggester(DOT_COMMANDS),
             )
             with Horizontal(id="statusbar"):
-                yield Static("未启动", id="bot")
+                yield Static("⏸ idle", id="bot")
                 yield Static("", id="pos")
                 yield Static("", id="server")
 
@@ -293,12 +292,12 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             # Claude-Code-style single line: a state glyph and the hints on
             # the left, the position centered, server info on the right.
             if not self.started:
-                state = "⏸ 未启动"
+                state = "⏸ idle"
             elif bot is not None:
                 state = f"⏵ {bot.username}"
             else:
-                state = "… 连接中"
-            bot_text = f"{state} · ? .help · ctrl+c 退出"
+                state = "… connecting"
+            bot_text = f"{state} · ? .help · ctrl+c exit"
             self.status_texts["bot"] = bot_text
             self.query_one("#bot", Static).update(bot_text)
 
@@ -314,8 +313,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
 
             mode = "online" if config.online_mode else "offline"
             server_text = (
-                f"{config.host}:{config.port} · {config.version} · {mode} · "
-                f"{time.strftime('%H:%M:%S')}"
+                f"{config.host}:{config.port} · {config.version} · {mode}"
             )
             self.status_texts["server"] = server_text
             self.query_one("#server", Static).update(server_text)
