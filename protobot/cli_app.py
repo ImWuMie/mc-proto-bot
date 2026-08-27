@@ -427,8 +427,6 @@ async def run_bot_session(args: argparse.Namespace) -> int:
         ),
         plugin_manager=manager,
     )
-    container = BotContainer(plugin_manager=manager)
-    container.add_session("default", session)
 
     watcher = PluginWatcher(manager) if plugin_config.watch else None
     watcher_task: asyncio.Task | None = None
@@ -439,19 +437,23 @@ async def run_bot_session(args: argparse.Namespace) -> int:
         print("[插件] 热更新监视已启动（编辑 plugins/ 下的文件即生效）。")
     try:
         if tui_enabled(load_tui_config(data)):
-            # 单事件循环：container 任务与 Textual App 共存；全部 print 经
-            # 代理进入日志区。UI 退出（Ctrl+C）→ request_stop；容器先结束
-            # （重连上限等）→ App 自行 exit。
+            # 单事件循环：Textual App 与 session 任务共存；全部 print 经代理
+            # 进入日志区。会话由界面内的 .run 命令启动，UI 退出（Ctrl+C /
+            # .quit）→ request_stop + 等待会话优雅结束。
             proxy = StdoutProxy()
-            container_task = asyncio.create_task(
-                container.run(), name="protobot-container"
-            )
-            app = ProtoBotApp(session, container_task, proxy)
-            with contextlib.redirect_stdout(proxy):
-                await app.run_async()
-            session.request_stop()
-            await container_task
+            app = ProtoBotApp(session, manager, proxy)
+            await manager.enable_all()
+            try:
+                with contextlib.redirect_stdout(proxy):
+                    await app.run_async()
+            finally:
+                session.request_stop()
+                if app.session_task is not None:
+                    await app.session_task
+                await manager.disable_all()
         else:
+            container = BotContainer(plugin_manager=manager)
+            container.add_session("default", session)
             await container.run()
     finally:
         if watcher is not None:

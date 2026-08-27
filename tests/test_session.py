@@ -206,6 +206,24 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertEqual(bot.close_count, 1)
 
+    async def test_session_can_be_restarted_after_a_stop(self) -> None:
+        bot1, bot2 = FakeBot(), FakeBot()
+        connector = FakeConnector([bot1, bot2])
+        session = make_session(connector=connector)
+
+        task = asyncio.create_task(session.run())
+        await wait_for(lambda: len(connector.calls) == 1 and bot1.tick_count > 0)
+        session.request_stop()
+        await task
+        self.assertEqual(bot1.close_count, 1)
+
+        # A second run clears the stop flag and connects again.
+        task = asyncio.create_task(session.run())
+        await wait_for(lambda: len(connector.calls) == 2 and bot2.tick_count > 0)
+        session.request_stop()
+        await task
+        self.assertEqual(bot2.close_count, 1)
+
 
 class ReconnectBindingTest(unittest.IsolatedAsyncioTestCase):
     async def test_plugins_rebind_to_each_new_bot(self) -> None:

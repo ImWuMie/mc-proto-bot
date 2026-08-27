@@ -319,9 +319,9 @@ class AutoReply(Plugin):
 
 ### 全屏 TUI 界面（可选）
 
-`protobot run` 支持类似 Claude Code 的全屏界面：顶栏输入框（输入消息回车
-发送聊天，`/命令` 执行服务器命令）、中间滚动日志区（会话与插件的全部输出）、
-底部三栏状态条（bot 名字 / 坐标 / 服务器·版本·模式·连接时长）。界面基于
+`protobot run` 支持 Claude Code 风格的全屏界面：上方滚动日志区（会话与
+插件的全部输出）、紧贴输入框上方的三栏状态条（bot 名字 / 坐标 / 服务器·
+版本·模式·连接时长）、**底部输入框**。界面基于
 [Textual](https://github.com/Textualize/textual)，作为可选依赖安装，核心
 仍然零依赖：
 
@@ -330,10 +330,22 @@ uv sync --extra tui              # 或 pip install -e ".[tui]"
 uv run protobot run              # 在真终端（Windows Terminal 等）中运行
 ```
 
+输入框支持三种输入，输入 `.` 时自动弹出命令提示下拉框：
+
+| 输入 | 行为 |
+| --- | --- |
+| 普通文本 | 发送聊天消息 |
+| `/命令` | 执行服务器命令（如 `/say hi`） |
+| `.run` | 启动 bot（进入界面后 bot 默认不启动） |
+| `.stop` | 停止 bot（保持界面） |
+| `.plugins` | 列出已加载插件 |
+| `.help` | 显示可用命令 |
+| `.quit` | 退出界面 |
+
 - **真终端**（Windows Terminal / VS Code 终端 / macOS / Linux）自动启用
-  全屏界面，Ctrl+C 退出。
-- **PyCharm 控制台、管道、CI** 自动降级为普通逐行日志；未安装 extra 时会
-  打印一次提示并同样降级。
+  全屏界面，Ctrl+C 或 `.quit` 退出。
+- **PyCharm 控制台、管道、CI** 自动降级为普通逐行日志（此时 bot 照常
+  自动启动，无需 `.run`）；未安装 extra 时会打印一次提示并同样降级。
 - 配置开关：`[tui] enabled = false` 可彻底关闭（默认 `true`）。
 
 ## 诊断 CLI

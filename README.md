@@ -338,23 +338,36 @@ Notes:
 
 ### Full-screen TUI (optional)
 
-`protobot run` also ships a Claude-Code-style full-screen interface: an input
-row on top (type a message and press Enter to chat; `/command` runs a server
-command), a scrolling log area in the middle (everything the session and
-plugins print), and a three-column footer (bot name / coordinates / server ·
-version · mode · connection uptime). It is built on
-[Textual](https://github.com/Textualize/textual) as an optional extra, so the
-core stays dependency-free:
+`protobot run` also ships a Claude-Code-style full-screen interface: a
+scrolling log area on top (everything the session and plugins print), a
+three-column status bar above the input (bot name / coordinates / server ·
+version · mode · connection uptime), and a **bottom input row**. It is built
+on [Textual](https://github.com/Textualize/textual) as an optional extra, so
+the core stays dependency-free:
 
 ```bash
 uv sync --extra tui              # or pip install -e ".[tui]"
 uv run protobot run              # in a real terminal (Windows Terminal etc.)
 ```
 
+The input accepts three kinds of content, with a live suggestion dropdown
+while typing `.`:
+
+| Input | Action |
+| --- | --- |
+| plain text | sends a chat message |
+| `/command` | runs a server command (e.g. `/say hi`) |
+| `.run` | starts the bot (the TUI starts with the bot stopped) |
+| `.stop` | stops the bot (keeps the UI) |
+| `.plugins` | lists loaded plugins |
+| `.help` | shows available commands |
+| `.quit` | exits the UI |
+
 - **Real terminals** (Windows Terminal, VS Code terminal, macOS, Linux) get
-  the full-screen UI; Ctrl+C exits.
+  the full-screen UI; Ctrl+C or `.quit` exits.
 - **PyCharm consoles, pipes, and CI** fall back to plain line logging
-  automatically; a missing extra prints a one-time hint and falls back too.
+  automatically (the bot then auto-starts as before, no `.run` needed); a
+  missing extra prints a one-time hint and falls back too.
 - Config switch: `[tui] enabled = false` turns it off entirely (default `true`).
 
 ## Diagnostic CLI

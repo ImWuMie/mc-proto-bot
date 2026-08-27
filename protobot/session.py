@@ -139,6 +139,9 @@ class BotSession:
         self._stop.set()
 
     async def run(self) -> None:
+        # Clear the stop flag so a session can be started again after a stop
+        # (the TUI's ``.run`` command relies on this).
+        self._stop.clear()
         if self._plugins is not None:
             self._plugins.bind_session_all(self)
         await self.events.emit("session_start")
