@@ -1,11 +1,11 @@
 """Textual TUI for ``protobot run`` (optional ``tui`` extra).
 
-Claude-Code-style layout: the log area fills the top, a three-column status
-bar (bot name / position / server info plus uptime) sits above a bottom input
-row.  The input sends chat messages, ``/``-prefixed server commands, and
-dot-prefixed UI commands (``.run`` starts the bot, ``.stop`` stops it,
-``.plugins``, ``.help``, ``.quit``) with a live suggestion dropdown while
-typing.
+Claude-Code-style layout: the log area fills the top, a bottom input row, and
+a three-column status bar (bot name / position / server info plus uptime) at
+the very bottom.  The input sends chat messages, ``/``-prefixed server
+commands, and dot-prefixed UI commands (``.run`` starts the bot, ``.stop``
+stops it, ``.plugins``, ``.help``, ``.quit``) with a live suggestion dropdown
+while typing.
 
 The module imports Textual lazily so the plain-log fallback keeps working
 without the extra installed: :func:`tui_enabled` decides, and
@@ -23,8 +23,9 @@ from typing import TYPE_CHECKING, Any, TextIO
 try:
     from textual.app import App, ComposeResult
     from textual.containers import Horizontal, Vertical
+    from textual.css.query import NoMatches
     from textual.suggester import Suggester
-    from textual.widgets import Input, Log, Static
+    from textual.widgets import Input, RichLog, Static
 
     _TEXTUAL = True
 except ImportError:  # pragma: no cover - exercised on base installs
@@ -163,6 +164,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         #log {
             border: none;
             padding: 0 1;
+            scrollbar-size: 0 0;   /* no scroll bars: long lines wrap */
         }
         #statusbar {
             height: 1;
@@ -218,23 +220,27 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         # ---- composition ----
 
         def compose(self) -> ComposeResult:
-            yield Log(id="log")
-            with Horizontal(id="statusbar"):
-                yield Static("未启动", id="bot")
-                yield Static("", id="pos")
-                yield Static("", id="server")
+            # Claude-Code layout: log fills the top, the input row sits above
+            # the very bottom status bar.
+            yield RichLog(
+                id="log", markup=False, wrap=True, max_lines=2000
+            )
             yield Input(
                 placeholder="输入消息回车发送；/命令 执行服务器命令；.help 查看命令",
                 id="cmd",
                 suggester=DotCommandSuggester(DOT_COMMANDS),
             )
+            with Horizontal(id="statusbar"):
+                yield Static("未启动", id="bot")
+                yield Static("", id="pos")
+                yield Static("", id="server")
 
         # ---- lifecycle ----
 
         def on_mount(self) -> None:
-            # Textual 8's Log is focusable and composed first, so it would
+            # Textual 8's RichLog is focusable and composed first, so it would
             # steal the initial focus (and Tab) from the input box.
-            self.query_one("#log", Log).can_focus = False
+            self.query_one("#log", RichLog).can_focus = False
             self.query_one("#cmd", Input).focus()
             self.set_interval(1.0, self._drain_logs)
             self.set_interval(1.0, self._refresh_status)
@@ -258,11 +264,22 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         # ---- periodic refresh ----
 
         def _log_write(self, line: str) -> None:
-            """Write one line to the log widget and the headless audit trail."""
-            self.query_one("#log", Log).write(line)
+            """Write one line to the log widget and the headless audit trail.
+
+            Timer callbacks can fire once more while the screen is being torn
+            down; the audit trail always records, the widget write is guarded.
+            """
             self.log_lines.append(line)
+            if not self.is_running:
+                return
+            try:
+                self.query_one("#log", RichLog).write(line)
+            except NoMatches:  # pragma: no cover - teardown race
+                pass
 
         def _drain_logs(self) -> None:
+            if not self.is_running:
+                return
             for line in self.proxy.drain(self.log_drain_limit):
                 self._log_write(line)
 
@@ -272,6 +289,8 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             return task is not None and not task.done()
 
         def _refresh_status(self) -> None:
+            if not self.is_running:  # timer can outlive the screen by a tick
+                return
             session = self.session
             config = session.config
             bot = session.bot
