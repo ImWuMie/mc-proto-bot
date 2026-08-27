@@ -1,0 +1,370 @@
+"""Collision-aware path planning for the high-level bot API."""
+
+from __future__ import annotations
+
+import heapq
+import itertools
+import math
+from dataclasses import dataclass
+
+from .errors import ProtoBotError
+from .physics.geometry import AABB, Vec3
+from .physics.world import CollisionWorld
+
+
+class PathNotFound(ProtoBotError):
+    """No walkable path was found within the configured search budget."""
+
+
+class NavigationTimeout(ProtoBotError, TimeoutError):
+    """A navigation task did not reach its target before its deadline."""
+
+
+@dataclass(frozen=True, slots=True)
+class PathWaypoint:
+    """One feet position in a planned route."""
+
+    position: Vec3
+    jump: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class NavigationPath:
+    """An immutable route plus useful search diagnostics."""
+
+    waypoints: tuple[PathWaypoint, ...]
+    explored_nodes: int
+    cost: float
+
+    def __len__(self) -> int:
+        return len(self.waypoints)
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(self.waypoints)
+
+
+@dataclass(frozen=True, slots=True)
+class _GridNode:
+    x: int
+    z: int
+    y: float
+
+    @property
+    def position(self) -> Vec3:
+        return Vec3(self.x + 0.5, self.y, self.z + 0.5)
+
+    @property
+    def key(self) -> tuple[int, int, int]:
+        # Official collision shapes are quantized much more coarsely than this.
+        # The fixed key also keeps equivalent floating-point shape tops merged.
+        return self.x, self.z, round(self.y * 1_000_000)
+
+
+class Pathfinder:
+    """A* planner over the exact collision boxes exposed by a world.
+
+    Nodes are safe player-feet positions on collision-shape top faces.  Edges
+    model ordinary horizontal travel, one-block jumps, and bounded falls.  The
+    planner deliberately does not mutate the world or simulate packets; Bot's
+    :meth:`navigate_to` method executes the returned route through normal 20 Hz
+    physics ticks.
+    """
+
+    _CARDINAL = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    _DIAGONAL = ((1, 1), (1, -1), (-1, 1), (-1, -1))
+
+    def __init__(
+        self,
+        world: CollisionWorld,
+        *,
+        player_width: float = 0.6,
+        player_height: float = 1.8,
+        step_height: float = 0.6,
+        max_jump_height: float = 1.25,
+        max_drop: float = 3.0,
+        allow_diagonal: bool = True,
+    ) -> None:
+        values = (player_width, player_height, step_height, max_jump_height, max_drop)
+        if not all(math.isfinite(value) and value > 0.0 for value in values):
+            raise ValueError("pathfinder dimensions and movement limits must be positive")
+        if max_jump_height < step_height:
+            raise ValueError("max_jump_height cannot be lower than step_height")
+        self.world = world
+        self.player_width = player_width
+        self.player_height = player_height
+        self.step_height = step_height
+        self.max_jump_height = max_jump_height
+        self.max_drop = max_drop
+        self.allow_diagonal = allow_diagonal
+
+    def find_path(
+        self,
+        start: Vec3,
+        target: Vec3,
+        *,
+        match_target_y: bool = True,
+        target_y_tolerance: float = 0.51,
+        max_nodes: int = 4096,
+    ) -> NavigationPath:
+        """Find a collision-safe route from ``start`` to ``target``.
+
+        ``match_target_y=False`` makes the first reachable standing surface in
+        the target X/Z cell acceptable.  This is useful when the caller knows a
+        horizontal destination but not the terrain's exact top face.
+        """
+
+        if max_nodes <= 0:
+            raise ValueError("max_nodes must be positive")
+        if not math.isfinite(target_y_tolerance) or target_y_tolerance < 0.0:
+            raise ValueError("target_y_tolerance must be finite and non-negative")
+        if not self._finite_vec(start) or not self._finite_vec(target):
+            raise ValueError("path endpoints must contain finite coordinates")
+
+        start_node = self._start_node(start)
+        goal_x, goal_z = math.floor(target.x), math.floor(target.z)
+        serial = itertools.count()
+        frontier: list[tuple[float, int, tuple[int, int, int]]] = []
+        nodes = {start_node.key: start_node}
+        costs = {start_node.key: 0.0}
+        parents: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+        jumps: dict[tuple[int, int, int], bool] = {}
+        heapq.heappush(
+            frontier,
+            (
+                self._heuristic(start_node, target, match_target_y),
+                next(serial),
+                start_node.key,
+            ),
+        )
+
+        explored = 0
+        goal: _GridNode | None = None
+        while frontier and explored < max_nodes:
+            _, _, current_key = heapq.heappop(frontier)
+            current = nodes[current_key]
+            explored += 1
+            if self._is_goal(
+                current,
+                goal_x,
+                goal_z,
+                target.y,
+                match_target_y,
+                target_y_tolerance,
+            ):
+                goal = current
+                break
+
+            for neighbor, requires_jump, edge_cost in self._neighbors(current):
+                key = neighbor.key
+                new_cost = costs[current_key] + edge_cost
+                if new_cost >= costs.get(key, math.inf):
+                    continue
+                costs[key] = new_cost
+                nodes[key] = neighbor
+                parents[key] = current_key
+                jumps[key] = requires_jump
+                priority = new_cost + self._heuristic(neighbor, target, match_target_y)
+                heapq.heappush(frontier, (priority, next(serial), key))
+
+        if goal is None:
+            raise PathNotFound(
+                f"no path to ({target.x:.3f}, {target.y:.3f}, {target.z:.3f}) "
+                f"after exploring {explored} nodes"
+            )
+
+        chain: list[_GridNode] = []
+        key = goal.key
+        while key != start_node.key:
+            chain.append(nodes[key])
+            key = parents[key]
+        chain.reverse()
+        waypoints: list[PathWaypoint] = []
+        for node in chain:
+            waypoints.append(PathWaypoint(node.position, jumps[node.key]))
+
+        # Finish at the caller's exact horizontal coordinate when the body can
+        # occupy it.  Grid centers remain the fallback near obstructed edges.
+        exact = Vec3(target.x, goal.y, target.z)
+        previous = start_node.position if not waypoints else waypoints[-1].position
+        exact_jump = exact.y > previous.y + self.step_height + 1.0e-7
+        if (
+            self._body_clear(exact.x, exact.y, exact.z)
+            and self._supported(exact.x, exact.y, exact.z)
+            and self._transition_clear(previous, exact, exact_jump)
+            and self._horizontal_distance_squared(previous, exact) > 1.0e-8
+        ):
+            waypoints.append(PathWaypoint(exact, exact_jump))
+
+        return NavigationPath(tuple(waypoints), explored, costs[goal.key])
+
+    def _start_node(self, start: Vec3) -> _GridNode:
+        x, z = math.floor(start.x), math.floor(start.z)
+        if self._body_clear(start.x, start.y, start.z) and self._supported(
+            start.x, start.y, start.z
+        ):
+            return _GridNode(x, z, start.y)
+        surfaces = self._surface_heights(x, z, start.y)
+        if not surfaces:
+            raise PathNotFound("the starting cell has no safe standing surface")
+        # Prefer the surface directly below an airborne or slightly corrected
+        # spawn, then the nearest surface if the player starts inside geometry.
+        below = [surface for surface in surfaces if surface <= start.y + 1.0e-6]
+        y = max(below) if below else min(surfaces, key=lambda surface: abs(surface - start.y))
+        return _GridNode(x, z, y)
+
+    def _neighbors(self, current: _GridNode):  # type: ignore[no-untyped-def]
+        offsets = self._CARDINAL + (self._DIAGONAL if self.allow_diagonal else ())
+        current_position = current.position
+        for dx, dz in offsets:
+            x, z = current.x + dx, current.z + dz
+            for y in self._surface_heights(x, z, current.y):
+                delta_y = y - current.y
+                if delta_y > self.max_jump_height + 1.0e-7:
+                    continue
+                if delta_y < -self.max_drop - 1.0e-7:
+                    continue
+                requires_jump = delta_y > self.step_height + 1.0e-7
+                position = Vec3(x + 0.5, y, z + 0.5)
+                if not self._transition_clear(current_position, position, requires_jump):
+                    continue
+                horizontal = math.sqrt(dx * dx + dz * dz)
+                edge_cost = horizontal + abs(delta_y) * 0.35 + (0.35 if requires_jump else 0.0)
+                yield _GridNode(x, z, y), requires_jump, edge_cost
+
+    def _surface_heights(self, x: int, z: int, reference_y: float) -> tuple[float, ...]:
+        center_x, center_z = x + 0.5, z + 0.5
+        half = self.player_width / 2.0 - 1.0e-6
+        low = reference_y - self.max_drop - 1.0
+        high = reference_y + self.max_jump_height + self.player_height + 1.0
+        query = AABB(
+            center_x - half,
+            low,
+            center_z - half,
+            center_x + half,
+            high,
+            center_z + half,
+        )
+        surfaces = {
+            box.max_y
+            for box in self.world.collision_boxes(query)
+            if reference_y - self.max_drop - 1.0e-7
+            <= box.max_y
+            <= reference_y + self.max_jump_height + 1.0e-7
+            and self._body_clear(center_x, box.max_y, center_z)
+            and self._supported(center_x, box.max_y, center_z)
+        }
+        return tuple(sorted(surfaces, key=lambda y: (abs(y - reference_y), y)))
+
+    def _body_clear(self, x: float, y: float, z: float) -> bool:
+        half = self.player_width / 2.0
+        epsilon = 1.0e-7
+        return self.world.no_collision(
+            AABB(
+                x - half + epsilon,
+                y + epsilon,
+                z - half + epsilon,
+                x + half - epsilon,
+                y + self.player_height - epsilon,
+                z + half - epsilon,
+            )
+        )
+
+    def _supported(self, x: float, y: float, z: float) -> bool:
+        half = self.player_width / 2.0 - 1.0e-6
+        probe = AABB(x - half, y - 0.05, z - half, x + half, y + 1.0e-7, z + half)
+        return any(abs(box.max_y - y) <= 1.0e-6 for box in self.world.collision_boxes(probe))
+
+    def _transition_clear(self, start: Vec3, end: Vec3, requires_jump: bool) -> bool:
+        delta_y = end.y - start.y
+        if requires_jump:
+            # A normal jump rises beside the obstacle before horizontal motion
+            # clears its upper face.  Splitting the geometric check this way
+            # accepts a vanilla one-block jump without accepting wall phasing.
+            if not self._vertical_clear(start.x, start.z, start.y, end.y):
+                return False
+            travel_y = end.y
+        elif delta_y < -1.0e-7:
+            # Walking off a ledge keeps the old Y until the support is cleared,
+            # then gravity resolves the fall at the destination column.
+            travel_y = start.y
+            if not self._vertical_clear(end.x, end.z, start.y, end.y):
+                return False
+        else:
+            travel_y = end.y
+
+        if not self._horizontal_clear(start.x, start.z, end.x, end.z, travel_y):
+            return False
+        if start.x != end.x and start.z != end.z:
+            # At least one axis order must fit the player's full width.  This
+            # prevents an A* diagonal from cutting through a blocked corner.
+            x_first = self._horizontal_clear(start.x, start.z, end.x, start.z, travel_y)
+            x_first = x_first and self._horizontal_clear(
+                end.x, start.z, end.x, end.z, travel_y
+            )
+            z_first = self._horizontal_clear(start.x, start.z, start.x, end.z, travel_y)
+            z_first = z_first and self._horizontal_clear(
+                start.x, end.z, end.x, end.z, travel_y
+            )
+            if not (x_first or z_first):
+                return False
+        return True
+
+    def _horizontal_clear(
+        self,
+        start_x: float,
+        start_z: float,
+        end_x: float,
+        end_z: float,
+        y: float,
+    ) -> bool:
+        distance = math.hypot(end_x - start_x, end_z - start_z)
+        steps = max(1, math.ceil(distance * 8.0))
+        for index in range(steps + 1):
+            fraction = index / steps
+            x = start_x + (end_x - start_x) * fraction
+            z = start_z + (end_z - start_z) * fraction
+            if not self._body_clear(x, y, z):
+                return False
+        return True
+
+    def _vertical_clear(
+        self,
+        x: float,
+        z: float,
+        start_y: float,
+        end_y: float,
+    ) -> bool:
+        distance = abs(end_y - start_y)
+        steps = max(1, math.ceil(distance * 8.0))
+        for index in range(steps + 1):
+            fraction = index / steps
+            if not self._body_clear(x, start_y + (end_y - start_y) * fraction, z):
+                return False
+        return True
+
+    @staticmethod
+    def _is_goal(
+        node: _GridNode,
+        goal_x: int,
+        goal_z: int,
+        goal_y: float,
+        match_target_y: bool,
+        tolerance: float,
+    ) -> bool:
+        return node.x == goal_x and node.z == goal_z and (
+            not match_target_y or abs(node.y - goal_y) <= tolerance
+        )
+
+    @staticmethod
+    def _heuristic(node: _GridNode, target: Vec3, match_target_y: bool) -> float:
+        horizontal = math.hypot(node.x + 0.5 - target.x, node.z + 0.5 - target.z)
+        vertical = abs(node.y - target.y) * 0.35 if match_target_y else 0.0
+        return horizontal + vertical
+
+    @staticmethod
+    def _horizontal_distance_squared(first: Vec3, second: Vec3) -> float:
+        return (first.x - second.x) ** 2 + (first.z - second.z) ** 2
+
+    @staticmethod
+    def _finite_vec(value: Vec3) -> bool:
+        return all(math.isfinite(component) for component in (value.x, value.y, value.z))

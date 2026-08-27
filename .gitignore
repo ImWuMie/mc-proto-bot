@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+auth_cache.json
+protobot-live.log
+.claude/settings.local.json
+
