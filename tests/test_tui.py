@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
-import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -226,23 +225,25 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
             server = app.status_texts["server"]
             self.assertIn("wolfx.jp:25565", server)
             self.assertIn("26.2", server)
-            self.assertIn("正版", server)
+            self.assertIn("online", server)
         finally:
             task.cancel()
 
-    async def test_status_states_without_a_bot_and_with_uptime(self) -> None:
+    async def test_status_without_a_bot_shows_the_clock(self) -> None:
+        import re
+
         session = FakeSession(bot=None)
         app, task = self._make_app(session)
         try:
             async with app.run_test():
-                app.connected_at = time.monotonic() - 65
                 app._refresh_status()
             self.assertIn("未启动", app.status_texts["bot"])
             self.assertIn("ctrl+c 退出", app.status_texts["bot"])
             self.assertEqual(app.status_texts["pos"], "")
             server = app.status_texts["server"]
-            self.assertIn("时长 00:01:05", server)
             self.assertIn("wolfx.jp:25565", server)
+            self.assertRegex(server, r"\d{2}:\d{2}:\d{2}")  # wall-clock time
+            self.assertNotIn("时长", server)
         finally:
             task.cancel()
 
@@ -254,20 +255,6 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
             async with app.run_test():
                 app._refresh_status()
             self.assertIn("连接中", app.status_texts["bot"])
-        finally:
-            task.cancel()
-
-    async def test_session_events_track_uptime(self) -> None:
-        bot = FakeBot()
-        session = FakeSession(bot=bot)
-        app, task = self._make_app(session)
-        try:
-            async with app.run_test():
-                self.assertIsNone(app.connected_at)
-                await session.events.emit("session_ready", bot)
-                self.assertIsNotNone(app.connected_at)
-                await session.events.emit("session_disconnected", "bye", 1)
-                self.assertIsNone(app.connected_at)
         finally:
             task.cancel()
 
