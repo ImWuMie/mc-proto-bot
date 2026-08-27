@@ -97,6 +97,7 @@ async def main():
     async def on_close(reason):
         print("断开连接:", reason)
 
+    await bot.send_message("hello from ProtoBot")
     await bot.send_command("say hello from ProtoBot")
     await asyncio.sleep(5)
     await bot.close()
@@ -278,6 +279,7 @@ python -m unittest discover -s tests -t .
 ## 注意事项与限制
 
 - **正版与离线模式。** 离线模式保持零第三方依赖。若需连接开启 `online-mode=true` 的正版服务器，请安装 `protobot[online]`（引入 `cryptography`）。
+- **发送的聊天消息不带签名。** `send_message()` 在不强制安全聊天的服务器（大多数插件服）上可用。若服务器开启 `enforce-secure-profile=true`，消息会被丢弃或拒绝——签名需要账号本地的聊天密钥对，只有 access token 的机器人无法取得。命令不受影响：`send_command()` 走的是普通命令包。
 - 物理预测以原版 26.2 默认值为基准；重度定制移动反作弊的服务器仍可能发出位置纠正。
 - `python -m compileall .` 是固定的语法检查；单元测试位于 `tests/` 目录下。
 

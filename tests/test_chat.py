@@ -5,10 +5,11 @@ from __future__ import annotations
 import struct
 import unittest
 import uuid
+from unittest.mock import AsyncMock, patch
 
 from protobot.client import Bot
 from protobot.errors import ProtocolError
-from protobot.protocol.codec import PacketWriter
+from protobot.protocol.codec import PacketReader, PacketWriter
 from protobot.protocol.connection import ConnectionState, RawPacket
 from protobot.protocol.nbt import encode_nbt_string
 from protobot.protocol.versions import SUPPORTED_VERSIONS
@@ -214,10 +215,72 @@ class PacketIdTableTest(unittest.TestCase):
         MCProtocolLib feature/26.2 (776), cross-checked on ten shared packets."""
         self.assertEqual(SUPPORTED_VERSIONS["1.21.11"].packets.clientbound_player_chat, 0x3F)
         self.assertEqual(SUPPORTED_VERSIONS["1.21.11"].packets.clientbound_profileless_chat, 0x21)
+        self.assertEqual(SUPPORTED_VERSIONS["1.21.11"].packets.serverbound_chat, 0x08)
         for version in ("26.1", "26.1.1", "26.1.2", "26.2"):
             packets = SUPPORTED_VERSIONS[version].packets
             self.assertEqual(packets.clientbound_player_chat, 0x41)
             self.assertEqual(packets.clientbound_profileless_chat, 0x21)
+            self.assertEqual(packets.serverbound_chat, 0x09)
+
+
+class SendMessageTest(unittest.IsolatedAsyncioTestCase):
+    """The chat packet carries timestamp/salt/ack fields but no signature."""
+
+    def setUp(self) -> None:
+        self.bot = Bot("127.0.0.1")
+        self.bot.state = ConnectionState.PLAY
+        self.bot._connection.send_packet = AsyncMock()
+
+    async def test_builds_an_unsigned_chat_packet(self) -> None:
+        with patch("protobot.client.time.time", return_value=1000.0), \
+             patch("protobot.client.secrets.randbits", return_value=0x1122334455667788):
+            await self.bot.send_message("hello")
+
+        self.bot._connection.send_packet.assert_called_once()
+        packet_id, payload = self.bot._connection.send_packet.call_args[0]
+        self.assertEqual(packet_id, self.bot.version.packets.serverbound_chat)
+
+        reader = PacketReader(payload)
+        self.assertEqual(reader.read_string(max_chars=256), "hello")
+        self.assertEqual(reader.read_long(), 1_000_000)
+        self.assertEqual(reader.read_unsigned_long(), 0x1122334455667788)
+        self.assertFalse(reader.read_bool())
+        self.assertEqual(reader.read_varint(), 0)
+        self.assertEqual(reader.read_raw(3), b"\x00\x00\x00")
+        self.assertEqual(reader.read_unsigned_byte(), 0)
+        self.assertEqual(reader.remaining, 0)
+
+    async def test_rejects_non_string(self) -> None:
+        with self.assertRaises(TypeError):
+            await self.bot.send_message(123)  # type: ignore[arg-type]
+
+    async def test_rejects_empty_message(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.bot.send_message("")
+
+    async def test_rejects_oversized_message(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.bot.send_message("x" * 257)
+        # exactly 256 characters is allowed
+        await self.bot.send_message("x" * 256)
+
+    async def test_requires_play_state(self) -> None:
+        self.bot.state = ConnectionState.DISCONNECTED
+        with self.assertRaises(RuntimeError):
+            await self.bot.send_message("hi")
+
+    async def test_works_for_every_supported_version(self) -> None:
+        for version in SUPPORTED_VERSIONS:
+            bot = Bot("127.0.0.1", version=version)
+            bot.state = ConnectionState.PLAY
+            bot._connection.send_packet = AsyncMock()
+            with patch("protobot.client.time.time", return_value=1000.0), \
+                 patch("protobot.client.secrets.randbits", return_value=0):
+                await bot.send_message("hi")
+            self.assertEqual(
+                bot._connection.send_packet.call_args[0][0],
+                bot.version.packets.serverbound_chat,
+            )
 
 
 class ChatTextParseTest(unittest.TestCase):

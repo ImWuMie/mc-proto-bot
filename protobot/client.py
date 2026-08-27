@@ -9,6 +9,7 @@ import ipaddress
 import json
 import math
 import secrets
+import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
@@ -624,6 +625,37 @@ class Bot:
             raise ValueError("command must not be empty")
         payload = PacketWriter().write_string(command, max_chars=32767).to_bytes()
         await self.send_raw(self.version.packets.serverbound_chat_command, payload)
+
+    async def send_message(self, message: str) -> None:
+        """Send a chat message without a signature.
+
+        The packet carries the timestamp, salt, an empty last-seen offset and
+        acknowledgement bitset, and a zero checksum, but no signature. Servers
+        that do not enforce secure chat (most plugin servers) accept this;
+        a server with ``enforce-secure-profile=true`` will drop or reject it,
+        since signing requires the account's local chat keypair, which a bot
+        holding only an access token does not have.
+        """
+
+        self._require_play()
+        if not isinstance(message, str):
+            raise TypeError("message must be a string")
+        if not message:
+            raise ValueError("message must not be empty")
+        if len(message) > 256:
+            raise ValueError("message exceeds the 256 character chat limit")
+        payload = (
+            PacketWriter()
+            .write_string(message, max_chars=256)
+            .write_long(int(time.time() * 1000))
+            .write_unsigned_long(secrets.randbits(64))
+            .write_bool(False)  # no message signature
+            .write_varint(0)  # last-seen offset: nothing acknowledged
+            .write_raw(b"\x00\x00\x00")  # fixed 20-bit acknowledged bitset
+            .write_unsigned_byte(0)  # last-seen checksum (unused without a session)
+            .to_bytes()
+        )
+        await self.send_raw(self.version.packets.serverbound_chat, payload)
 
     def load_block_state_report(self, report: str) -> int:
         """Install a Mojang ``blocks.json`` report for collision prediction."""

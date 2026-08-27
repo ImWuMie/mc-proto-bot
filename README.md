@@ -98,6 +98,7 @@ async def main():
     async def on_close(reason):
         print("disconnected:", reason)
 
+    await bot.send_message("hello from ProtoBot")
     await bot.send_command("say hello from ProtoBot")
     await asyncio.sleep(5)
     await bot.close()
@@ -294,6 +295,7 @@ optional `cryptography` extra is not present.
 ## Notes and limitations
 
 - **Online & offline mode.** Offline mode has zero third-party dependencies. For online-mode servers, install `protobot[online]` (requires `cryptography`).
+- **Chat sending is unsigned.** `send_message()` works on servers that do not enforce secure chat (most plugin servers). A server with `enforce-secure-profile=true` will drop or reject the message — signing requires the account's local chat keypair, which a bot holding only an access token cannot access. Commands are unaffected: `send_command()` uses the plain command packet.
 - Physics prediction mirrors vanilla 26.2 defaults; servers with heavy movement anti-cheat customisation may still issue corrections.
 - `python -m compileall .` is the standing sanity check; unit tests are located under `tests/`.
 

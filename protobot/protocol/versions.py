@@ -48,6 +48,7 @@ class PlayPacketIds:
     clientbound_update_attributes: int
     clientbound_update_mob_effect: int
     serverbound_chunk_batch_received: int
+    serverbound_chat: int
     serverbound_chat_command: int
     serverbound_custom_payload: int
     serverbound_container_click: int
@@ -182,6 +183,7 @@ _PLAY_774 = PlayPacketIds(
     clientbound_update_attributes=0x81,
     clientbound_update_mob_effect=0x82,
     serverbound_chunk_batch_received=0x0A,
+    serverbound_chat=0x08,
     serverbound_chat_command=0x06,
     serverbound_custom_payload=0x15,
     serverbound_container_click=0x11,
@@ -244,6 +246,7 @@ _PLAY_775_776 = PlayPacketIds(
     clientbound_update_attributes=0x83,
     clientbound_update_mob_effect=0x84,
     serverbound_chunk_batch_received=0x0B,
+    serverbound_chat=0x09,
     serverbound_chat_command=0x07,
     serverbound_custom_payload=0x16,
     serverbound_container_click=0x12,
