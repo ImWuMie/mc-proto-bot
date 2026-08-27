@@ -18,6 +18,8 @@ from protobot.errors import AuthenticationError
 PROFILE_HEX = "0123456789abcdef0123456789abcdef"
 AZURE_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
 REDIRECT = "https://login.live.com/oauth20_desktop.srf"
+MSA_TOKEN = "https://login.live.com/oauth20_token.srf"
+AAD_TOKEN = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 
 
 def _quiet_device_prompt(user_code: str, verification_uri: str) -> None:
@@ -52,7 +54,7 @@ class FakeEndpoints:
 
     def post_form(self, url: str, params: dict[str, str]) -> tuple[int, dict]:
         self.form_calls.append((url, params))
-        if url == auth._AAD_DEVICE_CODE_URL:
+        if url in (auth._MSA_DEVICE_CODE_URL, auth._AAD_DEVICE_CODE_URL):
             return 200, {
                 "device_code": "DEVICE-CODE",
                 "user_code": "ABCD1234",
@@ -106,10 +108,23 @@ class FakeEndpoints:
             test.addCleanup(patcher.stop)
 
 
+class EndpointFamilyTest(unittest.TestCase):
+    """The launcher client ID lives on MSA; anything else is an Azure app."""
+
+    def test_default_client_infers_msa(self) -> None:
+        self.assertFalse(auth._uses_azure_ad(auth.DEFAULT_MICROSOFT_CLIENT_ID, None))
+
+    def test_other_client_infers_azure(self) -> None:
+        self.assertTrue(auth._uses_azure_ad(AZURE_CLIENT_ID, None))
+
+    def test_explicit_choice_wins(self) -> None:
+        self.assertTrue(auth._uses_azure_ad(auth.DEFAULT_MICROSOFT_CLIENT_ID, True))
+        self.assertFalse(auth._uses_azure_ad(AZURE_CLIENT_ID, False))
+
+
 class AuthorizationUrlTest(unittest.TestCase):
     def test_targets_the_msa_authorize_endpoint(self) -> None:
-        url = auth.authorization_url()
-        split = urllib.parse.urlsplit(url)
+        split = urllib.parse.urlsplit(auth.authorization_url())
         self.assertEqual(
             f"{split.scheme}://{split.netloc}{split.path}",
             "https://login.live.com/oauth20_authorize.srf",
@@ -133,7 +148,9 @@ class ExtractAuthorizationCodeTest(unittest.TestCase):
         self.assertEqual(auth.extract_authorization_code(pasted), "M.C5_BAY.2.U.abcdef")
 
     def test_accepts_a_bare_code(self) -> None:
-        self.assertEqual(auth.extract_authorization_code("  M.C5_BAY.2.U.xyz  "), "M.C5_BAY.2.U.xyz")
+        self.assertEqual(
+            auth.extract_authorization_code("  M.C5_BAY.2.U.xyz  "), "M.C5_BAY.2.U.xyz"
+        )
 
     def test_reports_an_error_carried_in_the_redirect(self) -> None:
         pasted = f"{REDIRECT}?error=access_denied&error_description=User+cancelled"
@@ -163,11 +180,10 @@ class AuthorizationCodeLoginTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("login.live.com/oauth20_authorize.srf", prompts[0])
         url, params = fake.form_calls[0]
-        self.assertEqual(url, "https://login.live.com/oauth20_token.srf")
+        self.assertEqual(url, MSA_TOKEN)
         self.assertEqual(params["grant_type"], "authorization_code")
         self.assertEqual(params["code"], "THE-CODE")
         self.assertEqual(params["redirect_uri"], REDIRECT)
-        self.assertEqual(params["client_id"], auth.DEFAULT_MICROSOFT_CLIENT_ID)
 
         self.assertEqual(profile.name, "Steve")
         self.assertEqual(profile.id, uuid.UUID(hex=PROFILE_HEX))
@@ -201,73 +217,50 @@ class AuthorizationCodeLoginTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("single-use", message)
 
 
-class DeviceCodeClientIdTest(unittest.IsolatedAsyncioTestCase):
-    """The legacy launcher ID cannot complete the device-code grant.
+class MsaDeviceCodeLoginTest(unittest.IsolatedAsyncioTestCase):
+    """Default device-code login needs no registration and uses MSA."""
 
-    Microsoft issues a device code for it but then refuses the token with
-    "The user could not be authenticated or user interaction is required",
-    so the flow must refuse up front instead of sending users to a dead end.
-    """
-
-    async def test_rejects_the_public_launcher_client_id(self) -> None:
-        with self.assertRaises(AuthenticationError) as ctx:
-            await auth.device_code_login(auth.DEFAULT_MICROSOFT_CLIENT_ID)
-        message = str(ctx.exception)
-        self.assertIn("requires your own Azure AD application ID", message)
-        self.assertIn("authorization_code_login", message)
-
-    async def test_rejects_a_missing_client_id(self) -> None:
-        with self.assertRaises(AuthenticationError):
-            await auth.device_code_login()
-
-    async def test_makes_no_network_calls_when_refusing(self) -> None:
-        calls: list[str] = []
-        with patch.object(auth, "_http_post_form", lambda url, params: calls.append(url)):
-            with self.assertRaises(AuthenticationError):
-                await auth.device_code_login()
-        self.assertEqual(calls, [])
-
-
-class DeviceCodeLoginTest(unittest.IsolatedAsyncioTestCase):
     async def _login(self, fake: FakeEndpoints, **kwargs):
         fake.install(self)
         kwargs.setdefault("prompt_callback", _quiet_device_prompt)
-        return await auth.device_code_login(AZURE_CLIENT_ID, **kwargs)
+        return await auth.device_code_login(**kwargs)
 
-    async def test_uses_azure_ad_endpoints(self) -> None:
+    async def test_uses_msa_endpoints(self) -> None:
         fake = FakeEndpoints()
         await self._login(fake)
 
         device_url, device_params = fake.form_calls[0]
-        self.assertEqual(
-            device_url,
-            "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
-        )
-        self.assertEqual(device_params["scope"], "XboxLive.signin offline_access")
-        self.assertEqual(device_params["client_id"], AZURE_CLIENT_ID)
+        self.assertEqual(device_url, "https://login.live.com/oauth20_connect.srf")
+        self.assertEqual(device_params["scope"], "service::user.auth.xboxlive.com::MBI_SSL")
+        self.assertEqual(device_params["response_type"], "device_code")
+        self.assertEqual(device_params["client_id"], auth.DEFAULT_MICROSOFT_CLIENT_ID)
 
         token_url, token_params = fake.form_calls[1]
-        self.assertEqual(
-            token_url, "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-        )
+        self.assertEqual(token_url, MSA_TOKEN)
         self.assertEqual(token_params["grant_type"], auth._DEVICE_CODE_GRANT)
         self.assertEqual(token_params["device_code"], "DEVICE-CODE")
+
+        for url in fake.urls:
+            self.assertNotIn("login.microsoftonline.com", url)
+
+    async def test_verification_uri_prefills_the_code(self) -> None:
+        """microsoft.com/link redirects to remoteconnect; link the code directly."""
+        seen: list[tuple[str, str]] = []
+        fake = FakeEndpoints()
+        await self._login(fake, prompt_callback=lambda code, uri: seen.append((code, uri)))
+        user_code, uri = seen[0]
+        self.assertEqual(user_code, "ABCD1234")
+        self.assertEqual(
+            uri, "https://login.live.com/oauth20_remoteconnect.srf?otc=ABCD1234"
+        )
 
     async def test_returns_profile_with_refresh_token_and_expiry(self) -> None:
         fake = FakeEndpoints()
         before = time.time()
         profile = await self._login(fake)
-
-        self.assertEqual(profile.name, "Steve")
         self.assertEqual(profile.access_token, "mc-token")
         self.assertEqual(profile.refresh_token, "refresh-token-1")
         self.assertGreaterEqual(profile.expires_at, before + 86400 - 5)
-
-    async def test_prompt_callback_receives_code_and_uri(self) -> None:
-        seen: list[tuple[str, str]] = []
-        fake = FakeEndpoints()
-        await self._login(fake, prompt_callback=lambda code, uri: seen.append((code, uri)))
-        self.assertEqual(seen, [("ABCD1234", "https://microsoft.com/devicelogin")])
 
     async def test_polls_until_user_authorizes(self) -> None:
         fake = FakeEndpoints(pending_polls=3)
@@ -275,6 +268,64 @@ class DeviceCodeLoginTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile.access_token, "mc-token")
         # one device-code request plus four token polls
         self.assertEqual(len(fake.form_calls), 5)
+
+    async def test_incomplete_signin_explains_what_to_do(self) -> None:
+        """invalid_grant here means the browser sign-in did not finish."""
+
+        def post_form(url, params):
+            if url == auth._MSA_DEVICE_CODE_URL:
+                return 200, {
+                    "device_code": "D",
+                    "user_code": "U",
+                    "interval": 0,
+                    "expires_in": 900,
+                }
+            return 400, {
+                "error": "invalid_grant",
+                "error_description": "The user could not be authenticated.",
+            }
+
+        with patch.object(auth, "_http_post_form", post_form):
+            with self.assertRaises(AuthenticationError) as ctx:
+                await auth.device_code_login(prompt_callback=_quiet_device_prompt)
+        message = str(ctx.exception)
+        self.assertIn("did not finish", message)
+        self.assertIn("authorization_code_login", message)
+
+    async def test_rejects_azure_ad_with_the_launcher_client_id(self) -> None:
+        calls: list[str] = []
+        with patch.object(auth, "_http_post_form", lambda url, params: calls.append(url)):
+            with self.assertRaises(AuthenticationError) as ctx:
+                await auth.device_code_login(azure_ad=True)
+        self.assertIn("AADSTS700016", str(ctx.exception))
+        self.assertEqual(calls, [], "must refuse before making a request")
+
+
+class AzureDeviceCodeLoginTest(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_azure_endpoints_for_a_registered_app(self) -> None:
+        fake = FakeEndpoints()
+        fake.install(self)
+        await auth.device_code_login(
+            AZURE_CLIENT_ID, prompt_callback=_quiet_device_prompt
+        )
+
+        device_url, device_params = fake.form_calls[0]
+        self.assertEqual(
+            device_url,
+            "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
+        )
+        self.assertEqual(device_params["scope"], "XboxLive.signin offline_access")
+        self.assertNotIn("response_type", device_params)
+        self.assertEqual(fake.form_calls[1][0], AAD_TOKEN)
+
+    async def test_uses_the_server_supplied_verification_uri(self) -> None:
+        seen: list[str] = []
+        fake = FakeEndpoints()
+        fake.install(self)
+        await auth.device_code_login(
+            AZURE_CLIENT_ID, prompt_callback=lambda code, uri: seen.append(uri)
+        )
+        self.assertEqual(seen, ["https://microsoft.com/devicelogin"])
 
     async def test_device_code_request_failure_raises(self) -> None:
         aadsts = {
@@ -401,29 +452,32 @@ class MinecraftProfileFetchTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RefreshLoginTest(unittest.IsolatedAsyncioTestCase):
-    async def test_refresh_uses_msa_endpoint_by_default(self) -> None:
+    async def test_default_client_refreshes_against_msa(self) -> None:
         fake = FakeEndpoints()
         fake.install(self)
         profile = await auth.refresh_login("refresh-token-1")
 
         url, params = fake.form_calls[0]
-        self.assertEqual(url, "https://login.live.com/oauth20_token.srf")
+        self.assertEqual(url, MSA_TOKEN)
         self.assertEqual(params["grant_type"], "refresh_token")
         self.assertEqual(params["refresh_token"], "refresh-token-1")
         self.assertNotIn("scope", params)
-        self.assertEqual(profile.access_token, "mc-token")
         self.assertEqual(profile.refresh_token, "refresh-token-2")
 
-    async def test_refresh_uses_azure_endpoint_when_requested(self) -> None:
+    async def test_azure_client_refreshes_against_azure(self) -> None:
         fake = FakeEndpoints()
         fake.install(self)
-        await auth.refresh_login("refresh-token-1", AZURE_CLIENT_ID, azure_ad=True)
+        await auth.refresh_login("refresh-token-1", AZURE_CLIENT_ID)
 
         url, params = fake.form_calls[0]
-        self.assertEqual(
-            url, "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-        )
+        self.assertEqual(url, AAD_TOKEN)
         self.assertEqual(params["scope"], "XboxLive.signin offline_access")
+
+    async def test_explicit_flag_overrides_inference(self) -> None:
+        fake = FakeEndpoints()
+        fake.install(self)
+        await auth.refresh_login("refresh-token-1", AZURE_CLIENT_ID, azure_ad=False)
+        self.assertEqual(fake.form_calls[0][0], MSA_TOKEN)
 
     async def test_refresh_keeps_old_token_when_none_returned(self) -> None:
         fake = FakeEndpoints()

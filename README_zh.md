@@ -143,18 +143,34 @@ async def main():
 asyncio.run(main())
 ```
 
-也可以传入自己的提示函数以接入 GUI，它收到登录 URL、返回用户粘贴的内容：
+或使用交互式微软账号登录。默认是 `device_code_login()`：打开一个**已预填验证码**
+的链接，在浏览器里确认即可，无需复制任何东西回来。它配合公开的启动器 client ID
+工作，不需要注册 Azure 应用：
 
 ```python
-profile = await authorization_code_login(prompt_callback=my_prompt)
+import asyncio
+from protobot import connect, device_code_login
+
+async def main():
+    # 打印已预填验证码的链接，然后等待浏览器端授权
+    profile = await device_code_login()
+
+    bot = await connect(
+        "mc.example.com",
+        username=profile.name,
+        access_token=profile.access_token,
+        profile_uuid=profile.id,
+        version="26.2",
+    )
+    print("已登录正版账号:", bot.username)
+    await bot.close()
+
+asyncio.run(main())
 ```
 
-登录完成后，微软会在回跳页显示一个反钓鱼提示页：「你已进入一个通常不会显示的
-页面。Microsoft 绝不会要求你复制或分享此 URL」。该提示针对的是"骗你把地址转发
-给他人"的钓鱼手法；粘贴到本机脚本里，令牌不会离开你的电脑。不过这终究不是理想
-模式，而回环地址（`http://localhost:...`）在公开启动器 client ID 上会被拒绝
-（返回 `invalid_request`），因此**彻底免去复制粘贴的办法是用自己的应用走设备码
-流程**。
+浏览器里的登录必须**一路走到最后的确认页**。中途放弃会让设备码保持未授权状态，
+微软会在下一次轮询时返回「用户须重新登录或需要用户交互」——重试并把浏览器流程
+走完即可。
 
 Minecraft 访问令牌大约一天过期。登录同时会返回续期令牌（refresh token），
 因此缓存的凭据可以自动续期，无需再次授权：
@@ -170,26 +186,37 @@ if profile.expired and profile.refresh_token:
 此时重新授权即可。仓库自带的 `login.py` 与 `run_bot.py` 就是这么做的：
 授权一次，之后自动续期反复连服。
 
-### 设备码登录（需要你自己的 Azure 应用）
+### 备选一：授权码流程
 
-设备码是体验最好的流程——在浏览器里输入一个短验证码即可，无需复制任何东西，
-也不会出现上面的提示页——但微软只对在 Azure AD 注册过的应用开放它。公开的
-启动器 client ID **无法**完成该流程：微软会先发出设备码，随后拒绝发放令牌并提示
-「用户需要重新登录或需要用户交互」。因此 `device_code_login()` 要求显式传入
-`client_id`，而不是等用户输完验证码才失败。
+`authorization_code_login()` 同样无需注册。它打印登录 URL，并接收浏览器回跳的地址：
 
-注册是免费的，几分钟即可：在 [Azure 门户](https://portal.azure.com) 进入
-*Microsoft Entra ID → 应用注册 → 新注册*，账户类型选「仅个人 Microsoft 账户」，
-创建后在*身份验证*页打开「允许公共客户端流」。
+```python
+profile = await authorization_code_login()                       # 在 stdin 上询问
+profile = await authorization_code_login(prompt_callback=my_ui)  # 或接入自己的 UI
+```
+
+微软会在回跳页显示反钓鱼提示：「你已进入一个通常不会显示的页面。Microsoft 绝不会
+要求你复制或分享此 URL」。该提示针对的是"骗你把地址转发给他人"的手法；粘贴到本机
+脚本里，令牌不会离开你的电脑。回环地址（`http://localhost:...`）本可免去复制，但在
+公开启动器 client ID 上会被拒绝（`invalid_request`），所以优先用上面的设备码流程。
+
+### 备选二：用自己的 Azure 应用走设备码
+
+这是微软官方支持该授权的路径。传入 Azure 应用 ID 即自动切换到 Azure 端点：
 
 ```python
 profile = await device_code_login("<你的 Azure 应用 ID>")
 ...
-profile = await refresh_login(profile.refresh_token, "<你的 Azure 应用 ID>", azure_ad=True)
+profile = await refresh_login(profile.refresh_token, "<你的 Azure 应用 ID>")
 ```
 
-续期必须回到签发该令牌的那一套端点，这正是 `azure_ad=True` 的作用；`login.py`
-会把这一点记录到缓存里，`run_bot.py` 便能自动选对端点续期。
+注册免费：在 [Azure 门户](https://portal.azure.com) 进入 *Microsoft Entra ID →
+应用注册 → 新注册*，账户类型选「仅个人 Microsoft 账户」，创建后在*身份验证*页
+打开「允许公共客户端流」。
+
+续期必须回到签发该令牌的那一套端点。传入相同的 `client_id` 就会自动选对（启动器 ID
+表示 MSA，其他表示 Azure AD）；`azure_ad=True/False` 可强制指定。`login.py` 会把
+这一点记录到缓存里，`run_bot.py` 便能正确续期。
 
 ## 诊断 CLI
 

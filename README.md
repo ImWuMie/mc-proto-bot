@@ -119,17 +119,18 @@ async def main():
 asyncio.run(main())
 ```
 
-Or sign in interactively with a Microsoft account. The default flow is the
-authorization-code flow, which works with the public launcher client ID and
-needs no Azure application of your own:
+Or sign in interactively with a Microsoft account. `device_code_login()` is the
+default: the user opens a link with the code already filled in and approves in a
+browser, with nothing to copy back. It works with the public launcher client ID,
+so no Azure application is needed:
 
 ```python
 import asyncio
-from protobot import authorization_code_login, connect
+from protobot import connect, device_code_login
 
 async def main():
-    # Prints a Microsoft sign-in URL, then asks for the redirect URL it lands on
-    profile = await authorization_code_login()
+    # Prints a link (code pre-filled) and waits for the browser approval
+    profile = await device_code_login()
 
     bot = await connect(
         "mc.example.com",
@@ -144,20 +145,10 @@ async def main():
 asyncio.run(main())
 ```
 
-Supply your own prompt to integrate with a GUI — it receives the sign-in URL and
-returns whatever the user pasted back:
-
-```python
-profile = await authorization_code_login(prompt_callback=my_prompt)
-```
-
-After signing in, Microsoft shows an anti-phishing interstitial on the redirect
-page: *"You've reached a page that normally isn't shown. Microsoft will never ask
-you to copy or share this URL."* That warning targets scammers who ask victims to
-forward the URL; pasting it into a script on your own machine keeps the token
-local. It is still a pattern worth avoiding, and loopback redirects (`http://localhost:...`)
-are rejected for the public launcher client ID, so the way to skip the
-copy-and-paste entirely is the device-code flow with an application of your own.
+The sign-in has to be carried through to the final confirmation page. Abandoning
+it part-way leaves the device code unauthorized, and Microsoft answers the next
+poll with *"the user could not be authenticated or user interaction is
+required"* — retry and complete the browser flow.
 
 Minecraft access tokens last roughly a day. The login also returns a refresh
 token, so a stored credential can be renewed without asking the user for
@@ -175,30 +166,43 @@ revoked or expired; sign in again at that point. The bundled `login.py` and
 `run_bot.py` scripts implement exactly this: authorize once, then reconnect
 indefinitely with automatic renewal.
 
-### Device-code login (requires your own Azure application)
+### Alternative: authorization-code flow
 
-The device-code grant is the cleanest flow — the user types a short code in a
-browser, with nothing to copy back and no interstitial — but Microsoft only
-offers it to applications registered in Azure AD. The public launcher client ID
-cannot complete it: Microsoft issues a device code and then refuses the token
-with *"the user could not be authenticated or user interaction is required"*, so
-`device_code_login()` requires an explicit `client_id` rather than failing after
-the user has already typed a code.
+`authorization_code_login()` also needs no registration. It prints a sign-in URL
+and takes back the redirect URL the browser lands on:
 
-Registering one is free and takes a few minutes: in the
-[Azure portal](https://portal.azure.com) go to *Microsoft Entra ID → App
-registrations → New registration*, choose "Personal Microsoft accounts only",
-then under *Authentication* enable "Allow public client flows".
+```python
+profile = await authorization_code_login()                       # prompts on stdin
+profile = await authorization_code_login(prompt_callback=my_ui)  # or your own UI
+```
+
+Microsoft shows an anti-phishing interstitial on that redirect page — *"You've
+reached a page that normally isn't shown. Microsoft will never ask you to copy or
+share this URL."* The warning targets scammers who ask victims to forward the URL;
+pasting it into a script on your own machine keeps the token local. Loopback
+redirects (`http://localhost:...`) would avoid the copy entirely but are rejected
+for the public launcher client ID, so prefer the device-code flow above.
+
+### Alternative: device code with your own Azure application
+
+This is the path Microsoft officially supports for the device-code grant. Pass an
+Azure AD application ID and the Azure endpoints are used automatically:
 
 ```python
 profile = await device_code_login("<your-azure-application-id>")
 ...
-profile = await refresh_login(profile.refresh_token, "<your-azure-application-id>", azure_ad=True)
+profile = await refresh_login(profile.refresh_token, "<your-azure-application-id>")
 ```
 
-Refreshes must return to the endpoint family that issued the token, which is
-what `azure_ad=True` selects; `login.py` records this in its cache so
-`run_bot.py` renews against the right endpoint automatically.
+Registering one is free: in the [Azure portal](https://portal.azure.com) go to
+*Microsoft Entra ID → App registrations → New registration*, choose "Personal
+Microsoft accounts only", then under *Authentication* enable "Allow public client
+flows".
+
+A refresh must return to the endpoint family that issued the token. Passing the
+same `client_id` selects it automatically (the launcher ID means MSA, anything
+else means Azure AD); `azure_ad=True/False` overrides the choice. `login.py`
+records this in its cache so `run_bot.py` renews correctly.
 
 ## Diagnostic CLI
 

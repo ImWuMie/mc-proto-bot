@@ -2,24 +2,25 @@
 
 在 PyCharm 中直接右键运行本文件即可。
 
-本脚本支持两种登录方式：
+默认流程（无需任何注册）：
+    脚本打印一个链接和一个 8 位验证码 -> 浏览器打开链接（验证码已预填）
+    -> 登录并**一路点到最后的确认页** -> 脚本自动继续，无需回到控制台粘贴。
 
-1. 授权码流程（默认，无需任何注册）
-   打印一个微软登录链接 -> 你在浏览器里登录 -> 把地址栏复制回来粘贴。
-   注意：登录完微软会显示一个提示页，写着「你已进入一个通常不会显示的页面，
-   Microsoft 绝不会要求你复制或分享此 URL」。这是微软的反钓鱼提示，因为骗子
-   会用「把地址发给我」的话术骗取令牌。这里你粘贴的目标是本机上的这个脚本，
-   令牌不会离开你的电脑，所以是安全的——但如果你不想每次都看到这个页面，
-   请改用下面的方式 2。
+    注意：这一步必须完整走完到确认页。如果中途关掉窗口或没点最终确认，
+    微软会返回「用户须重新登录并授予该客户端访问权限」，此时重跑本脚本即可。
 
-2. 设备码流程（推荐，需要一次性注册自己的 Azure 应用）
-   在浏览器里输入一个 8 位验证码即可，不需要复制粘贴地址，也不会出现上述提示页。
-   注册步骤（免费，约 3 分钟）：
-     a. 打开 https://portal.azure.com -> Microsoft Entra ID -> 应用注册 -> 新注册
-     b. 名称随意；「支持的账户类型」选择「仅个人 Microsoft 账户」
-     c. 创建后进入「身份验证」，把「允许公共客户端流」(Allow public client flows)
-        打开并保存
-     d. 复制「概述」页的「应用程序(客户端) ID」，填到下面的 AZURE_CLIENT_ID
+如果设备码流程反复失败，有两个备选：
+
+  A. 授权码流程（同样无需注册）——把 USE_AUTH_CODE 改成 True。
+     缺点：登录完要把浏览器地址栏复制回来粘贴，且微软会显示一个
+     「Microsoft 绝不会要求你复制或分享此 URL」的反钓鱼提示页。
+
+  B. 用自己的 Azure 应用走设备码（微软官方支持该授权的路径）——
+     把应用 ID 填到 AZURE_CLIENT_ID。注册免费，约 3 分钟：
+       1. https://portal.azure.com -> Microsoft Entra ID -> 应用注册 -> 新注册
+       2. 「支持的账户类型」选「仅个人 Microsoft 账户」
+       3. 创建后进入「身份验证」，打开「允许公共客户端流」并保存
+       4. 复制「概述」页的「应用程序(客户端) ID」填到下面
 """
 
 import asyncio
@@ -29,7 +30,10 @@ from pathlib import Path
 
 from protobot import authorization_code_login, authorization_url, device_code_login
 
-# 填入自己的 Azure 应用 ID 即启用设备码流程；留空则走授权码流程。
+# 备选 A：改为 True 走授权码流程（需要复制粘贴地址）
+USE_AUTH_CODE = False
+
+# 备选 B：填入自己的 Azure 应用 ID
 AZURE_CLIENT_ID = ""
 
 CACHE_FILE = Path(__file__).parent / "auth_cache.json"
@@ -38,30 +42,31 @@ CACHE_FILE = Path(__file__).parent / "auth_cache.json"
 def _open_browser(url: str) -> None:
     try:
         if webbrowser.open(url):
-            print("    （已尝试自动打开浏览器）\n")
+            print("    （已尝试自动打开浏览器）")
     except Exception:
         pass
 
 
+def show_device_code(user_code: str, verification_uri: str) -> None:
+    print(f"\n[1] 请在浏览器中打开（验证码已预填）：\n\n    {verification_uri}\n")
+    _open_browser(verification_uri)
+    print(f"[2] 验证码： {user_code}")
+    print("    如果页面没有预填，手动输入上面这串即可。\n")
+    print("[3] 登录后请**一路点到最后的确认页**，不要提前关闭窗口。")
+    print("    完成后本脚本会自动继续，无需回到这里操作。\n")
+    print("[..] 正在等待你在浏览器中完成授权（最多 15 分钟）...")
+
+
 def prompt_for_code(url: str) -> str:
-    """打印登录链接，等待用户粘贴回跳地址。"""
-    print("\n[1] 请在浏览器中打开下面的链接并登录你的微软账号：\n")
+    print("\n[1] 请在浏览器中打开下面的链接并登录：\n")
     print(f"    {url}\n")
     _open_browser(url)
-    print("[2] 登录完成后，微软可能显示一个提示页，内容大意是：")
+    print("[2] 登录完成后，微软会显示一个提示页，大意是：")
     print('    「你已进入一个通常不会显示的页面。Microsoft 绝不会要求你复制或分享此 URL」')
-    print("    这是正常的反钓鱼提示。你要粘贴到的是本机上的这个脚本，令牌不会外传。")
-    print("    （不想每次看到它，可按文件开头说明改用设备码流程。）\n")
+    print("    这是反钓鱼提示。你要粘贴到的是本机上的这个脚本，令牌不会外传。\n")
     print("[3] 请把浏览器地址栏里**整条**地址复制下来，它形如：")
     print("    https://login.live.com/oauth20_desktop.srf?code=M.C5xx...&lc=2052\n")
     return input("[4] 粘贴回跳地址（或只粘贴 code 部分）后回车： ")
-
-
-def show_device_code(user_code: str, verification_uri: str) -> None:
-    print(f"\n[1] 请在浏览器中打开： {verification_uri}")
-    _open_browser(verification_uri)
-    print(f"[2] 输入验证码： {user_code}")
-    print("[3] 在浏览器里完成授权，本脚本会自动继续（无需回到这里操作）...\n")
 
 
 async def main() -> None:
@@ -69,14 +74,23 @@ async def main() -> None:
     print("      ProtoBot 微软正版账号授权向导")
     print("=" * 60)
 
-    if AZURE_CLIENT_ID:
+    if USE_AUTH_CODE:
+        print("[方式] 授权码流程（需复制粘贴地址）")
+        profile = await authorization_code_login(prompt_callback=prompt_for_code)
+        client_id = None
+        azure_ad = False
+    elif AZURE_CLIENT_ID:
         print("[方式] 设备码流程（使用你的 Azure 应用）")
         profile = await device_code_login(
             AZURE_CLIENT_ID, prompt_callback=show_device_code
         )
+        client_id = AZURE_CLIENT_ID
+        azure_ad = True
     else:
-        print("[方式] 授权码流程（无需注册；如需免复制粘贴请见文件开头说明）")
-        profile = await authorization_code_login(prompt_callback=prompt_for_code)
+        print("[方式] 设备码流程（输验证码，无需注册）")
+        profile = await device_code_login(prompt_callback=show_device_code)
+        client_id = None
+        azure_ad = False
 
     cache_data = {
         "name": profile.name,
@@ -84,8 +98,8 @@ async def main() -> None:
         "access_token": profile.access_token,
         "refresh_token": profile.refresh_token,
         "expires_at": profile.expires_at,
-        "azure_ad": bool(AZURE_CLIENT_ID),
-        "client_id": AZURE_CLIENT_ID or None,
+        "azure_ad": azure_ad,
+        "client_id": client_id,
     }
     CACHE_FILE.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
 
@@ -104,7 +118,7 @@ async def main() -> None:
 
 
 def print_login_url() -> None:
-    """供排查使用：只打印登录链接，不走完整流程。"""
+    """供排查使用：只打印授权码流程的登录链接。"""
     print(authorization_url())
 
 
