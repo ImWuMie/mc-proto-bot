@@ -245,12 +245,12 @@ class BotSession:
             await bot.tick(MovementInput())
             await asyncio.sleep(self._tick_interval)
             tick_count += 1
-            if tick_count % self._heartbeat_ticks == 0:
-                pos = bot.player
-                info(
-                    f"[心跳] 当前坐标: X={pos.x:.1f}, Y={pos.y:.1f}, "
-                    f"Z={pos.z:.1f} | 在线中"
-                )
+            # if tick_count % self._heartbeat_ticks == 0:
+            #     pos = bot.player
+            #     info(
+            #         f"[心跳] 当前坐标: X={pos.x:.1f}, Y={pos.y:.1f}, "
+            #         f"Z={pos.z:.1f} | 在线中"
+            #     )
         if self._stop.is_set():
             info("[退出] 正在正常退出并关闭连接...")
 
