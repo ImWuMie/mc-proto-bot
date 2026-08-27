@@ -28,7 +28,7 @@ OFFLINE_USERNAME = "ProtoBot"
 CACHE_FILE = Path(__file__).parent / "auth_cache.json"
 
 
-def _save_profile(profile: MinecraftProfile) -> None:
+def _save_profile(profile: MinecraftProfile, refresh_options: dict) -> None:
     CACHE_FILE.write_text(
         json.dumps(
             {
@@ -37,6 +37,8 @@ def _save_profile(profile: MinecraftProfile) -> None:
                 "access_token": profile.access_token,
                 "refresh_token": profile.refresh_token,
                 "expires_at": profile.expires_at,
+                "azure_ad": refresh_options.get("azure_ad", False),
+                "client_id": refresh_options.get("client_id"),
             },
             indent=2,
         ),
@@ -44,13 +46,17 @@ def _save_profile(profile: MinecraftProfile) -> None:
     )
 
 
-def _load_profile() -> MinecraftProfile | None:
-    """读取本地缓存的正版凭据；缺失或损坏时返回 None。"""
+def _load_profile() -> tuple[MinecraftProfile, dict] | None:
+    """读取本地缓存的正版凭据；缺失或损坏时返回 None。
+
+    同时返回续期所需的参数：设备码流程签发的令牌必须回到 Azure AD 端点续期，
+    授权码流程签发的必须回到 MSA 端点，两者不能混用。
+    """
     if not CACHE_FILE.exists():
         return None
     try:
         data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        return MinecraftProfile(
+        profile = MinecraftProfile(
             id=uuid.UUID(data["uuid"]),
             name=data["name"],
             access_token=data["access_token"],
@@ -60,6 +66,11 @@ def _load_profile() -> MinecraftProfile | None:
     except (OSError, ValueError, KeyError) as error:
         print(f"[提示] 本地凭据缓存损坏，将重新发起登录 ({error})")
         return None
+
+    refresh_options: dict = {}
+    if data.get("azure_ad") and data.get("client_id"):
+        refresh_options = {"client_id": data["client_id"], "azure_ad": True}
+    return profile, refresh_options
 
 
 async def get_credentials() -> tuple[str, str | None, uuid.UUID | None]:
@@ -71,12 +82,12 @@ async def get_credentials() -> tuple[str, str | None, uuid.UUID | None]:
     if not ONLINE_MODE:
         return OFFLINE_USERNAME, None, None
 
-    profile = _load_profile()
-
-    if profile is None:
+    loaded = _load_profile()
+    if loaded is None:
         raise SystemExit(
             "[错误] 未找到正版凭据缓存。请先运行 login.py 完成一次微软账号授权。"
         )
+    profile, refresh_options = loaded
 
     if not profile.expired:
         print(f"[凭据] 已从本地缓存读取正版账号: {profile.name}")
@@ -89,13 +100,13 @@ async def get_credentials() -> tuple[str, str | None, uuid.UUID | None]:
 
     print(f"[凭据] 缓存令牌已过期，正在为 {profile.name} 自动续期...")
     try:
-        profile = await refresh_login(profile.refresh_token)
+        profile = await refresh_login(profile.refresh_token, **refresh_options)
     except Exception as error:
         raise SystemExit(
             f"[错误] 自动续期失败，请重新运行 login.py 授权。原因: {error}"
         ) from error
 
-    _save_profile(profile)
+    _save_profile(profile, refresh_options)
     print(f"[凭据] 续期成功: {profile.name}")
     return profile.name, profile.access_token, profile.id
 

@@ -149,6 +149,13 @@ asyncio.run(main())
 profile = await authorization_code_login(prompt_callback=my_prompt)
 ```
 
+登录完成后，微软会在回跳页显示一个反钓鱼提示页：「你已进入一个通常不会显示的
+页面。Microsoft 绝不会要求你复制或分享此 URL」。该提示针对的是"骗你把地址转发
+给他人"的钓鱼手法；粘贴到本机脚本里，令牌不会离开你的电脑。不过这终究不是理想
+模式，而回环地址（`http://localhost:...`）在公开启动器 client ID 上会被拒绝
+（返回 `invalid_request`），因此**彻底免去复制粘贴的办法是用自己的应用走设备码
+流程**。
+
 Minecraft 访问令牌大约一天过期。登录同时会返回续期令牌（refresh token），
 因此缓存的凭据可以自动续期，无需再次授权：
 
@@ -165,17 +172,24 @@ if profile.expired and profile.refresh_token:
 
 ### 设备码登录（需要你自己的 Azure 应用）
 
-`device_code_login()` 同样可用，但设备码授权只对在 Azure AD 注册过的应用开放。
-公开的启动器 client ID **无法**完成该流程——微软会先发出设备码，随后拒绝发放
-令牌并提示「用户需要重新登录或需要用户交互」——因此该函数要求显式传入
-`client_id`。请注册一个公共客户端，开启 "Allow public client flows"，并添加
-`XboxLive.signin` 委托权限，然后：
+设备码是体验最好的流程——在浏览器里输入一个短验证码即可，无需复制任何东西，
+也不会出现上面的提示页——但微软只对在 Azure AD 注册过的应用开放它。公开的
+启动器 client ID **无法**完成该流程：微软会先发出设备码，随后拒绝发放令牌并提示
+「用户需要重新登录或需要用户交互」。因此 `device_code_login()` 要求显式传入
+`client_id`，而不是等用户输完验证码才失败。
+
+注册是免费的，几分钟即可：在 [Azure 门户](https://portal.azure.com) 进入
+*Microsoft Entra ID → 应用注册 → 新注册*，账户类型选「仅个人 Microsoft 账户」，
+创建后在*身份验证*页打开「允许公共客户端流」。
 
 ```python
 profile = await device_code_login("<你的 Azure 应用 ID>")
 ...
 profile = await refresh_login(profile.refresh_token, "<你的 Azure 应用 ID>", azure_ad=True)
 ```
+
+续期必须回到签发该令牌的那一套端点，这正是 `azure_ad=True` 的作用；`login.py`
+会把这一点记录到缓存里，`run_bot.py` 便能自动选对端点续期。
 
 ## 诊断 CLI
 

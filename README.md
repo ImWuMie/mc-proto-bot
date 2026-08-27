@@ -151,6 +151,14 @@ returns whatever the user pasted back:
 profile = await authorization_code_login(prompt_callback=my_prompt)
 ```
 
+After signing in, Microsoft shows an anti-phishing interstitial on the redirect
+page: *"You've reached a page that normally isn't shown. Microsoft will never ask
+you to copy or share this URL."* That warning targets scammers who ask victims to
+forward the URL; pasting it into a script on your own machine keeps the token
+local. It is still a pattern worth avoiding, and loopback redirects (`http://localhost:...`)
+are rejected for the public launcher client ID, so the way to skip the
+copy-and-paste entirely is the device-code flow with an application of your own.
+
 Minecraft access tokens last roughly a day. The login also returns a refresh
 token, so a stored credential can be renewed without asking the user for
 anything:
@@ -169,19 +177,28 @@ indefinitely with automatic renewal.
 
 ### Device-code login (requires your own Azure application)
 
-`device_code_login()` is also available, but the device-code grant is only
-offered to applications registered in Azure AD. The public launcher client ID
-cannot complete it — Microsoft issues a device code and then refuses the token
-with *"the user could not be authenticated or user interaction is required"* — so
-the function requires an explicit `client_id`. Register a public client with
-"Allow public client flows" enabled and the `XboxLive.signin` delegated
-permission, then:
+The device-code grant is the cleanest flow — the user types a short code in a
+browser, with nothing to copy back and no interstitial — but Microsoft only
+offers it to applications registered in Azure AD. The public launcher client ID
+cannot complete it: Microsoft issues a device code and then refuses the token
+with *"the user could not be authenticated or user interaction is required"*, so
+`device_code_login()` requires an explicit `client_id` rather than failing after
+the user has already typed a code.
+
+Registering one is free and takes a few minutes: in the
+[Azure portal](https://portal.azure.com) go to *Microsoft Entra ID → App
+registrations → New registration*, choose "Personal Microsoft accounts only",
+then under *Authentication* enable "Allow public client flows".
 
 ```python
 profile = await device_code_login("<your-azure-application-id>")
 ...
 profile = await refresh_login(profile.refresh_token, "<your-azure-application-id>", azure_ad=True)
 ```
+
+Refreshes must return to the endpoint family that issued the token, which is
+what `azure_ad=True` selects; `login.py` records this in its cache so
+`run_bot.py` renews against the right endpoint automatically.
 
 ## Diagnostic CLI
 
