@@ -33,8 +33,11 @@ python -m pip install -e .
 # 包含正版验证支持
 python -m pip install -e ".[online]"
 
+# 包含 TUI 界面支持
+python -m pip install -e ".[tui]"
+
 # 或使用 uv
-uv sync --extra online
+uv sync --extra online --extra tui
 ```
 
 ## 快速开始
@@ -314,6 +317,25 @@ class AutoReply(Plugin):
 - **配置开关**：`[plugins] disabled = ["auto_reply"]` 可禁用插件，依赖
   被禁用插件的插件会被一并禁用并提示。
 
+### 全屏 TUI 界面（可选）
+
+`protobot run` 支持类似 Claude Code 的全屏界面：顶栏输入框（输入消息回车
+发送聊天，`/命令` 执行服务器命令）、中间滚动日志区（会话与插件的全部输出）、
+底部三栏状态条（bot 名字 / 坐标 / 服务器·版本·模式·连接时长）。界面基于
+[Textual](https://github.com/Textualize/textual)，作为可选依赖安装，核心
+仍然零依赖：
+
+```bash
+uv sync --extra tui              # 或 pip install -e ".[tui]"
+uv run protobot run              # 在真终端（Windows Terminal 等）中运行
+```
+
+- **真终端**（Windows Terminal / VS Code 终端 / macOS / Linux）自动启用
+  全屏界面，Ctrl+C 退出。
+- **PyCharm 控制台、管道、CI** 自动降级为普通逐行日志；未安装 extra 时会
+  打印一次提示并同样降级。
+- 配置开关：`[tui] enabled = false` 可彻底关闭（默认 `true`）。
+
 ## 诊断 CLI
 
 安装后会附带三个控制台命令：
@@ -347,6 +369,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `text.py` | 聊天组件转纯文本（`plain_text`） |
 | `config.py` | 零依赖的 YAML 子集编解码（`config.yaml`） |
 | `cli_app.py` | 统一 CLI：`protobot login|run|plugins|setup` |
+| `tui.py` | Textual 全屏 TUI（可选 `tui` extra）与普通日志降级 |
 | `data/` | 内置各版本方块状态表 |
 | `cli.py` | 诊断控制台命令 |
 | `plugins/` | 示例插件（chat_logger、auto_reply） |

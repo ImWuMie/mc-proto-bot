@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sys
 import uuid
@@ -27,6 +28,7 @@ from .config import load_config, save_config
 from .plugin import PluginError, PluginManager, PluginWatcher
 from .protocol.versions import SUPPORTED_VERSIONS
 from .session import BotContainer, BotSession, SessionConfig
+from .tui import ProtoBotApp, StdoutProxy, tui_enabled
 
 DEFAULT_CONFIG = Path("config.yaml")
 
@@ -36,6 +38,7 @@ __all__ = [
     "load_plugin_config",
     "load_profile",
     "load_session_config",
+    "load_tui_config",
     "main",
     "run_bot_session",
     "run_login",
@@ -99,6 +102,12 @@ def load_plugin_config(data: dict, base_dir: Path) -> PluginConfig:
         disabled=tuple(str(name) for name in disabled),
         watch=bool(plugins.get("watch", True)),
     )
+
+
+def load_tui_config(data: dict) -> bool:
+    """从 config.yaml 读取 [tui] enabled（缺省 True）。"""
+    tui = data.get("tui", {})
+    return bool(tui.get("enabled", True)) if isinstance(tui, dict) else True
 
 
 # ======================== 凭据缓存（与旧 login.py / run_bot.py 同格式） ========================
@@ -311,6 +320,7 @@ def run_setup(config_path: Path) -> int:
             "reconnect_max_attempts": None,
         },
         "plugins": {"directory": "plugins", "disabled": [], "watch": True},
+        "tui": {"enabled": True},
     }
     save_config(config_path, data)
 
@@ -428,7 +438,21 @@ async def run_bot_session(args: argparse.Namespace) -> int:
         )
         print("[插件] 热更新监视已启动（编辑 plugins/ 下的文件即生效）。")
     try:
-        await container.run()
+        if tui_enabled(load_tui_config(data)):
+            # 单事件循环：container 任务与 Textual App 共存；全部 print 经
+            # 代理进入日志区。UI 退出（Ctrl+C）→ request_stop；容器先结束
+            # （重连上限等）→ App 自行 exit。
+            proxy = StdoutProxy()
+            container_task = asyncio.create_task(
+                container.run(), name="protobot-container"
+            )
+            app = ProtoBotApp(session, container_task, proxy)
+            with contextlib.redirect_stdout(proxy):
+                await app.run_async()
+            session.request_stop()
+            await container_task
+        else:
+            await container.run()
     finally:
         if watcher is not None:
             watcher.request_stop()

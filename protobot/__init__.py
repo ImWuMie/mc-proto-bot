@@ -52,6 +52,7 @@ from .protocol.versions import SUPPORTED_VERSIONS, VersionSpec, get_version
 from .session import BotContainer, BotSession, SessionConfig
 from .srv import resolve_minecraft_srv
 from .text import plain_text
+from .tui import ProtoBotApp, StdoutProxy, classify_submission, tui_enabled
 from .state import (
     ContainerState,
     EntityMetadataValue,
@@ -104,14 +105,17 @@ __all__ = [
     "PluginError",
     "PluginManager",
     "PluginWatcher",
+    "ProtoBotApp",
     "ProtocolError",
     "SessionConfig",
     "StaticCollisionWorld",
+    "StdoutProxy",
     "StatusEffect",
     "UnsupportedVersion",
     "Vec3",
     "VersionSpec",
     "World",
+    "classify_submission",
     "connect",
     "get_version",
     "make_adapter",
@@ -124,4 +128,5 @@ __all__ = [
     "device_code_login",
     "join_session_server",
     "refresh_login",
+    "tui_enabled",
 ]

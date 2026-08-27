@@ -33,8 +33,11 @@ python -m pip install -e .
 # With online-mode authentication support
 python -m pip install -e ".[online]"
 
+# With TUI interface support
+python -m pip install -e ".[tui]"
+
 # Or with uv
-uv sync --extra online
+uv sync --extra online --extra tui
 ```
 
 ## Quick start
@@ -333,6 +336,27 @@ Notes:
 - **Config switches** — `[plugins] disabled = ["auto_reply"]` disables a
   plugin; anything depending on it is disabled too, with a notice.
 
+### Full-screen TUI (optional)
+
+`protobot run` also ships a Claude-Code-style full-screen interface: an input
+row on top (type a message and press Enter to chat; `/command` runs a server
+command), a scrolling log area in the middle (everything the session and
+plugins print), and a three-column footer (bot name / coordinates / server ·
+version · mode · connection uptime). It is built on
+[Textual](https://github.com/Textualize/textual) as an optional extra, so the
+core stays dependency-free:
+
+```bash
+uv sync --extra tui              # or pip install -e ".[tui]"
+uv run protobot run              # in a real terminal (Windows Terminal etc.)
+```
+
+- **Real terminals** (Windows Terminal, VS Code terminal, macOS, Linux) get
+  the full-screen UI; Ctrl+C exits.
+- **PyCharm consoles, pipes, and CI** fall back to plain line logging
+  automatically; a missing extra prints a one-time hint and falls back too.
+- Config switch: `[tui] enabled = false` turns it off entirely (default `true`).
+
 ## Diagnostic CLI
 
 Three console commands are installed with the package:
@@ -366,6 +390,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `text.py` | Chat-component plain-text rendering (`plain_text`) |
 | `config.py` | Dependency-free YAML-subset codec for `config.yaml` |
 | `cli_app.py` | Unified CLI: `protobot login|run|plugins|setup` |
+| `tui.py` | Textual full-screen TUI (optional `tui` extra) with plain-log fallback |
 | `data/` | Bundled per-version block-state tables |
 | `cli.py` | Diagnostic console commands |
 | `plugins/` | Example plugins (chat_logger, auto_reply) |

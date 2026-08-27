@@ -13,3 +13,4 @@ config.yaml
 protobot-live.log
 .claude/settings.local.json
 
+/run/

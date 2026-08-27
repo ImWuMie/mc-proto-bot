@@ -9,6 +9,9 @@ dependencies = []
 online = [
     "cryptography>=42.0.0",
 ]
+tui = [
+    "textual>=1.0",
+]
 
 # Development-only tooling. Runtime stays dependency-free; the suite also runs
 # under ``python -m unittest`` with nothing installed at all.
