@@ -18,6 +18,7 @@ from .errors import (
     ProtocolError,
     UnsupportedVersion,
 )
+from . import log
 from .modlist import (
     ChannelFlow,
     ChannelSpec,
@@ -127,6 +128,7 @@ __all__ = [
     "authorization_url",
     "device_code_login",
     "join_session_server",
+    "log",
     "refresh_login",
     "tui_enabled",
 ]

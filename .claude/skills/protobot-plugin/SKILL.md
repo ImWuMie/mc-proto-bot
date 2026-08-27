@@ -110,13 +110,21 @@ mod-loader events; ordinary plugins do not need them.
 6. **Zero third-party dependencies**: plugins may import only the stdlib and
    `protobot`; plugin files cannot import each other (the plugin directory is
    not on sys.path). Keep files UTF-8 with Chinese comments and Chinese console
-   output in the existing `[标签]` style.
+   output in the existing `[标签]` style. **Log via `protobot.log`, not
+   `print()`**: while the TUI runs, Textual captures stdout and plain prints
+   are lost — `from protobot import log; log.info("[聊天]", text)` routes to
+   the TUI log area (and falls back to print outside the TUI). `warn` /
+   `error` / `debug` add `[警告]` / `[错误]` / `[调试]` prefixes; call
+   signatures match `print` (positional args, `sep`, `end`).
 7. **Chat-sending limits**: `send_message()` is capped at 256 characters and is
    unsigned (dropped by enforce-secure-profile servers); `send_command()` is
    unaffected.
 
 ## Bot API available to plugins (public)
 
+- Logging: `from protobot import log` → `log.info(*args, sep=" ", end="\n")`,
+  `log.warn(...)`, `log.error(...)`, `log.debug(...)` — print-style calls that
+  reach the TUI log area (plain `print()` output is swallowed by the TUI)
 - Chat: `await self.bot.send_message(text)` / `await self.bot.send_command(cmd)` (leading `/` stripped)
 - Movement: `await self.bot.tick(MovementInput())` (one 20 Hz physics tick),
   `walk_to(x, z, sprint=False)`, `navigate_to(x, z, sprint=False)` (A*),

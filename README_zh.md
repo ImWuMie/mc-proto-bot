@@ -346,6 +346,10 @@ uv run protobot run              # 在真终端（Windows Terminal 等）中运�
 - **PyCharm 控制台、管道、CI** 自动降级为普通逐行日志（此时 bot 照常
   自动启动，无需 `.run`）；未安装 extra 时会打印一次提示并同样降级。
 - 配置开关：`[tui] enabled = false` 可彻底关闭（默认 `true`）。
+- **插件日志**：TUI 运行期间 Textual 会吞掉 `print()` 输出——插件应使用
+  `from protobot import log` 的 `log.info/warn/error/debug(...)`（调用格式
+  与 `print` 相同），这些输出会自动进入日志区；非 TUI 模式下降级为普通
+  print。
 
 ## 诊断 CLI
 

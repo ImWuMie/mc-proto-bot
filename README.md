@@ -368,6 +368,10 @@ while typing `.`:
   automatically (the bot then auto-starts as before, no `.run` needed); a
   missing extra prints a one-time hint and falls back too.
 - Config switch: `[tui] enabled = false` turns it off entirely (default `true`).
+- **Plugin logging**: while the TUI runs, Textual swallows `print()` output —
+  plugins should use `from protobot import log` with `log.info/warn/error/
+  debug(...)` (print-style calls), which land in the TUI log area and degrade
+  to plain prints outside the TUI.
 
 ## Diagnostic CLI
 

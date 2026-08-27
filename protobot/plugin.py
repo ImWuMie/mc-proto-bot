@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .events import EventHandler
+from .log import error as log_error
+from .log import warn
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from .client import Bot
@@ -143,7 +145,7 @@ class Plugin:
             except asyncio.CancelledError:
                 raise  # never swallow cancellation
             except Exception as error:  # Exception only, never BaseException
-                print(f"[插件] {plugin_name} 处理事件时出错: {error!r}")
+                log_error(f"[插件] {plugin_name} 处理事件时出错: {error!r}")
                 traceback.print_exc()
 
         return wrapped
@@ -167,7 +169,7 @@ def resolve_load_order(plugins: dict[str, Plugin], disabled: set[str]) -> list[P
                 continue
             if any(dep in disabled for dep in plugin.dependencies):
                 disabled.add(name)
-                print(f"[插件] {name} 依赖的插件已被禁用，将一并禁用。")
+                warn(f"[插件] {name} 依赖的插件已被禁用，将一并禁用。")
                 changed = True
 
     # Validation: enabled plugins may only depend on existing, enabled plugins.
@@ -470,7 +472,7 @@ class PluginManager:
                 if other_name in to_close:
                     continue
                 if any(dep in to_close for dep in other.dependencies):
-                    print(f"[插件] {other_name} 依赖的插件已关闭，将一并关闭。")
+                    warn(f"[插件] {other_name} 依赖的插件已关闭，将一并关闭。")
                     to_close.add(other_name)
                     changed = True
         for closing in to_close:
@@ -537,7 +539,7 @@ class PluginManager:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            print(f"[插件] {plugin.name} 生命周期钩子出错 ({hook}): {error!r}")
+            log_error(f"[插件] {plugin.name} 生命周期钩子出错 ({hook}): {error!r}")
             traceback.print_exc()
 
 
@@ -576,7 +578,7 @@ class PluginWatcher:
             try:
                 await self.check_once()
             except Exception as error:
-                print(f"[插件] 热更新失败: {error!r}")
+                log_error(f"[插件] 热更新失败: {error!r}")
                 traceback.print_exc()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)

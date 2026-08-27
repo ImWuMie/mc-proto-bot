@@ -285,6 +285,28 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel()
 
+    async def test_log_sink_feeds_the_tui_log_area(self) -> None:
+        # The end-to-end chain: protobot.log -> sink -> proxy -> drain -> log.
+        # (Textual swallows plain print() output while running, so this is the
+        # only path for session/plugin logging to reach the UI.)
+        from protobot import log
+
+        proxy = StdoutProxy()
+        session = FakeSession(bot=None)
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        app = ProtoBotApp(session, manager=None, proxy=proxy)
+        try:
+            async with app.run_test():
+                log.set_sink(lambda line: proxy.write(line + "\n"))
+                log.info("[心跳] tick 1")
+                log.warn("careful")
+                app._drain_logs()
+            self.assertTrue(any("tick 1" in line for line in app.log_lines))
+            self.assertTrue(any("careful" in line for line in app.log_lines))
+        finally:
+            log.set_sink(None)
+            task.cancel()
+
     async def test_send_failure_is_logged_not_fatal(self) -> None:
         bot = FakeBot()
 

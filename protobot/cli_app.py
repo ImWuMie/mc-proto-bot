@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import json
 import sys
 import uuid
@@ -25,6 +24,7 @@ from . import (
     refresh_login,
 )
 from .config import load_config, save_config
+from .log import info, set_sink
 from .plugin import PluginError, PluginManager, PluginWatcher
 from .protocol.versions import SUPPORTED_VERSIONS
 from .session import BotContainer, BotSession, SessionConfig
@@ -151,7 +151,7 @@ def load_profile(cache_file: Path) -> tuple[MinecraftProfile, dict] | None:
             expires_at=float(data.get("expires_at", 0.0)),
         )
     except (OSError, ValueError, KeyError) as error:
-        print(f"[提示] 本地凭据缓存损坏，将重新发起登录 ({error})")
+        info(f"[提示] 本地凭据缓存损坏，将重新发起登录 ({error})")
         return None
 
     refresh_options: dict = {}
@@ -179,7 +179,7 @@ async def get_credentials(
     profile, refresh_options = loaded
 
     if not profile.expired:
-        print(f"[凭据] 已从本地缓存读取正版账号: {profile.name}")
+        info(f"[凭据] 已从本地缓存读取正版账号: {profile.name}")
         return profile.name, profile.access_token, profile.id
 
     if not profile.refresh_token:
@@ -187,7 +187,7 @@ async def get_credentials(
             "[错误] 缓存令牌已过期且没有续期令牌，请重新运行 protobot login 授权。"
         )
 
-    print(f"[凭据] 缓存令牌已过期，正在为 {profile.name} 自动续期...")
+    info(f"[凭据] 缓存令牌已过期，正在为 {profile.name} 自动续期...")
     try:
         profile = await refresh_login(profile.refresh_token, **refresh_options)
     except Exception as error:
@@ -196,7 +196,7 @@ async def get_credentials(
         ) from error
 
     save_profile(cache_file, profile, refresh_options)
-    print(f"[凭据] 续期成功: {profile.name}")
+    info(f"[凭据] 续期成功: {profile.name}")
     return profile.name, profile.access_token, profile.id
 
 
@@ -437,19 +437,21 @@ async def run_bot_session(args: argparse.Namespace) -> int:
         print("[插件] 热更新监视已启动（编辑 plugins/ 下的文件即生效）。")
     try:
         if tui_enabled(load_tui_config(data)):
-            # 单事件循环：Textual App 与 session 任务共存；全部 print 经代理
-            # 进入日志区。会话由界面内的 .run 命令启动，UI 退出（Ctrl+C /
-            # .quit）→ request_stop + 等待会话优雅结束。
+            # 单事件循环：Textual App 与 session 任务共存。Textual 运行期会
+            # 捕获 stdout（print 会丢失），因此 protobot.log 的 sink 直连
+            # 代理队列进入日志区；会话由界面内的 .run 命令启动，UI 退出
+            # （Ctrl+C）→ request_stop + 等待会话优雅结束。
             proxy = StdoutProxy()
             app = ProtoBotApp(session, manager, proxy)
             await manager.enable_all()
+            set_sink(lambda line: proxy.write(line + "\n"))
             try:
-                with contextlib.redirect_stdout(proxy):
-                    await app.run_async()
+                await app.run_async()
             finally:
                 session.request_stop()
                 if app.session_task is not None:
                     await app.session_task
+                set_sink(None)  # 恢复 print 路由
                 await manager.disable_all()
         else:
             container = BotContainer(plugin_manager=manager)

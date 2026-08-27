@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from .events import EventBus
+from .log import error as log_error
+from .log import info
 from .physics import MovementInput
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
@@ -158,7 +160,7 @@ class BotSession:
         attempt = 1
         while not self._stop.is_set():
             await self.events.emit("session_connecting", attempt)
-            print(
+            info(
                 f"[连接] 正在连接服务器 {self.config.host}:{self.config.port} "
                 f"(版本: {self.config.version}) ..."
             )
@@ -167,7 +169,7 @@ class BotSession:
                 # disconnected between retries.
                 username, access_token, profile_uuid = await self._credentials()
                 mode = "正版验证 (Online Mode)" if access_token else "离线模式 (Offline Mode)"
-                print(f"[模式] {mode}")
+                info(f"[模式] {mode}")
                 bot = await self._connector(
                     self.config, username, access_token, profile_uuid
                 )
@@ -176,7 +178,7 @@ class BotSession:
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # Exception only, never BaseException
-                print(f"[错误] 第 {attempt} 次连接失败: {error}")
+                log_error(f"第 {attempt} 次连接失败: {error}")
                 if not await self._maybe_reconnect(attempt):
                     break
                 attempt += 1
@@ -186,19 +188,19 @@ class BotSession:
             if self._plugins is not None:
                 await self._plugins.bind_all(bot)
             await self.events.emit("session_ready", bot)
-            print(
+            info(
                 f"[成功] 机器人已进入游戏！\n"
                 f"       玩家名: {bot.username}\n"
                 f"       出生位置: X={bot.player.x:.2f}, "
                 f"Y={bot.player.y:.2f}, Z={bot.player.z:.2f}"
             )
 
-            print("[等待] 正在加载世界区块...")
+            info("[等待] 正在加载世界区块...")
             try:
                 await bot.wait_world(timeout=self._wait_world_timeout)
-                print(f"[世界] 已加载 {len(bot.world.chunks)} 个区块！")
+                info(f"[世界] 已加载 {len(bot.world.chunks)} 个区块！")
             except Exception:
-                print("[世界] 等待区块超时，继续保持在线...")
+                info("[世界] 等待区块超时，继续保持在线...")
 
             try:
                 await self._tick_loop(bot)
@@ -222,10 +224,10 @@ class BotSession:
             return False
         max_attempts = self.config.reconnect_max_attempts
         if max_attempts is not None and attempt >= max_attempts:
-            print(f"[提示] 已达重连次数上限 ({max_attempts})，停止重试。")
+            info(f"[提示] 已达重连次数上限 ({max_attempts})，停止重试。")
             return False
         delay = self.config.reconnect_delay
-        print(f"[重连] {delay:.0f} 秒后重试...")
+        info(f"[重连] {delay:.0f} 秒后重试...")
         await self._sleep_or_stop(delay)
         return True
 
@@ -237,7 +239,7 @@ class BotSession:
             pass  # delay elapsed; retry
 
     async def _tick_loop(self, bot: Bot) -> None:
-        print("\n[运行中] 机器人正在运行 (按 Ctrl + C 可退出)...")
+        info("\n[运行中] 机器人正在运行 (按 Ctrl + C 可退出)...")
         tick_count = 0
         while not bot.closed.is_set() and not self._stop.is_set():
             await bot.tick(MovementInput())
@@ -245,12 +247,12 @@ class BotSession:
             tick_count += 1
             if tick_count % self._heartbeat_ticks == 0:
                 pos = bot.player
-                print(
+                info(
                     f"[心跳] 当前坐标: X={pos.x:.1f}, Y={pos.y:.1f}, "
                     f"Z={pos.z:.1f} | 在线中"
                 )
         if self._stop.is_set():
-            print("[退出] 正在正常退出并关闭连接...")
+            info("[退出] 正在正常退出并关闭连接...")
 
 
 class BotContainer:
