@@ -17,15 +17,27 @@ from typing import Any
 from .errors import AuthenticationError, OnlineModeRequired
 
 # Public client ID of the Minecraft launcher. It belongs to the legacy
-# Microsoft-account (MSA) endpoints below, not to Azure AD: posting it to
-# ``login.microsoftonline.com/consumers/oauth2/v2.0/devicecode`` is rejected
-# with ``AADSTS700016`` because it is not a registered AAD application. The
-# MSA endpoints need no app registration of your own.
+# Microsoft-account (MSA) endpoints and supports the *authorization-code* flow
+# without any app registration of your own.
+#
+# It cannot be used for the device-code flow: the MSA device endpoint hands out
+# a device code for any scope, but the later token poll fails with "The user
+# could not be authenticated or user interaction is required" because this
+# client can never be granted the requested scope. Device code needs an
+# application you registered in Azure AD -- see ``device_code_login``.
 DEFAULT_MICROSOFT_CLIENT_ID = "00000000402b5328"
 
-_MSA_DEVICE_CODE_URL = "https://login.live.com/oauth20_connect.srf"
+# Legacy MSA endpoints (authorization-code flow, no registration required).
+_MSA_AUTHORIZE_URL = "https://login.live.com/oauth20_authorize.srf"
 _MSA_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
+_MSA_REDIRECT_URI = "https://login.live.com/oauth20_desktop.srf"
 _MSA_SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
+
+# Azure AD v2.0 endpoints (device-code flow, needs your own registered app).
+_AAD_DEVICE_CODE_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+_AAD_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+_AAD_SCOPE = "XboxLive.signin offline_access"
+
 _DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
 _XBL_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
@@ -371,33 +383,163 @@ async def _minecraft_profile(
     )
 
 
-async def device_code_login(
+def authorization_url(
     client_id: str = DEFAULT_MICROSOFT_CLIENT_ID,
+    *,
+    redirect_uri: str = _MSA_REDIRECT_URI,
+) -> str:
+    """Build the Microsoft sign-in URL for the authorization-code flow."""
+
+    query = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": _MSA_SCOPE,
+        }
+    )
+    return f"{_MSA_AUTHORIZE_URL}?{query}"
+
+
+def extract_authorization_code(pasted: str) -> str:
+    """Pull the ``code`` out of the redirect URL the browser landed on.
+
+    Accepts either the full ``https://login.live.com/oauth20_desktop.srf?code=...``
+    URL or a bare code, since users paste both. A redirect carrying ``error``
+    instead of ``code`` is reported with Microsoft's own description.
+    """
+
+    pasted = pasted.strip()
+    if not pasted:
+        raise AuthenticationError("No authorization code was provided.")
+
+    is_url = pasted.startswith(("http://", "https://"))
+    if is_url or "?" in pasted or "code=" in pasted or "error=" in pasted:
+        query = urllib.parse.urlsplit(pasted).query
+        if not query:
+            query = pasted.partition("?")[2] or pasted
+        values = urllib.parse.parse_qs(query)
+        if "error" in values:
+            description = values.get("error_description", values["error"])[0]
+            raise AuthenticationError(f"Microsoft denied the sign-in: {description}")
+        codes = values.get("code")
+        if codes and codes[0]:
+            return codes[0]
+        raise AuthenticationError(
+            "That URL carries no authorization code. Sign in fully, then copy the "
+            "address bar once it points at login.live.com/oauth20_desktop.srf."
+        )
+
+    return pasted
+
+
+def _default_code_prompt(url: str) -> str:
+    print("\n[ProtoBot Auth] Open this URL in your browser and sign in:")
+    print(f"  {url}")
+    print(
+        "\n[ProtoBot Auth] After signing in the page will look blank. Copy the "
+        "whole address bar\n                (it starts with "
+        "https://login.live.com/oauth20_desktop.srf?code=) and paste it here."
+    )
+    return input("\n[ProtoBot Auth] Redirect URL (or just the code): ")
+
+
+async def authorization_code_login(
+    client_id: str = DEFAULT_MICROSOFT_CLIENT_ID,
+    *,
+    redirect_uri: str = _MSA_REDIRECT_URI,
+    prompt_callback: Callable[[str], str] | None = None,
+) -> MinecraftProfile:
+    """Sign in to a Minecraft account with the Microsoft authorization-code flow.
+
+    This is the flow that works with the public launcher client ID, so it needs
+    no Azure application of your own. The caller is shown a URL, signs in with a
+    browser, and hands back the redirect URL it lands on.
+
+    Args:
+        client_id: Microsoft client ID. The default public launcher ID is fine.
+        redirect_uri: Must match the one registered for ``client_id``.
+        prompt_callback: Receives the sign-in URL and returns the redirect URL
+            (or bare code) the user copied. If None, prompts on stdin.
+
+    Returns:
+        A :class:`MinecraftProfile` with the player UUID, username, Minecraft
+        bearer token, and a refresh token usable with :func:`refresh_login`.
+    """
+
+    url = authorization_url(client_id, redirect_uri=redirect_uri)
+    prompt = prompt_callback or _default_code_prompt
+    pasted = await asyncio.to_thread(prompt, url)
+    code = extract_authorization_code(pasted)
+
+    status, token_res = await asyncio.to_thread(
+        _http_post_form,
+        _MSA_TOKEN_URL,
+        {
+            "client_id": client_id,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+            "scope": _MSA_SCOPE,
+        },
+    )
+    if status != 200 or not isinstance(token_res, dict) or "access_token" not in token_res:
+        description = (
+            token_res.get("error_description", token_res.get("error"))
+            if isinstance(token_res, dict)
+            else token_res
+        )
+        raise AuthenticationError(
+            f"Microsoft code exchange failed (HTTP {status}): {description}. "
+            "Authorization codes are single-use and expire quickly — sign in again."
+        )
+
+    return await _minecraft_profile(
+        token_res["access_token"], token_res.get("refresh_token")
+    )
+
+
+async def device_code_login(
+    client_id: str | None = None,
     *,
     prompt_callback: Callable[[str, str], None] | None = None,
 ) -> MinecraftProfile:
     """Perform an interactive Microsoft Device Code login for a Minecraft account.
 
+    The device-code grant is only available to applications registered in Azure
+    AD, so ``client_id`` is required: register a public client with the
+    "Allow public client flows" option enabled and the ``XboxLive.signin``
+    delegated permission. Use :func:`authorization_code_login` if you would
+    rather not register anything.
+
     Args:
-        client_id: Microsoft client ID. Defaults to the public Minecraft
-            launcher ID, which pairs with the legacy MSA endpoints.
+        client_id: Your Azure AD application (client) ID.
         prompt_callback: Callable receiving ``(user_code, verification_uri)``.
             If None, the code and URL are printed to stdout.
 
     Returns:
         A :class:`MinecraftProfile` with the player UUID, username, Minecraft
-        bearer token, and — when the identity provider issues one — a refresh
-        token usable with :func:`refresh_login`.
+        bearer token, and a refresh token usable with
+        ``refresh_login(..., azure_ad=True)``.
     """
+
+    if not client_id or client_id == DEFAULT_MICROSOFT_CLIENT_ID:
+        raise AuthenticationError(
+            "device_code_login() requires your own Azure AD application ID. The "
+            "public launcher client ID cannot complete the device-code grant: "
+            "Microsoft issues a device code but then refuses the token with "
+            "'user interaction is required'. Either pass client_id=<your Azure "
+            "app id>, or call authorization_code_login(), which needs no "
+            "registration."
+        )
 
     # 1. Request a device code.
     status, device_info = await asyncio.to_thread(
         _http_post_form,
-        _MSA_DEVICE_CODE_URL,
+        _AAD_DEVICE_CODE_URL,
         {
             "client_id": client_id,
-            "scope": _MSA_SCOPE,
-            "response_type": "device_code",
+            "scope": _AAD_SCOPE,
         },
     )
     if status != 200 or not isinstance(device_info, dict) or "device_code" not in device_info:
@@ -407,7 +549,7 @@ async def device_code_login(
 
     device_code = device_info["device_code"]
     user_code = device_info["user_code"]
-    verification_uri = device_info.get("verification_uri", "https://microsoft.com/link")
+    verification_uri = device_info.get("verification_uri", "https://microsoft.com/devicelogin")
     interval = float(device_info.get("interval", 5))
     expires_in = float(device_info.get("expires_in", 900))
 
@@ -432,7 +574,7 @@ async def device_code_login(
             )
 
         status, token_res = await asyncio.to_thread(
-            _http_post_form, _MSA_TOKEN_URL, token_params
+            _http_post_form, _AAD_TOKEN_URL, token_params
         )
         if status == 200 and isinstance(token_res, dict) and "access_token" in token_res:
             return await _minecraft_profile(
@@ -459,27 +601,37 @@ async def device_code_login(
         raise AuthenticationError(f"Microsoft login failed (HTTP {status}): {description}")
 
 
+
 async def refresh_login(
     refresh_token: str,
     client_id: str = DEFAULT_MICROSOFT_CLIENT_ID,
+    *,
+    azure_ad: bool = False,
 ) -> MinecraftProfile:
     """Mint a fresh Minecraft token from a stored refresh token.
 
     Minecraft access tokens last about a day, so a cached credential needs this
     before it can be reused. Raises :class:`AuthenticationError` if the refresh
     token has itself been revoked or expired, in which case the caller should
-    fall back to :func:`device_code_login`.
+    fall back to an interactive login.
+
+    Args:
+        refresh_token: The token stored alongside the previous login.
+        client_id: The same client ID the refresh token was issued to.
+        azure_ad: Set when the token came from :func:`device_code_login`, so the
+            refresh goes to the Azure AD endpoint rather than the MSA one.
     """
 
-    status, token_res = await asyncio.to_thread(
-        _http_post_form,
-        _MSA_TOKEN_URL,
-        {
-            "client_id": client_id,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        },
-    )
+    params = {
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    if azure_ad:
+        params["scope"] = _AAD_SCOPE
+    token_url = _AAD_TOKEN_URL if azure_ad else _MSA_TOKEN_URL
+
+    status, token_res = await asyncio.to_thread(_http_post_form, token_url, params)
     if status != 200 or not isinstance(token_res, dict) or "access_token" not in token_res:
         description = (
             token_res.get("error_description", token_res.get("error"))

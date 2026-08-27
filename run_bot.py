@@ -8,11 +8,11 @@ import json
 import uuid
 from pathlib import Path
 
-from protobot import MinecraftProfile, MovementInput, connect, device_code_login, refresh_login
+from protobot import MinecraftProfile, MovementInput, connect, refresh_login
 
 # ======================== 配置区域 ========================
 # 服务器地址与端口
-SERVER_HOST = "127.0.0.1"
+SERVER_HOST = "wolfx.jp"
 SERVER_PORT = 25565
 
 # 服务器协议版本：支持 "1.21.11", "26.1", "26.1.1", "26.1.2", "26.2"
@@ -65,34 +65,38 @@ def _load_profile() -> MinecraftProfile | None:
 async def get_credentials() -> tuple[str, str | None, uuid.UUID | None]:
     """获取连接凭据（正版或离线）。
 
-    正版模式下优先复用本地缓存；令牌过期时用 refresh token 自动续期，
-    续期失败才回退到交互式扫码登录。
+    正版模式下优先复用本地缓存；令牌过期时用 refresh token 自动续期。
+    续期不可用时提示重新运行 login.py（授权需要浏览器交互，不在本脚本内进行）。
     """
     if not ONLINE_MODE:
         return OFFLINE_USERNAME, None, None
 
     profile = _load_profile()
 
-    if profile is not None and not profile.expired:
+    if profile is None:
+        raise SystemExit(
+            "[错误] 未找到正版凭据缓存。请先运行 login.py 完成一次微软账号授权。"
+        )
+
+    if not profile.expired:
         print(f"[凭据] 已从本地缓存读取正版账号: {profile.name}")
         return profile.name, profile.access_token, profile.id
 
-    if profile is not None and profile.refresh_token:
-        print(f"[凭据] 缓存令牌已过期，正在为 {profile.name} 自动续期...")
-        try:
-            profile = await refresh_login(profile.refresh_token)
-            _save_profile(profile)
-            print(f"[凭据] 续期成功: {profile.name}")
-            return profile.name, profile.access_token, profile.id
-        except Exception as error:
-            print(f"[提示] 自动续期失败，需要重新扫码登录 ({error})")
-    elif profile is not None:
-        print("[提示] 缓存令牌已过期且没有续期令牌，需要重新扫码登录")
+    if not profile.refresh_token:
+        raise SystemExit(
+            "[错误] 缓存令牌已过期且没有续期令牌，请重新运行 login.py 授权。"
+        )
 
-    # 首次运行、或续期不可用时发起微软登录
-    print("\n[认证] 正在发起微软正版登录...")
-    profile = await device_code_login()
+    print(f"[凭据] 缓存令牌已过期，正在为 {profile.name} 自动续期...")
+    try:
+        profile = await refresh_login(profile.refresh_token)
+    except Exception as error:
+        raise SystemExit(
+            f"[错误] 自动续期失败，请重新运行 login.py 授权。原因: {error}"
+        ) from error
+
     _save_profile(profile)
+    print(f"[凭据] 续期成功: {profile.name}")
     return profile.name, profile.access_token, profile.id
 
 

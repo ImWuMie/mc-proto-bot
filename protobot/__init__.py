@@ -2,6 +2,8 @@
 
 from .auth import (
     MinecraftProfile,
+    authorization_code_login,
+    authorization_url,
     device_code_login,
     join_session_server,
     minecraft_sha1_digest,
@@ -104,6 +106,8 @@ __all__ = [
     "make_adapter",
     "minecraft_sha1_digest",
     "MinecraftProfile",
+    "authorization_code_login",
+    "authorization_url",
     "device_code_login",
     "join_session_server",
     "refresh_login",

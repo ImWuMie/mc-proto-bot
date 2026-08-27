@@ -9,7 +9,7 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 ## Features
 
 - **Full protocol stack** — handshake → login → configuration → play, keep-alive, teleport confirmation, chunk decoding, and server transfers, all bounds-checked and deterministic.
-- **Online & offline mode** — full support for Mojang session-server authenticated login (RSA/AES-CFB8 stream encryption) and Microsoft Device Code OAuth, as well as offline-mode servers.
+- **Online & offline mode** — full support for Mojang session-server authenticated login (RSA/AES-CFB8 stream encryption) and Microsoft OAuth sign-in (authorization-code by default, device-code with your own Azure app), as well as offline-mode servers.
 - **Multiple releases** — Minecraft `1.21.11`, `26.1`, `26.1.1`, `26.1.2`, and `26.2` out of the box (bundled per-version block-state tables).
 - **Client-side physics** — a 20 Hz deterministic physics engine that mirrors vanilla movement, including boats and hard entity collision.
 - **Navigation** — A\* path planning and execution over the decoded world with automatic replanning.
@@ -119,15 +119,17 @@ async def main():
 asyncio.run(main())
 ```
 
-Or perform interactive Microsoft Device Code login:
+Or sign in interactively with a Microsoft account. The default flow is the
+authorization-code flow, which works with the public launcher client ID and
+needs no Azure application of your own:
 
 ```python
 import asyncio
-from protobot import connect, device_code_login
+from protobot import authorization_code_login, connect
 
 async def main():
-    # Prompts to visit https://www.microsoft.com/link and enter a code
-    profile = await device_code_login()
+    # Prints a Microsoft sign-in URL, then asks for the redirect URL it lands on
+    profile = await authorization_code_login()
 
     bot = await connect(
         "mc.example.com",
@@ -142,9 +144,16 @@ async def main():
 asyncio.run(main())
 ```
 
-Minecraft access tokens last roughly a day. `device_code_login()` also returns a
-refresh token, so a stored credential can be renewed without asking the user to
-enter another code:
+Supply your own prompt to integrate with a GUI — it receives the sign-in URL and
+returns whatever the user pasted back:
+
+```python
+profile = await authorization_code_login(prompt_callback=my_prompt)
+```
+
+Minecraft access tokens last roughly a day. The login also returns a refresh
+token, so a stored credential can be renewed without asking the user for
+anything:
 
 ```python
 from protobot import refresh_login
@@ -154,9 +163,25 @@ if profile.expired and profile.refresh_token:
 ```
 
 `refresh_login` raises `AuthenticationError` once the refresh token itself is
-revoked or expired; fall back to `device_code_login()` at that point. The
-bundled `login.py` and `run_bot.py` scripts implement exactly this: authorize
-once, then reconnect indefinitely with automatic renewal.
+revoked or expired; sign in again at that point. The bundled `login.py` and
+`run_bot.py` scripts implement exactly this: authorize once, then reconnect
+indefinitely with automatic renewal.
+
+### Device-code login (requires your own Azure application)
+
+`device_code_login()` is also available, but the device-code grant is only
+offered to applications registered in Azure AD. The public launcher client ID
+cannot complete it — Microsoft issues a device code and then refuses the token
+with *"the user could not be authenticated or user interaction is required"* — so
+the function requires an explicit `client_id`. Register a public client with
+"Allow public client flows" enabled and the `XboxLive.signin` delegated
+permission, then:
+
+```python
+profile = await device_code_login("<your-azure-application-id>")
+...
+profile = await refresh_login(profile.refresh_token, "<your-azure-application-id>", azure_ad=True)
+```
 
 ## Diagnostic CLI
 
@@ -179,7 +204,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | Path | Contents |
 | --- | --- |
 | `client.py` | `Bot` high-level API and `connect()` |
-| `auth.py` | Mojang session join, RSA/AES-CFB8 encryption, Microsoft OAuth device flow |
+| `auth.py` | Mojang session join, RSA/AES-CFB8 encryption, Microsoft OAuth sign-in and token refresh |
 | `protocol/` | Wire codec, framing, NBT, connection state machine, version tables |
 | `physics/` | Deterministic movement engine, collision geometry, boat physics |
 | `navigation.py` | A\* pathfinder |

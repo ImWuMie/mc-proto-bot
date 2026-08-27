@@ -9,7 +9,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 ## 功能特性
 
 - **完整协议栈**——握手 → 登录 → 配置 → 游戏全流程，含 keep-alive、传送确认、区块解码与服务器转移，全部经过边界检查、行为确定。
-- **正版与离线双支持**——完整支持 Mojang session-server 正版加密验证（RSA/AES-CFB8 8位流式加密）、微软设备代码（Device Code）交互认证及离线模式。
+- **正版与离线双支持**——完整支持 Mojang session-server 正版加密验证（RSA/AES-CFB8 8位流式加密）、微软 OAuth 交互登录（默认授权码流程，可选设备码流程）及离线模式。
 - **多版本支持**——开箱支持 Minecraft `1.21.11`、`26.1`、`26.1.1`、`26.1.2`、`26.2`（内置各版本方块状态表）。
 - **客户端物理**——20 Hz 确定性物理引擎，精确复刻原版移动逻辑，含船载物理与实体硬碰撞。
 - **导航寻路**——基于解码后世界的 A\* 路径规划与执行，支持自动重规划。
@@ -119,15 +119,16 @@ async def main():
 asyncio.run(main())
 ```
 
-或使用交互式微软设备代码（Device Code）登录：
+或使用交互式微软账号登录。默认走**授权码流程**，配合公开的启动器 client ID
+即可，无需你自己注册 Azure 应用：
 
 ```python
 import asyncio
-from protobot import connect, device_code_login
+from protobot import authorization_code_login, connect
 
 async def main():
-    # 提示打开 https://www.microsoft.com/link 并输入验证码
-    profile = await device_code_login()
+    # 打印微软登录链接，然后要求粘贴回跳地址
+    profile = await authorization_code_login()
 
     bot = await connect(
         "mc.example.com",
@@ -142,8 +143,14 @@ async def main():
 asyncio.run(main())
 ```
 
-Minecraft 访问令牌大约一天过期。`device_code_login()` 会同时返回续期令牌
-（refresh token），因此缓存的凭据可以自动续期，无需再次扫码：
+也可以传入自己的提示函数以接入 GUI，它收到登录 URL、返回用户粘贴的内容：
+
+```python
+profile = await authorization_code_login(prompt_callback=my_prompt)
+```
+
+Minecraft 访问令牌大约一天过期。登录同时会返回续期令牌（refresh token），
+因此缓存的凭据可以自动续期，无需再次授权：
 
 ```python
 from protobot import refresh_login
@@ -153,8 +160,22 @@ if profile.expired and profile.refresh_token:
 ```
 
 当续期令牌本身被吊销或过期时，`refresh_login` 会抛出 `AuthenticationError`，
-此时回退到 `device_code_login()` 重新授权即可。仓库自带的 `login.py` 与
-`run_bot.py` 就是这么做的：授权一次，之后自动续期反复连服。
+此时重新授权即可。仓库自带的 `login.py` 与 `run_bot.py` 就是这么做的：
+授权一次，之后自动续期反复连服。
+
+### 设备码登录（需要你自己的 Azure 应用）
+
+`device_code_login()` 同样可用，但设备码授权只对在 Azure AD 注册过的应用开放。
+公开的启动器 client ID **无法**完成该流程——微软会先发出设备码，随后拒绝发放
+令牌并提示「用户需要重新登录或需要用户交互」——因此该函数要求显式传入
+`client_id`。请注册一个公共客户端，开启 "Allow public client flows"，并添加
+`XboxLive.signin` 委托权限，然后：
+
+```python
+profile = await device_code_login("<你的 Azure 应用 ID>")
+...
+profile = await refresh_login(profile.refresh_token, "<你的 Azure 应用 ID>", azure_ad=True)
+```
 
 ## 诊断 CLI
 
@@ -177,7 +198,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | 路径 | 内容 |
 | --- | --- |
 | `client.py` | `Bot` 高层 API 与 `connect()` |
-| `auth.py` | Mojang 会话加入、RSA/AES-CFB8 加密、微软 OAuth 设备代码流 |
+| `auth.py` | Mojang 会话加入、RSA/AES-CFB8 加密、微软 OAuth 登录与令牌续期 |
 | `protocol/` | 传输编解码、封帧、NBT、连接状态机、版本表 |
 | `physics/` | 确定性移动引擎、碰撞几何、船载物理 |
 | `navigation.py` | A\* 寻路器 |
