@@ -16,6 +16,7 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 - **Navigation** — A\* path planning and execution over the decoded world with automatic replanning.
 - **Mod loader handshakes** — Forge, NeoForge, and Fabric client mod declarations, plus Velocity modern forwarding.
 - **Event bus** — subscribe to chat, chunk, entity, container, and raw packet events.
+- **Plugin system & unified CLI** — plugins auto-discovered from `plugins/` with prerequisite declarations, dependency-ordered loading, exception isolation, and hot load/reload/close; `protobot login|run|plugins|setup` covers sign-in, connecting, and plugin management, with automatic reconnects.
 - **Diagnostic CLI** — live regression checks and movement traces against a local server.
 
 ## Installation
@@ -201,9 +202,9 @@ if profile.expired and profile.refresh_token:
 ```
 
 `refresh_login` raises `AuthenticationError` once the refresh token itself is
-revoked or expired; sign in again at that point. The bundled `login.py` and
-`run_bot.py` scripts implement exactly this: authorize once, then reconnect
-indefinitely with automatic renewal.
+revoked or expired; sign in again at that point. The command-line tool
+implements exactly this (see `protobot login` and `protobot run` in the next
+section): authorize once, then reconnect indefinitely with automatic renewal.
 
 ### Alternative: authorization-code flow
 
@@ -240,8 +241,94 @@ flows".
 
 A refresh must return to the endpoint family that issued the token. Passing the
 same `client_id` selects it automatically (the launcher ID means MSA, anything
-else means Azure AD); `azure_ad=True/False` overrides the choice. `login.py`
-records this in its cache so `run_bot.py` renews correctly.
+else means Azure AD); `azure_ad=True/False` overrides the choice. `protobot
+login` records this in its cache so `protobot run` renews correctly.
+
+## Bot CLI and plugin system
+
+Besides the library API, ProtoBot ships one unified command that merges the
+former standalone scripts into subcommands:
+
+```bash
+protobot login     # Microsoft sign-in (device-code flow; caches credentials)
+protobot run       # connect, run plugins, auto-reconnect after disconnects
+protobot plugins   # list discovered plugins and their load order
+protobot setup     # re-enter the interactive configuration wizard
+```
+
+**On first launch** of any subcommand, if there is no local `config.yaml`, an
+interactive wizard walks through login mode (offline/online), server address,
+and protocol version, then writes the configuration:
+
+```yaml
+server:
+  host: "wolfx.jp"
+  port: 25565
+  version: "26.2"
+login:
+  mode: online              # online | offline
+  offline_username: "ProtoBot"
+session:
+  reconnect: true           # reconnect after disconnects
+  reconnect_delay: 5.0      # seconds between attempts (default: every 5 s)
+  reconnect_max_attempts: null   # optional cap (null = forever)
+plugins:
+  directory: "plugins"      # relative to this config file
+  disabled: []              # e.g. ["auto_reply"]
+  watch: true               # hot load/reload/close on file changes
+```
+
+The sign-in cache lives next to the config file (`auth_cache.json`), so `login`
+and `run` agree on it from any working directory. The `run_bot.py` at the repo
+root is a thin shim for PyCharm's right-click Run — equivalent to
+`protobot run`.
+
+### Writing plugins
+
+A plugin is a `Plugin` subclass dropped in `plugins/` (configurable via
+`[plugins] directory`). It declares `name` and optional prerequisite plugins
+in `dependencies`; the framework loads them in topological order:
+
+```python
+from protobot import Plugin, plain_text
+
+class AutoReply(Plugin):
+    name = "auto_reply"
+    dependencies = ("chat_logger",)   # prerequisite: loaded before this one
+
+    def __init__(self):
+        super().__init__()
+        # Bot protocol events (exceptions are isolated: never kill the link)
+        self.subscribe("player_chat", self._on_player_chat)
+        # Session lifecycle events
+        self.subscribe_session("session_disconnected", self._on_disconnect)
+
+    async def _on_player_chat(self, sender, name, message, chat_type_id, target):
+        if plain_text(message).startswith("hey,claude"):
+            await self.bot.send_message("1")
+```
+
+Notes:
+
+- **Events** — `subscribe()` registers bot protocol events (same names and
+  arguments as `bot.on`: `player_chat`, `system_chat`, `world`, `entity_add`,
+  …); `subscribe_session()` registers session lifecycle events
+  (`session_start`, `session_connecting`, `session_ready`,
+  `session_disconnected`, `session_stop`). A raising handler prints a
+  traceback and **cannot** drop the connection.
+- **Re-read `self.bot` on every call** — a reconnect spawns a fresh Bot object;
+  the framework rebinds subscriptions to it automatically, so a cached
+  reference would point at the closed predecessor. `on_bot_ready()` fires once
+  per spawned bot and is the place for per-connection state.
+- **Lifecycle** — `on_enable()` / `on_disable()` run once per process. Tasks
+  created in `on_enable` outlive individual bots; cancel them yourself in
+  `on_disable` (the framework never cancels plugin tasks).
+- **Hot updates** — with `plugins.watch = true` (default), saving a file under
+  `plugins/` hot-reloads it: new files hot-load, modified files hot-reload,
+  deleted files hot-close. A broken edit (syntax error, missing dependency) is
+  rejected and the **old plugin keeps running** — the online bot is untouched.
+- **Config switches** — `[plugins] disabled = ["auto_reply"]` disables a
+  plugin; anything depending on it is disabled too, with a notice.
 
 ## Diagnostic CLI
 
@@ -271,8 +358,15 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `srv.py` | Dependency-free `_minecraft._tcp` SRV lookup |
 | `world.py` / `state.py` | World/chunk decoding, block-state registry, entity/inventory state |
 | `modlist.py` | Forge/NeoForge/Fabric loader adapters, Velocity forwarding |
+| `plugin.py` | Plugin framework: discovery, dependency ordering, exception isolation, hot load/reload/close |
+| `session.py` | `BotSession` reconnect loop and `BotContainer` |
+| `text.py` | Chat-component plain-text rendering (`plain_text`) |
+| `config.py` | Dependency-free YAML-subset codec for `config.yaml` |
+| `cli_app.py` | Unified CLI: `protobot login|run|plugins|setup` |
 | `data/` | Bundled per-version block-state tables |
 | `cli.py` | Diagnostic console commands |
+| `plugins/` | Example plugins (chat_logger, auto_reply) |
+| `config.yaml` | Local configuration (generated by the first-launch wizard; not committed) |
 
 ## Development
 

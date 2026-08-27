@@ -47,8 +47,11 @@ from .physics import (
     StatusEffect,
     Vec3,
 )
+from .plugin import Plugin, PluginError, PluginManager, PluginWatcher
 from .protocol.versions import SUPPORTED_VERSIONS, VersionSpec, get_version
+from .session import BotContainer, BotSession, SessionConfig
 from .srv import resolve_minecraft_srv
+from .text import plain_text
 from .state import (
     ContainerState,
     EntityMetadataValue,
@@ -72,6 +75,8 @@ __all__ = [
     "BlockStateRegistry",
     "BoatPhysicsEngine",
     "Bot",
+    "BotContainer",
+    "BotSession",
     "ChannelFlow",
     "ChannelSpec",
     "ConnectionClosed",
@@ -95,7 +100,12 @@ __all__ = [
     "PhysicsEngine",
     "PhysicsState",
     "PlayerAbilities",
+    "Plugin",
+    "PluginError",
+    "PluginManager",
+    "PluginWatcher",
     "ProtocolError",
+    "SessionConfig",
     "StaticCollisionWorld",
     "StatusEffect",
     "UnsupportedVersion",
@@ -105,6 +115,7 @@ __all__ = [
     "connect",
     "get_version",
     "make_adapter",
+    "plain_text",
     "resolve_minecraft_srv",
     "minecraft_sha1_digest",
     "MinecraftProfile",

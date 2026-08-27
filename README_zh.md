@@ -16,6 +16,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **导航寻路**——基于解码后世界的 A\* 路径规划与执行，支持自动重规划。
 - **模组加载器握手**——支持 Forge、NeoForge、Fabric 客户端模组声明，以及 Velocity modern forwarding。
 - **事件总线**——可订阅聊天、区块、实体、容器与原始数据包事件。
+- **插件系统与统一 CLI**——`plugins/` 目录自动发现插件，支持前置插件依赖、拓扑排序加载、异常隔离、热加载/热重载/热关闭；`protobot login|run|plugins|setup` 一个命令搞定授权、连服与插件管理，掉线自动重连。
 - **诊断 CLI**——针对本地服务器的在线回归检查与移动轨迹采集。
 
 ## 安装
@@ -194,8 +195,8 @@ if profile.expired and profile.refresh_token:
 ```
 
 当续期令牌本身被吊销或过期时，`refresh_login` 会抛出 `AuthenticationError`，
-此时重新授权即可。仓库自带的 `login.py` 与 `run_bot.py` 就是这么做的：
-授权一次，之后自动续期反复连服。
+此时重新授权即可。命令行工具就是这么做的（见下一节的 `protobot login` 与
+`protobot run`）：授权一次，之后自动续期反复连服。
 
 ### 备选一：授权码流程
 
@@ -226,8 +227,89 @@ profile = await refresh_login(profile.refresh_token, "<你的 Azure 应用 ID>")
 打开「允许公共客户端流」。
 
 续期必须回到签发该令牌的那一套端点。传入相同的 `client_id` 就会自动选对（启动器 ID
-表示 MSA，其他表示 Azure AD）；`azure_ad=True/False` 可强制指定。`login.py` 会把
-这一点记录到缓存里，`run_bot.py` 便能正确续期。
+表示 MSA，其他表示 Azure AD）；`azure_ad=True/False` 可强制指定。`protobot login`
+会把这一点记录到缓存里，`protobot run` 便能正确续期。
+
+## 机器人 CLI 与插件系统
+
+除了作为库使用，ProtoBot 还带一个统一的命令行入口，把原来的授权脚本与启动
+脚本合并成了子命令：
+
+```bash
+protobot login     # 微软正版账号授权（设备码流程，凭据自动缓存）
+protobot run       # 连接服务器、运行插件、掉线自动重连
+protobot plugins   # 列出已发现的插件与加载顺序
+protobot setup     # 重新进入交互式配置向导
+```
+
+**首次启动**任何子命令时，如果本地没有 `config.yaml`，会先进入交互式配置
+向导：依次选择登录方式（离线/正版）、服务器地址、协议版本，然后自动写入
+配置：
+
+```yaml
+server:
+  host: "wolfx.jp"
+  port: 25565
+  version: "26.2"
+login:
+  mode: online              # online | offline
+  offline_username: "ProtoBot"
+session:
+  reconnect: true           # 掉线自动重连
+  reconnect_delay: 5.0      # 重连间隔（秒），默认每 5 秒一次
+  reconnect_max_attempts: null   # 可选：最大重连次数（null = 无限）
+plugins:
+  directory: "plugins"      # 相对本配置文件所在目录
+  disabled: []              # 例: ["auto_reply"]
+  watch: true               # 监视插件目录，文件变化即热加载/热重载/热关闭
+```
+
+正版登录的凭据缓存在配置文件旁边的 `auth_cache.json`，`login` 与 `run`
+在任意工作目录下都指向同一份。仓库根目录的 `run_bot.py` 是给 PyCharm
+右键运行的薄壳，等价于 `protobot run`。
+
+### 编写插件
+
+插件是 `Plugin` 的子类，放在 `plugins/` 目录下（`[plugins] directory` 可改）。
+每个插件声明 `name` 与可选的前置插件 `dependencies`，框架按依赖拓扑排序加载：
+
+```python
+from protobot import Plugin, plain_text
+
+class AutoReply(Plugin):
+    name = "auto_reply"
+    dependencies = ("chat_logger",)   # 前置插件：必须先于本插件加载
+
+    def __init__(self):
+        super().__init__()
+        # 注册 bot 协议事件（异常会被框架隔离，不会打断连接）
+        self.subscribe("player_chat", self._on_player_chat)
+        # 注册会话生命周期事件
+        self.subscribe_session("session_disconnected", self._on_disconnect)
+
+    async def _on_player_chat(self, sender, name, message, chat_type_id, target):
+        if plain_text(message).startswith("hey,claude"):
+            await self.bot.send_message("1")
+```
+
+要点：
+
+- **事件注册**：`subscribe()` 注册 bot 协议事件（`player_chat`、
+  `system_chat`、`world`、`entity_add`……与 `bot.on` 同名同参）；
+  `subscribe_session()` 注册会话生命周期事件（`session_start`、
+  `session_connecting`、`session_ready`、`session_disconnected`、
+  `session_stop`）。handler 抛出的异常只会打印回溯，**不会**导致掉线。
+- **`self.bot` 每次调用时重读**：掉线重连会生成全新的 Bot 对象，框架在
+  重连后自动把订阅重新绑定到新 bot；缓存 bot 引用会拿到已关闭的旧对象。
+  每只 bot 就绪时会调用一次 `on_bot_ready()`，适合放按连接初始化的状态。
+- **生命周期**：`on_enable()` / `on_disable()` 每个进程各一次；
+  `on_enable` 里创建的任务跨重连存活，请在 `on_disable` 里自行取消
+  （框架绝不强制取消插件任务）。
+- **热更新**：`plugins.watch = true`（默认）时，编辑 `plugins/` 下的文件
+  保存即热重载——新增文件热加载、修改文件热重载、删除文件热关闭。语法
+  错误或依赖缺失的重载会被拒绝，**旧插件继续运行**，不会打断在线 bot。
+- **配置开关**：`[plugins] disabled = ["auto_reply"]` 可禁用插件，依赖
+  被禁用插件的插件会被一并禁用并提示。
 
 ## 诊断 CLI
 
@@ -257,8 +339,15 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `srv.py` | 零依赖的 `_minecraft._tcp` SRV 查询 |
 | `world.py` / `state.py` | 世界/区块解码、方块状态注册表、实体/物品栏状态 |
 | `modlist.py` | Forge/NeoForge/Fabric 加载器适配、Velocity forwarding |
+| `plugin.py` | 插件框架：目录发现、依赖拓扑排序、异常隔离、热加载/热重载/热关闭 |
+| `session.py` | `BotSession` 会话（重连循环）与 `BotContainer` 容器 |
+| `text.py` | 聊天组件转纯文本（`plain_text`） |
+| `config.py` | 零依赖的 YAML 子集编解码（`config.yaml`） |
+| `cli_app.py` | 统一 CLI：`protobot login|run|plugins|setup` |
 | `data/` | 内置各版本方块状态表 |
 | `cli.py` | 诊断控制台命令 |
+| `plugins/` | 示例插件（chat_logger、auto_reply） |
+| `config.yaml` | 本地配置文件（首次启动向导生成，不入库） |
 
 ## 开发
 

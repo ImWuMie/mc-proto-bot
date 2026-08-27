@@ -18,6 +18,7 @@ dev = [
 ]
 
 [project.scripts]
+protobot = "protobot.cli_app:main"
 protobot-export-block-states = "protobot.cli:export_block_states"
 protobot-live-regression = "protobot.cli:live_regression"
 protobot-movement-matrix = "protobot.cli:movement_matrix"
@@ -27,8 +28,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 # ``protobot`` is a real subdirectory of the checkout, so ordinary package
-# discovery works. The explicit include keeps the top-level helper scripts
-# (``login.py``, ``run_bot.py``) and the test suite out of the distribution.
+# discovery works. The explicit include keeps the top-level helper script
+# (``run_bot.py``), the plugin examples, and the test suite out of the
+# distribution.
 [tool.setuptools.packages.find]
 include = ["protobot*"]
 namespaces = false

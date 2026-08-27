@@ -9,6 +9,7 @@ dist/
 build/
 *.egg-info/
 auth_cache.json
+config.yaml
 protobot-live.log
 .claude/settings.local.json
 

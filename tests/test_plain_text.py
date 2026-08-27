@@ -4,20 +4,20 @@ from __future__ import annotations
 
 import unittest
 
-import run_bot
+from protobot.text import plain_text
 
 
 class PlainTextTest(unittest.TestCase):
     def test_string_and_list_components(self) -> None:
-        self.assertEqual(run_bot._plain_text("hi"), "hi")
-        self.assertEqual(run_bot._plain_text([{"text": "a"}, "b"]), "ab")
+        self.assertEqual(plain_text("hi"), "hi")
+        self.assertEqual(plain_text([{"text": "a"}, "b"]), "ab")
 
     def test_text_and_extra(self) -> None:
-        self.assertEqual(run_bot._plain_text({"text": "", "extra": [{"text": "x"}]}), "x")
+        self.assertEqual(plain_text({"text": "", "extra": [{"text": "x"}]}), "x")
 
     def test_translate_without_fallback(self) -> None:
         self.assertEqual(
-            run_bot._plain_text(
+            plain_text(
                 {"translate": "multiplayer.player.joined", "with": ["Steve"]}
             ),
             "multiplayer.player.joinedSteve",
@@ -25,7 +25,7 @@ class PlainTextTest(unittest.TestCase):
 
     def test_fallback_wins_over_translation_key(self) -> None:
         self.assertEqual(
-            run_bot._plain_text(
+            plain_text(
                 {
                     "translate": "commands.message.display.incoming",
                     "fallback": "[_ImWuMie -> me] 123",
@@ -70,10 +70,10 @@ class PlainTextTest(unittest.TestCase):
             ],
             "text": "",
         }
-        self.assertEqual(run_bot._plain_text(component), "[_ImWuMie -> me] 123")
+        self.assertEqual(plain_text(component), "[_ImWuMie -> me] 123")
 
     def test_empty_key_renders_alongside_other_parts(self) -> None:
-        self.assertEqual(run_bot._plain_text({"": "tail"}), "tail")
+        self.assertEqual(plain_text({"": "tail"}), "tail")
 
 
 if __name__ == "__main__":
