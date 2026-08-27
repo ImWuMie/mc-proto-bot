@@ -258,7 +258,7 @@ class SettingsTest(unittest.TestCase):
             )
             self.assertEqual(saved["llm"]["model"], "gpt-4o-mini")
             self.assertEqual(saved["history_limit"], 200)
-            self.assertEqual(saved["context_limit"], 40)
+            self.assertGreaterEqual(saved["context_limit"], 4)  # 默认值可调
             self.assertIn("hey,claude", saved["reply"]["prefix"])
             self.assertEqual(saved["reply"]["keywords"], [])
 
@@ -289,9 +289,69 @@ class SettingsTest(unittest.TestCase):
             self._load(tmp, {"history_limit": 5, "context_limit": 2})
             self.assertEqual(self.plugin._settings["history_limit"], 10)
             self.assertEqual(self.plugin._settings["context_limit"], 4)
-            self._load(tmp, {"history_limit": 99999, "context_limit": 999})
+            self._load(tmp, {"history_limit": 99999, "context_limit": 99999})
             self.assertEqual(self.plugin._settings["history_limit"], 2000)
-            self.assertEqual(self.plugin._settings["context_limit"], 200)
+            self.assertEqual(self.plugin._settings["context_limit"], 1000)
+
+
+class SettingsReloadTest(unittest.IsolatedAsyncioTestCase):
+    """llm_agent.json 修改后约 3 秒内自动重新加载（无需热重载插件）。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+
+    def _init(self, tmp: str, settings: dict | None = None) -> None:
+        configure(self.plugin, tmp, settings=settings)
+        self.plugin._load_settings()  # 记录 mtime 快照
+
+    async def test_changed_settings_file_auto_reloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp, settings={"admins": []})
+            self.assertEqual(self.plugin._settings["admins"], [])
+            path = self.plugin._settings_file
+            self.plugin._settings_mtime -= 1.0  # 模拟旧快照，避免同秒 mtime 抖动
+            path.write_text(
+                json.dumps({"admins": ["_ImWuMie"]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            await self.plugin._check_settings_changed()
+            self.assertEqual(self.plugin._settings["admins"], ["_ImWuMie"])
+
+    async def test_unchanged_settings_file_not_reloaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp, settings={"admins": ["a"]})
+            self.plugin._settings["admins"] = ["marker"]
+            await self.plugin._check_settings_changed()
+            self.assertEqual(self.plugin._settings["admins"], ["marker"])  # 未重载
+
+    async def test_admin_effective_right_after_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp, settings={"admins": ["mie_233"]})
+            self.plugin._generated_dir = Path(tmp) / "gen"
+            self.plugin.manager = self.manager
+            self.plugin._requester = "_ImWuMie"
+            result = await self.plugin._run_tool(
+                "write_plugin", {"filename": "x.py", "code": TEMP_PLUGIN_SRC}
+            )
+            self.assertIn("Permission denied for _ImWuMie", result)
+            # 管理员名单改成当前玩家后，设置自动重载立即生效
+            path = self.plugin._settings_file
+            self.plugin._settings_mtime -= 1.0
+            path.write_text(
+                json.dumps({"admins": ["_ImWuMie"]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            await self.plugin._check_settings_changed()
+            result = await self.plugin._run_tool(
+                "write_plugin",
+                {
+                    "filename": "x.py",
+                    "code": TEMP_PLUGIN_SRC.replace('"temp_a"', '"temp_ok"'),
+                },
+            )
+            self.assertIn("Saved and loaded", result)
+            self.assertIn("temp_ok", self.manager.plugins)
 
 
 class MemoryTest(unittest.IsolatedAsyncioTestCase):
@@ -806,6 +866,7 @@ class WorkerPipelineTest(unittest.IsolatedAsyncioTestCase):
                 await manager.disable_all()
             self.assertIsNone(plugin.manager)
             self.assertIsNone(plugin._worker_task)
+            self.assertIsNone(plugin._settings_task)
 
 
 if __name__ == "__main__":

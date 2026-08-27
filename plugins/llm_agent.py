@@ -18,9 +18,9 @@
     API 端点（base_url）、模型、系统提示词、回复策略等
 
 LLM 看到的内容（系统提示词、工具描述、工具返回）均为英文；控制台日志保持
-中文 [LLM] 风格。修改 llm_agent.json 后，保存一次本文件（llm_agent.py）
-触发热重载即可生效，无需重启。生成目录里的插件由 LLM 维护，与手工编写的
-plugins/ 目录分开。
+中文 [LLM] 风格。llm_agent.json 修改后约 3 秒内自动重新加载（无需重启或
+热重载本插件），TUI 日志会打印「设置文件已更新」。生成目录里的插件由 LLM
+维护，与手工编写的 plugins/ 目录分开。
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ DEFAULT_SETTINGS: dict = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "admins": [],  # 管理员玩家名列表：只有名单内玩家能让 LLM 写插件/开关插件；留空不限制
     "history_limit": 200,  # 游戏内聊天日志保留条数（read_chat 工具查询范围）
-    "context_limit": 40,  # agent 对话上下文保留的消息条数
+    "context_limit": 600,  # agent 对话上下文保留的消息条数
     "memory_dir": "llm_agent_memory",  # 记忆根目录（每服务器一个子目录，记忆为 MEMORY.md 等 Markdown 文件）
     "generated_dir": "../plugins_llm",  # LLM 生成插件的目录（与 plugins/ 分开）
 }
@@ -354,6 +354,8 @@ class LLMAgent(Plugin):
         self._conversation: list[dict] = []  # agent 对话上下文（system 之外的消息轮次）
         self._queue: asyncio.Queue | None = None
         self._worker_task: asyncio.Task | None = None
+        self._settings_task: asyncio.Task | None = None
+        self._settings_mtime: float | None = None  # 设置文件修改时间快照
         self._requester: str | None = None  # 当前触发聊天的玩家名（权限判定用）
         self._sent_recent: list[tuple[float, str]] = []  # 近期发送 (时间, 内容)
         self._post_json = _http_post_json  # 测试可替换为假实现
@@ -375,21 +377,29 @@ class LLMAgent(Plugin):
             )
         reply = self._settings["reply"]
         mode = "回应每条聊天" if reply.get("all") else "仅回应名字提及/特殊前缀"
+        admins = self._settings.get("admins") or []
         self._queue = asyncio.Queue(maxsize=16)
         self._worker_task = asyncio.create_task(
             self._worker(), name="protobot-llm-agent-worker"
         )
-        log.info(f"[LLM] 智能体插件已启用（回复策略: {mode}）。")
+        self._settings_task = asyncio.create_task(
+            self._settings_watcher(), name="protobot-llm-agent-settings"
+        )
+        log.info(
+            f"[LLM] 智能体插件已启用（回复策略: {mode}；"
+            f"管理员: {', '.join(admins) if admins else '未限制'}）。"
+        )
 
     async def on_disable(self) -> None:
-        task = self._worker_task
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            self._worker_task = None
+        for attribute in ("_worker_task", "_settings_task"):
+            task = getattr(self, attribute)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, attribute, None)
         self._queue = None
         log.info("[LLM] 智能体插件已关闭。")
 
@@ -435,7 +445,7 @@ class LLMAgent(Plugin):
             self._settings["history_limit"] = 200
         try:
             context = int(merged.get("context_limit", 40))
-            self._settings["context_limit"] = max(4, min(200, context))
+            self._settings["context_limit"] = max(4, min(1000, context))
         except (TypeError, ValueError):
             self._settings["context_limit"] = 40
         if not isinstance(merged.get("reply"), dict):
@@ -443,6 +453,38 @@ class LLMAgent(Plugin):
         self._settings["admins"] = [
             str(admin) for admin in (merged.get("admins") or [])
         ]
+        try:
+            self._settings_mtime = (
+                path.stat().st_mtime if path is not None and path.exists() else None
+            )
+        except OSError:
+            self._settings_mtime = None
+
+    async def _settings_watcher(self) -> None:
+        """监视 llm_agent.json：修改后自动重新加载设置（约 3 秒生效）。
+
+        这样改管理员名单等配置不需要再热重载插件本身。
+        """
+        while True:
+            await asyncio.sleep(3.0)
+            await self._check_settings_changed()
+
+    async def _check_settings_changed(self) -> None:
+        path = self._settings_file
+        if path is None or not path.exists():
+            return
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if self._settings_mtime is not None and mtime != self._settings_mtime:
+            self._load_settings()
+            self._resolve_dirs()
+            admins = self._settings.get("admins") or []
+            log.info(
+                f"[LLM] 设置文件已更新并重新加载"
+                f"（管理员: {', '.join(admins) if admins else '未限制'}）。"
+            )
 
     def _resolve_dirs(self) -> None:
         base = self._settings_file.parent
@@ -827,7 +869,10 @@ class LLMAgent(Plugin):
 
     async def _tool_set_plugin(self, args: dict) -> str:
         if not self._is_admin(self._requester):
-            return "Permission denied: only admins can manage plugins"
+            return (
+                f"Permission denied for {self._requester or 'unknown'}: "
+                "only admins can manage plugins"
+            )
         name = str(args.get("name") or "").strip()
         enabled = bool(args.get("enabled", True))
         if not name:
@@ -857,7 +902,10 @@ class LLMAgent(Plugin):
 
     async def _tool_write_plugin(self, args: dict) -> str:
         if not self._is_admin(self._requester):
-            return "Permission denied: only admins can write plugins"
+            return (
+                f"Permission denied for {self._requester or 'unknown'}: "
+                "only admins can write plugins"
+            )
         filename = str(args.get("filename") or "").strip()
         code = str(args.get("code") or "")
         if not re.fullmatch(r"[A-Za-z0-9_]{1,64}\.py", filename):
