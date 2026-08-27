@@ -1,6 +1,12 @@
 """Public API for ProtoBot."""
 
-from .auth import MinecraftProfile, device_code_login, join_session_server, minecraft_sha1_digest
+from .auth import (
+    MinecraftProfile,
+    device_code_login,
+    join_session_server,
+    minecraft_sha1_digest,
+    refresh_login,
+)
 from .client import AttributeModifierUpdate, AttributeUpdate, Bot, connect
 from .errors import (
     AuthenticationError,
@@ -100,4 +106,5 @@ __all__ = [
     "MinecraftProfile",
     "device_code_login",
     "join_session_server",
+    "refresh_login",
 ]

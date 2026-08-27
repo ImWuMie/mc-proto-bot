@@ -126,7 +126,7 @@ import asyncio
 from protobot import connect, device_code_login
 
 async def main():
-    # Prompts to visit https://microsoft.com/link and enter code
+    # Prompts to visit https://www.microsoft.com/link and enter a code
     profile = await device_code_login()
 
     bot = await connect(
@@ -141,6 +141,22 @@ async def main():
 
 asyncio.run(main())
 ```
+
+Minecraft access tokens last roughly a day. `device_code_login()` also returns a
+refresh token, so a stored credential can be renewed without asking the user to
+enter another code:
+
+```python
+from protobot import refresh_login
+
+if profile.expired and profile.refresh_token:
+    profile = await refresh_login(profile.refresh_token)
+```
+
+`refresh_login` raises `AuthenticationError` once the refresh token itself is
+revoked or expired; fall back to `device_code_login()` at that point. The
+bundled `login.py` and `run_bot.py` scripts implement exactly this: authorize
+once, then reconnect indefinitely with automatic renewal.
 
 ## Diagnostic CLI
 

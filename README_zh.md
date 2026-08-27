@@ -126,7 +126,7 @@ import asyncio
 from protobot import connect, device_code_login
 
 async def main():
-    # 提示打开 https://microsoft.com/link 并输入验证码
+    # 提示打开 https://www.microsoft.com/link 并输入验证码
     profile = await device_code_login()
 
     bot = await connect(
@@ -141,6 +141,20 @@ async def main():
 
 asyncio.run(main())
 ```
+
+Minecraft 访问令牌大约一天过期。`device_code_login()` 会同时返回续期令牌
+（refresh token），因此缓存的凭据可以自动续期，无需再次扫码：
+
+```python
+from protobot import refresh_login
+
+if profile.expired and profile.refresh_token:
+    profile = await refresh_login(profile.refresh_token)
+```
+
+当续期令牌本身被吊销或过期时，`refresh_login` 会抛出 `AuthenticationError`，
+此时回退到 `device_code_login()` 重新授权即可。仓库自带的 `login.py` 与
+`run_bot.py` 就是这么做的：授权一次，之后自动续期反复连服。
 
 ## 诊断 CLI
 

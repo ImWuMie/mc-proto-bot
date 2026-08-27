@@ -8,7 +8,7 @@ import json
 import uuid
 from pathlib import Path
 
-from protobot import MovementInput, connect, device_code_login
+from protobot import MinecraftProfile, MovementInput, connect, device_code_login, refresh_login
 
 # ======================== 配置区域 ========================
 # 服务器地址与端口
@@ -28,33 +28,73 @@ OFFLINE_USERNAME = "ProtoBot"
 CACHE_FILE = Path(__file__).parent / "auth_cache.json"
 
 
+def _save_profile(profile: MinecraftProfile) -> None:
+    CACHE_FILE.write_text(
+        json.dumps(
+            {
+                "name": profile.name,
+                "uuid": str(profile.id),
+                "access_token": profile.access_token,
+                "refresh_token": profile.refresh_token,
+                "expires_at": profile.expires_at,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _load_profile() -> MinecraftProfile | None:
+    """读取本地缓存的正版凭据；缺失或损坏时返回 None。"""
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        return MinecraftProfile(
+            id=uuid.UUID(data["uuid"]),
+            name=data["name"],
+            access_token=data["access_token"],
+            refresh_token=data.get("refresh_token"),
+            expires_at=float(data.get("expires_at", 0.0)),
+        )
+    except (OSError, ValueError, KeyError) as error:
+        print(f"[提示] 本地凭据缓存损坏，将重新发起登录 ({error})")
+        return None
+
+
 async def get_credentials() -> tuple[str, str | None, uuid.UUID | None]:
-    """获取连接凭据（正版或离线）。"""
+    """获取连接凭据（正版或离线）。
+
+    正版模式下优先复用本地缓存；令牌过期时用 refresh token 自动续期，
+    续期失败才回退到交互式扫码登录。
+    """
     if not ONLINE_MODE:
         return OFFLINE_USERNAME, None, None
 
-    # 优先从本地缓存读取
-    if CACHE_FILE.exists():
-        try:
-            data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-            name = data["name"]
-            token = data["access_token"]
-            player_uuid = uuid.UUID(data["uuid"])
-            print(f"[凭据] 已从本地缓存读取正版账号: {name}")
-            return name, token, player_uuid
-        except Exception as e:
-            print(f"[提示] 本地凭据缓存损坏，重新发起登录 ({e})")
+    profile = _load_profile()
 
-    # 首次运行发起微软登录
-    print("\n[认证] 未检测到有效凭据，正在发起微软正版登录...")
+    if profile is not None and not profile.expired:
+        print(f"[凭据] 已从本地缓存读取正版账号: {profile.name}")
+        return profile.name, profile.access_token, profile.id
+
+    if profile is not None and profile.refresh_token:
+        print(f"[凭据] 缓存令牌已过期，正在为 {profile.name} 自动续期...")
+        try:
+            profile = await refresh_login(profile.refresh_token)
+            _save_profile(profile)
+            print(f"[凭据] 续期成功: {profile.name}")
+            return profile.name, profile.access_token, profile.id
+        except Exception as error:
+            print(f"[提示] 自动续期失败，需要重新扫码登录 ({error})")
+    elif profile is not None:
+        print("[提示] 缓存令牌已过期且没有续期令牌，需要重新扫码登录")
+
+    # 首次运行、或续期不可用时发起微软登录
+    print("\n[认证] 正在发起微软正版登录...")
     profile = await device_code_login()
-    cache_data = {
-        "name": profile.name,
-        "uuid": str(profile.id),
-        "access_token": profile.access_token,
-    }
-    CACHE_FILE.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
+    _save_profile(profile)
     return profile.name, profile.access_token, profile.id
+
 
 
 async def main() -> None:

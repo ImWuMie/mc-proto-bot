@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -17,9 +16,25 @@ from typing import Any
 
 from .errors import AuthenticationError, OnlineModeRequired
 
-# Microsoft Public OAuth Client ID for Minecraft Launcher
-# Used widely across open-source Minecraft tools.
+# Public client ID of the Minecraft launcher. It belongs to the legacy
+# Microsoft-account (MSA) endpoints below, not to Azure AD: posting it to
+# ``login.microsoftonline.com/consumers/oauth2/v2.0/devicecode`` is rejected
+# with ``AADSTS700016`` because it is not a registered AAD application. The
+# MSA endpoints need no app registration of your own.
 DEFAULT_MICROSOFT_CLIENT_ID = "00000000402b5328"
+
+_MSA_DEVICE_CODE_URL = "https://login.live.com/oauth20_connect.srf"
+_MSA_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
+_MSA_SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
+_DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+
+_XBL_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
+_XSTS_AUTH_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
+_MC_LOGIN_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
+_MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
+
+# Refresh a little early so a token cannot expire mid-handshake.
+_TOKEN_EXPIRY_MARGIN = 60.0
 
 
 def minecraft_sha1_digest(*data: bytes | str) -> str:
@@ -157,6 +172,40 @@ def _http_get_json(url: str, *, headers: dict[str, str] | None = None) -> tuple[
         raise AuthenticationError(f"HTTP request to {url} failed: {error}") from error
 
 
+def _http_post_form(url: str, params: dict[str, str]) -> tuple[int, dict[str, Any] | str]:
+    """POST ``application/x-www-form-urlencoded`` data, as the OAuth endpoints require."""
+
+    body = urllib.parse.urlencode(params).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "ProtoBot",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15.0) as response:
+            status = response.status
+            raw = response.read()
+            if not raw:
+                return status, {}
+            try:
+                return status, json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return status, raw.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        raw = error.read()
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except Exception:
+            parsed = raw.decode("utf-8", errors="replace")
+        return error.code, parsed
+    except urllib.error.URLError as error:
+        raise AuthenticationError(f"HTTP request to {url} failed: {error}") from error
+
+
 async def join_session_server(
     access_token: str,
     selected_profile: uuid.UUID | str,
@@ -192,114 +241,60 @@ class MinecraftProfile:
     id: uuid.UUID
     name: str
     access_token: str
+    refresh_token: str | None = None
+    expires_at: float = 0.0
+
+    @property
+    def expired(self) -> bool:
+        """Whether the Minecraft access token is at or near its expiry.
+
+        Caches written before expiry tracking existed carry ``expires_at == 0``
+        and are treated as expired, which forces one refresh instead of a
+        confusing session-server rejection at login time.
+        """
+
+        return time.time() >= self.expires_at - _TOKEN_EXPIRY_MARGIN
 
 
-async def device_code_login(
-    client_id: str = DEFAULT_MICROSOFT_CLIENT_ID,
-    *,
-    prompt_callback: Callable[[str, str], None] | None = None,
-) -> MinecraftProfile:
-    """Perform an interactive Microsoft Device Code OAuth flow to obtain a Minecraft Access Token.
+async def _authenticate_xbox_live(ms_access_token: str) -> tuple[str, str]:
+    """Exchange a Microsoft access token for an Xbox Live token and user hash.
 
-    Args:
-        client_id: Microsoft Azure App Client ID. Defaults to standard public Minecraft launcher ID.
-        prompt_callback: Callable receiving ``(user_code, verification_uri)``. If None, prints to stdout.
-
-    Returns:
-        A :class:`MinecraftProfile` containing player UUID, username, and the Minecraft Bearer access token.
+    The ``RpsTicket`` prefix depends on which endpoint minted the token: legacy
+    MSA (``MBI_SSL``) tickets use ``t=`` while Azure AD tickets use ``d=``. Both
+    are attempted so a caller supplying their own AAD application still works.
     """
-    # 1. Request device code
-    device_code_url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
-    data = urllib.parse.urlencode({
-        "client_id": client_id,
-        "scope": "XboxLive.signin offline_access",
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        device_code_url,
-        data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "ProtoBot"},
-        method="POST",
-    )
 
-    def _get_device_code():
-        with urllib.request.urlopen(req, timeout=15.0) as res:
-            return json.loads(res.read().decode("utf-8"))
-
-    device_info = await asyncio.to_thread(_get_device_code)
-    user_code = device_info["user_code"]
-    verification_uri = device_info.get("verification_uri", "https://microsoft.com/link")
-    device_code = device_info["device_code"]
-    interval = device_info.get("interval", 5)
-    expires_in = device_info.get("expires_in", 900)
-
-    if prompt_callback is not None:
-        prompt_callback(user_code, verification_uri)
-    else:
-        print(f"\n[ProtoBot Auth] Open: {verification_uri}")
-        print(f"[ProtoBot Auth] Enter code: {user_code}\n")
-
-    # 2. Poll for Microsoft OAuth token
-    token_url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-    token_payload = urllib.parse.urlencode({
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "client_id": client_id,
-        "device_code": device_code,
-    }).encode("utf-8")
-
-    deadline = time.monotonic() + expires_in
-    ms_access_token = None
-
-    while time.monotonic() < deadline:
-        await asyncio.sleep(interval)
-        poll_req = urllib.request.Request(
-            token_url,
-            data=token_payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "ProtoBot"},
-            method="POST",
+    failure: tuple[int, Any] | None = None
+    for ticket in (f"t={ms_access_token}", f"d={ms_access_token}"):
+        payload = {
+            "Properties": {
+                "AuthMethod": "RPS",
+                "SiteName": "user.auth.xboxlive.com",
+                "RpsTicket": ticket,
+            },
+            "RelyingParty": "http://auth.xboxlive.com",
+            "TokenType": "JWT",
+        }
+        status, response = await asyncio.to_thread(
+            _http_post_json, _XBL_AUTH_URL, payload, headers={"Accept": "application/json"}
         )
-        try:
-            def _poll():
-                with urllib.request.urlopen(poll_req, timeout=15.0) as res:
-                    return json.loads(res.read().decode("utf-8"))
+        if status == 200 and isinstance(response, dict):
+            try:
+                return response["Token"], response["DisplayClaims"]["xui"][0]["uhs"]
+            except (KeyError, IndexError, TypeError) as error:
+                raise AuthenticationError(
+                    f"Xbox Live returned an unexpected response shape: {response}"
+                ) from error
+        failure = (status, response)
 
-            token_res = await asyncio.to_thread(_poll)
-            if "access_token" in token_res:
-                ms_access_token = token_res["access_token"]
-                break
-        except urllib.error.HTTPError as err:
-            err_data = json.loads(err.read().decode("utf-8"))
-            err_type = err_data.get("error")
-            if err_type == "authorization_pending":
-                continue
-            if err_type == "slow_down":
-                interval += 5
-                continue
-            raise AuthenticationError(f"Microsoft login failed: {err_data.get('error_description', err_type)}")
+    status, response = failure if failure is not None else (0, "no attempt made")
+    raise AuthenticationError(f"Xbox Live authentication failed (HTTP {status}): {response}")
 
-    if ms_access_token is None:
-        raise AuthenticationError("Device code login timed out.")
 
-    # 3. Authenticate with Xbox Live (user.auth.xboxlive.com)
-    xbl_url = "https://user.auth.xboxlive.com/user/authenticate"
-    xbl_payload = {
-        "Properties": {
-            "AuthMethod": "RPS",
-            "SiteName": "user.auth.xboxlive.com",
-            "RpsTicket": f"d={ms_access_token}",
-        },
-        "RelyingParty": "http://auth.xboxlive.com",
-        "TokenType": "JWT",
-    }
-    status, xbl_res = await asyncio.to_thread(_http_post_json, xbl_url, xbl_payload)
-    if status != 200 or not isinstance(xbl_res, dict):
-        raise AuthenticationError(f"Xbox Live authentication failed: {xbl_res}")
+async def _authorize_xsts(xbl_token: str) -> str:
+    """Trade an Xbox Live token for an XSTS token scoped to Minecraft services."""
 
-    xbl_token = xbl_res["Token"]
-    user_hash = xbl_res["DisplayClaims"]["xui"][0]["uhs"]
-
-    # 4. Acquire XSTS token (xsts.auth.xboxlive.com)
-    xsts_url = "https://xsts.auth.xboxlive.com/xsts/authorize"
-    xsts_payload = {
+    payload = {
         "Properties": {
             "SandboxId": "RETAIL",
             "UserTokens": [xbl_token],
@@ -307,37 +302,195 @@ async def device_code_login(
         "RelyingParty": "rp://api.minecraftservices.com/",
         "TokenType": "JWT",
     }
-    status, xsts_res = await asyncio.to_thread(_http_post_json, xsts_url, xsts_payload)
-    if status != 200 or not isinstance(xsts_res, dict):
-        err_code = xsts_res.get("XErr", "Unknown") if isinstance(xsts_res, dict) else "Unknown"
-        if err_code == 2148916233:
-            raise AuthenticationError("Microsoft account has no Xbox account.")
-        if err_code == 2148916238:
-            raise AuthenticationError("Child account requires parental consent.")
-        raise AuthenticationError(f"XSTS authorization failed (code {err_code}): {xsts_res}")
-
-    xsts_token = xsts_res["Token"]
-
-    # 5. Login with Xbox to Minecraft Services
-    mc_login_url = "https://api.minecraftservices.com/authentication/login_with_xbox"
-    mc_payload = {
-        "identityToken": f"XBL3.0 x={user_hash};{xsts_token}",
-    }
-    status, mc_res = await asyncio.to_thread(_http_post_json, mc_login_url, mc_payload)
-    if status != 200 or not isinstance(mc_res, dict):
-        raise AuthenticationError(f"Minecraft Services login failed: {mc_res}")
-
-    mc_access_token = mc_res["access_token"]
-
-    # 6. Fetch Minecraft player profile
-    profile_url = "https://api.minecraftservices.com/minecraft/profile"
-    status, prof_res = await asyncio.to_thread(
-        _http_get_json, profile_url, headers={"Authorization": f"Bearer {mc_access_token}"}
+    status, response = await asyncio.to_thread(
+        _http_post_json, _XSTS_AUTH_URL, payload, headers={"Accept": "application/json"}
     )
-    if status != 200 or not isinstance(prof_res, dict):
-        raise AuthenticationError(f"Failed to fetch Minecraft profile (HTTP {status}): {prof_res}")
+    if status == 200 and isinstance(response, dict) and "Token" in response:
+        return response["Token"]
 
-    profile_id = uuid.UUID(prof_res["id"])
-    profile_name = prof_res["name"]
+    err_code = response.get("XErr") if isinstance(response, dict) else None
+    if err_code == 2148916233:
+        raise AuthenticationError(
+            "This Microsoft account has no Xbox profile. Sign in once at "
+            "https://www.xbox.com to create one, then retry."
+        )
+    if err_code == 2148916235:
+        raise AuthenticationError("Xbox Live is not available in this account's region.")
+    if err_code == 2148916238:
+        raise AuthenticationError(
+            "This is a child account and needs to be added to a family by an adult."
+        )
+    raise AuthenticationError(
+        f"XSTS authorization failed (HTTP {status}, XErr {err_code}): {response}"
+    )
 
-    return MinecraftProfile(id=profile_id, name=profile_name, access_token=mc_access_token)
+
+async def _minecraft_profile(
+    ms_access_token: str,
+    refresh_token: str | None,
+) -> MinecraftProfile:
+    """Run the Xbox Live -> XSTS -> Minecraft chain and fetch the player profile."""
+
+    xbl_token, user_hash = await _authenticate_xbox_live(ms_access_token)
+    xsts_token = await _authorize_xsts(xbl_token)
+
+    status, mc_res = await asyncio.to_thread(
+        _http_post_json,
+        _MC_LOGIN_URL,
+        {"identityToken": f"XBL3.0 x={user_hash};{xsts_token}"},
+        headers={"Accept": "application/json"},
+    )
+    if status != 200 or not isinstance(mc_res, dict) or "access_token" not in mc_res:
+        raise AuthenticationError(
+            f"Minecraft Services login failed (HTTP {status}): {mc_res}"
+        )
+    mc_access_token = mc_res["access_token"]
+    expires_at = time.time() + float(mc_res.get("expires_in", 86400))
+
+    status, prof_res = await asyncio.to_thread(
+        _http_get_json,
+        _MC_PROFILE_URL,
+        headers={"Authorization": f"Bearer {mc_access_token}", "Accept": "application/json"},
+    )
+    if status == 404:
+        raise AuthenticationError(
+            "This account does not own Minecraft: Java Edition (no profile exists). "
+            "Game Pass accounts must launch the game once to create a profile."
+        )
+    if status != 200 or not isinstance(prof_res, dict) or "id" not in prof_res:
+        raise AuthenticationError(
+            f"Failed to fetch Minecraft profile (HTTP {status}): {prof_res}"
+        )
+
+    return MinecraftProfile(
+        id=uuid.UUID(hex=prof_res["id"]),
+        name=prof_res["name"],
+        access_token=mc_access_token,
+        refresh_token=refresh_token,
+        expires_at=expires_at,
+    )
+
+
+async def device_code_login(
+    client_id: str = DEFAULT_MICROSOFT_CLIENT_ID,
+    *,
+    prompt_callback: Callable[[str, str], None] | None = None,
+) -> MinecraftProfile:
+    """Perform an interactive Microsoft Device Code login for a Minecraft account.
+
+    Args:
+        client_id: Microsoft client ID. Defaults to the public Minecraft
+            launcher ID, which pairs with the legacy MSA endpoints.
+        prompt_callback: Callable receiving ``(user_code, verification_uri)``.
+            If None, the code and URL are printed to stdout.
+
+    Returns:
+        A :class:`MinecraftProfile` with the player UUID, username, Minecraft
+        bearer token, and — when the identity provider issues one — a refresh
+        token usable with :func:`refresh_login`.
+    """
+
+    # 1. Request a device code.
+    status, device_info = await asyncio.to_thread(
+        _http_post_form,
+        _MSA_DEVICE_CODE_URL,
+        {
+            "client_id": client_id,
+            "scope": _MSA_SCOPE,
+            "response_type": "device_code",
+        },
+    )
+    if status != 200 or not isinstance(device_info, dict) or "device_code" not in device_info:
+        raise AuthenticationError(
+            f"Microsoft device code request failed (HTTP {status}): {device_info}"
+        )
+
+    device_code = device_info["device_code"]
+    user_code = device_info["user_code"]
+    verification_uri = device_info.get("verification_uri", "https://microsoft.com/link")
+    interval = float(device_info.get("interval", 5))
+    expires_in = float(device_info.get("expires_in", 900))
+
+    if prompt_callback is not None:
+        prompt_callback(user_code, verification_uri)
+    else:
+        print(f"\n[ProtoBot Auth] Open: {verification_uri}")
+        print(f"[ProtoBot Auth] Enter code: {user_code}\n")
+
+    # 2. Poll until the user finishes authorizing in their browser.
+    token_params = {
+        "client_id": client_id,
+        "device_code": device_code,
+        "grant_type": _DEVICE_CODE_GRANT,
+    }
+    deadline = time.monotonic() + expires_in
+    while True:
+        await asyncio.sleep(interval)
+        if time.monotonic() >= deadline:
+            raise AuthenticationError(
+                "Device code login timed out before the code was entered."
+            )
+
+        status, token_res = await asyncio.to_thread(
+            _http_post_form, _MSA_TOKEN_URL, token_params
+        )
+        if status == 200 and isinstance(token_res, dict) and "access_token" in token_res:
+            return await _minecraft_profile(
+                token_res["access_token"], token_res.get("refresh_token")
+            )
+
+        error = token_res.get("error") if isinstance(token_res, dict) else None
+        if error == "authorization_pending":
+            continue
+        if error == "slow_down":
+            interval += 5
+            continue
+        if error in ("authorization_declined", "access_denied"):
+            raise AuthenticationError("The Microsoft login was declined in the browser.")
+        if error in ("expired_token", "code_expired"):
+            raise AuthenticationError(
+                "The device code expired before it was entered. Please retry."
+            )
+        description = (
+            token_res.get("error_description", error)
+            if isinstance(token_res, dict)
+            else token_res
+        )
+        raise AuthenticationError(f"Microsoft login failed (HTTP {status}): {description}")
+
+
+async def refresh_login(
+    refresh_token: str,
+    client_id: str = DEFAULT_MICROSOFT_CLIENT_ID,
+) -> MinecraftProfile:
+    """Mint a fresh Minecraft token from a stored refresh token.
+
+    Minecraft access tokens last about a day, so a cached credential needs this
+    before it can be reused. Raises :class:`AuthenticationError` if the refresh
+    token has itself been revoked or expired, in which case the caller should
+    fall back to :func:`device_code_login`.
+    """
+
+    status, token_res = await asyncio.to_thread(
+        _http_post_form,
+        _MSA_TOKEN_URL,
+        {
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+    )
+    if status != 200 or not isinstance(token_res, dict) or "access_token" not in token_res:
+        description = (
+            token_res.get("error_description", token_res.get("error"))
+            if isinstance(token_res, dict)
+            else token_res
+        )
+        raise AuthenticationError(
+            f"Microsoft token refresh failed (HTTP {status}): {description}"
+        )
+
+    return await _minecraft_profile(
+        token_res["access_token"], token_res.get("refresh_token", refresh_token)
+    )
+
