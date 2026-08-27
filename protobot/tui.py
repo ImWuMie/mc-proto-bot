@@ -176,7 +176,6 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         }
         #statusbar {
             height: 1;
-            border-top: solid #2b2b2b;
             color: #6c7086;   /* muted, Claude-Code style */
         }
         #bot, #pos, #server {
@@ -196,11 +195,13 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         #cmd {
             border: none;
             border-top: solid #2b2b2b;
+            border-bottom: solid #2b2b2b;  /* the rule above the status bar */
             padding: 0 1;
         }
         #cmd:focus {
             border: none;
             border-top: solid $accent;
+            border-bottom: solid $accent;
         }
         #cmd > .input--placeholder {
             color: #6c7086;
@@ -312,16 +313,17 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             config = session.config
             bot = session.bot
 
-            # Claude-Code-style single line: a state glyph, ``·``-separated
-            # items, muted hints on the right.
+            # Claude-Code-style single line: a state glyph and the hints on
+            # the left, the position centered, server info on the right.
             if not self.started:
-                bot_name = "⏸ 未启动"
+                state = "⏸ 未启动"
             elif bot is not None:
-                bot_name = f"⏵ {bot.username}"
+                state = f"⏵ {bot.username}"
             else:
-                bot_name = "… 连接中"
-            self.status_texts["bot"] = bot_name
-            self.query_one("#bot", Static).update(bot_name)
+                state = "… 连接中"
+            bot_text = f"{state} · ? .help · ctrl+c 退出"
+            self.status_texts["bot"] = bot_text
+            self.query_one("#bot", Static).update(bot_text)
 
             if bot is not None:
                 player = bot.player
@@ -338,11 +340,10 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             if self.connected_at is not None:
                 seconds = int(time.monotonic() - self.connected_at)
                 uptime = (
-                    f" 时长 {seconds // 3600:02d}:"
+                    f" · 时长 {seconds // 3600:02d}:"
                     f"{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
                 )
             server_text = (
-                f"? .help · ↩ 发送 · ctrl+c 退出 · "
                 f"{config.host}:{config.port} · {config.version} · {mode}{uptime}"
             )
             self.status_texts["server"] = server_text

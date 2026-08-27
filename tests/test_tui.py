@@ -238,10 +238,11 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
                 app.connected_at = time.monotonic() - 65
                 app._refresh_status()
             self.assertIn("未启动", app.status_texts["bot"])
+            self.assertIn("ctrl+c 退出", app.status_texts["bot"])
             self.assertEqual(app.status_texts["pos"], "")
             server = app.status_texts["server"]
             self.assertIn("时长 00:01:05", server)
-            self.assertIn("ctrl+c 退出", server)
+            self.assertIn("wolfx.jp:25565", server)
         finally:
             task.cancel()
 
