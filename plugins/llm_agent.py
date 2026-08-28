@@ -825,20 +825,21 @@ class LLMAgent(Plugin):
         self, sender_uuid, name, message, chat_type_id, target_name
     ) -> None:
         text = plain_text(message)
+        # name 是聊天组件（服务器常带 click/hover/insertion 一起发过来），
+        # 必须先渲染成纯文本：否则玩家名会是一整个 dict，管理员判定必然落空。
+        sender = plain_text(name).strip() if name is not None else ""
         # 回显判定按「近期发送过的内容」而不是按名字：正版账号下玩家本人与
         # bot 同名，按名字会把玩家本人的消息也屏蔽掉。
         if self._is_own_echo(text):
             return  # 自己消息的服务器回显：发送时已记录，且不能自我触发
-        self._record_chat(system=False, name=name or "?", text=text)
+        self._record_chat(system=False, name=sender or "?", text=text)
         # 记录 名字 -> UUID 映射：get_player 工具用它从可见实体里定位玩家
-        if sender_uuid is not None and name:
-            self._known_players[str(name).lower()] = (
-                str(sender_uuid),
-                str(name),
-            )
-        kind = self._should_reply(name, text)
+        if sender_uuid is not None and sender:
+            self._known_players[sender.lower()] = (str(sender_uuid), sender)
+        kind = self._should_reply(sender, text)
         if kind:
-            self._enqueue(name, text, follow_up=kind == "follow_up")
+            self._enqueue(sender, text, follow_up=kind == "follow_up")
+
     async def _on_system_chat(self, component, overlay) -> None:
         text = plain_text(component)
         if text:

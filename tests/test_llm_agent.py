@@ -132,6 +132,89 @@ async def wait_until(predicate, pauses: int = 100) -> None:
     raise AssertionError("timed out waiting for condition")
 
 
+RICH_NAME = {
+    "click_event": {"command": "/tell _ImWuMie ", "action": "suggest_command"},
+    "insertion": "_ImWuMie",
+    "hover_event": {
+        "name": "_ImWuMie",
+        "id": "minecraft:player",
+        "action": "show_entity",
+    },
+    "text": "_ImWuMie",
+}
+
+
+class ComponentNameTest(unittest.IsolatedAsyncioTestCase):
+    """player_chat 的 name 是聊天组件，必须渲染成纯文本再用。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot(username="mie_233")
+        self.plugin._queue = asyncio.Queue()
+        self.plugin._settings["reply"] = {
+            "all": False, "name_mention": True, "prefix": "hey,claude",
+            "keywords": [], "attention_seconds": 0.0,
+        }
+
+    async def test_component_name_becomes_plain_text(self) -> None:
+        await self.plugin._on_player_chat(
+            "uuid-1", RICH_NAME, {"text": "mie_233 钓鱼"}, None, None
+        )
+        item = self.plugin._queue.get_nowait()
+        self.assertEqual(item["name"], "_ImWuMie")
+        self.assertEqual(self.plugin._chat_log[-1]["name"], "_ImWuMie")
+        self.assertEqual(
+            self.plugin._known_players["_imwumie"], ("uuid-1", "_ImWuMie")
+        )
+
+    async def test_admin_check_matches_a_component_name(self) -> None:
+        # 线上 bug：管理员名单是 ["_ImWuMie"]，但 _requester 曾是整个组件 dict，
+        # 于是名单内的玩家也被判成非管理员。
+        self.plugin._settings["admins"] = ["_ImWuMie"]
+        self.plugin._settings["llm"]["api_key"] = "k"
+        self.plugin._post_json = FakeLLM(
+            assistant(tool_calls=[tool_call("set_plugin",
+                                            {"name": "ghost", "enabled": False})]),
+            assistant(content="好"),
+        )
+        await self.plugin._on_player_chat(
+            "uuid-1", RICH_NAME, {"text": "mie_233 关插件"}, None, None
+        )
+        item = self.plugin._queue.get_nowait()
+        await self.plugin._handle_trigger(
+            item["name"], item["text"], follow_up=item["follow_up"]
+        )
+        # 权限过了，才会走到「插件不存在」这一步
+        messages = self.plugin._post_json.calls[1][1]["messages"]
+        tool_result = [m for m in messages if m["role"] == "tool"][0]["content"]
+        self.assertNotIn("Permission denied", tool_result)
+        self.assertIn("Plugin not found", tool_result)
+
+    async def test_component_name_mention_still_triggers(self) -> None:
+        await self.plugin._on_player_chat(
+            "uuid-1", RICH_NAME, {"text": "mie_233 在吗"}, None, None
+        )
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_missing_name_falls_back(self) -> None:
+        await self.plugin._on_player_chat(
+            None, None, {"text": "mie_233 你好"}, None, None
+        )
+        self.assertEqual(self.plugin._chat_log[-1]["name"], "?")
+        self.assertEqual(self.plugin._known_players, {})
+
+    async def test_trigger_turn_shows_the_plain_name(self) -> None:
+        self.plugin._settings["llm"]["api_key"] = "k"
+        fake = FakeLLM(assistant(content="嗯"))
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("_ImWuMie", "钓鱼")
+        self.assertEqual(
+            fake.calls[0][1]["messages"][1]["content"], "<_ImWuMie>: 钓鱼"
+        )
+
+
 class TriggerTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.manager = make_manager()
