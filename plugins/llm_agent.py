@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import re
 import time
 import urllib.error
@@ -212,6 +213,75 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "get_player",
+            "description": "Get a player's position by name (players seen in recent chat; empty name lists all visible known players)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Player name; omit to list all visible known players",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "look",
+            "description": "Turn the bot's head to an absolute yaw/pitch (degrees), or rotate by the given amounts when relative is true",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "yaw": {"type": "number", "description": "Yaw in degrees"},
+                    "pitch": {"type": "number", "description": "Pitch in degrees"},
+                    "relative": {
+                        "type": "boolean",
+                        "description": "true = rotate by the given amounts instead of facing them, default false",
+                    },
+                },
+                "required": ["yaw", "pitch"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_plugin_source",
+            "description": "Read the source code of a plugin by its name (up to 8000 chars)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Plugin name, e.g. chat_logger",
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_plugin",
+            "description": "Modify a plugin's source and hot-reload it: pass 'content' for a full rewrite, or 'old'/'new' to replace the first occurrence of a text (read the source first); admin only",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Plugin name to patch"},
+                    "content": {"type": "string", "description": "New full source (optional)"},
+                    "old": {"type": "string", "description": "Exact text to find (optional, use with 'new')"},
+                    "new": {"type": "string", "description": "Replacement text (optional, use with 'old')"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_plugin",
             "description": "Enable or disable a plugin by its name (cannot touch llm_agent itself; disabling also closes plugins that depend on it; admin only)",
             "parameters": {
@@ -373,6 +443,7 @@ class LLMAgent(Plugin):
         self._memory_loaded = False
         self._chat_log: list[dict] = []  # 最近 N 条游戏内聊天（read_chat 工具查询）
         self._conversation: list[dict] = []  # agent 对话上下文（system 之外的消息轮次）
+        self._known_players: dict[str, tuple[str, str]] = {}  # 小写名 -> (UUID 字符串, 显示名)
         self._queue: asyncio.Queue | None = None
         self._worker_task: asyncio.Task | None = None
         self._settings_task: asyncio.Task | None = None
@@ -545,6 +616,12 @@ class LLMAgent(Plugin):
         if self._is_own_echo(text):
             return  # 自己消息的服务器回显：发送时已记录，且不能自我触发
         self._record_chat(system=False, name=name or "?", text=text)
+        # 记录 名字 -> UUID 映射：get_player 工具用它从可见实体里定位玩家
+        if sender_uuid is not None and name:
+            self._known_players[str(name).lower()] = (
+                str(sender_uuid),
+                str(name),
+            )
         if self._should_reply(name, text):
             self._enqueue(name, text)
 
@@ -1009,6 +1086,137 @@ class LLMAgent(Plugin):
             f"Permission denied for {requester or 'unknown'}: "
             f"only admins can {action}"
         )
+
+    async def _tool_look(self, args: dict) -> str:
+        bot = self.bot
+        if bot is None:
+            return "Not connected to a server"
+        try:
+            yaw = float(args.get("yaw"))
+            pitch = float(args.get("pitch"))
+        except (TypeError, ValueError):
+            return "Arguments yaw/pitch must be numbers (degrees)"
+        relative = bool(args.get("relative", False))
+        if relative:
+            yaw += bot.player.yaw
+            pitch += bot.player.pitch
+        await bot.send_look(yaw, pitch)
+        return f"Facing yaw={yaw:.1f}, pitch={pitch:.1f}"
+
+    def _format_player_position(self, name: str, entity, bot) -> str:
+        player = bot.player
+        dx = entity.x - player.x
+        dy = entity.y - player.y
+        dz = entity.z - player.z
+        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+        return (
+            f"Player {name}: X={entity.x:.1f} Y={entity.y:.1f} Z={entity.z:.1f}"
+            f" (yaw={entity.yaw:.1f}, {distance:.1f} blocks away)"
+        )
+
+    def _find_player_entity(self, name: str):
+        """按「名字 -> UUID（聊天事件） -> 可见实体」的链路定位玩家实体。
+
+        返回 (entity, 显示名)；未见过该玩家返回 (None, None)，见过但不在
+        视野内返回 (None, 显示名)。
+        """
+        key = str(name).lower()
+        entry = self._known_players.get(key)
+        if entry is None:
+            return None, None
+        target_uuid, display = entry
+        bot = self.bot
+        for entity in getattr(bot, "entities", {}).values():
+            if entity is not None and str(
+                getattr(entity, "entity_uuid", "")
+            ) == target_uuid:
+                return entity, display
+        return None, display
+
+    async def _tool_get_player(self, args: dict) -> str:
+        bot = self.bot
+        if bot is None:
+            return "Not connected to a server"
+        name = str(args.get("name") or "").strip()
+        if name:
+            entity, display = self._find_player_entity(name)
+            if entity is None:
+                if display is None:
+                    return f"Unknown player: {name} (no recent chat from them)"
+                return f"Player {name} is not visible nearby"
+            return self._format_player_position(display, entity, bot)
+        lines: list[str] = []
+        for known in sorted(self._known_players):
+            entity, display = self._find_player_entity(known)
+            if entity is not None:
+                lines.append(self._format_player_position(display, entity, bot))
+        if not lines:
+            return "No visible players with known names"
+        return "\n".join(lines)
+
+    async def _tool_read_plugin_source(self, args: dict) -> str:
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return "Missing plugin name"
+        manager = self.manager
+        if manager is None:
+            return "Plugin manager unavailable"
+        source = manager.source_of(name)
+        if source is None:
+            return f"Plugin not found: {name}"
+        try:
+            content = source.read_text(encoding="utf-8")
+        except OSError as error:
+            return f"Failed to read source: {error}"
+        if len(content) > 8000:
+            content = content[:8000] + "\n... (truncated)"
+        return f"--- {name} ({source.name}) ---\n{content}"
+
+    async def _tool_patch_plugin(self, args: dict) -> str:
+        if not self._is_admin(self._requester):
+            return self._deny(self._requester, "patch plugins")
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return "Missing plugin name"
+        if name == self.name:
+            return f"Refused: cannot patch {self.name} itself"
+        manager = self.manager
+        if manager is None:
+            return "Plugin manager unavailable"
+        source = manager.source_of(name)
+        if source is None:
+            return f"Plugin not found: {name}"
+        try:
+            current = source.read_text(encoding="utf-8")
+        except OSError as error:
+            return f"Failed to read source: {error}"
+        content = args.get("content")
+        if content is not None:
+            new_source = str(content)
+        else:
+            old = str(args.get("old") or "")
+            new = str(args.get("new") or "")
+            if not old:
+                return (
+                    "Provide either 'content' (full source) or 'old'/'new' "
+                    "(text replacement)"
+                )
+            if old not in current:
+                return f"Patch rejected: 'old' text not found in {name}"
+            new_source = current.replace(old, new, 1)
+        try:
+            source.write_text(new_source, encoding="utf-8")
+        except OSError as error:
+            return f"Failed to write source: {error}"
+        try:
+            plugins = await manager.hot_reload_file(source)
+        except PluginError as error:
+            return (
+                f"Patch saved but reload failed: {error} "
+                "(old plugin keeps running; fix and retry)"
+            )
+        names = ", ".join(plugin.name for plugin in plugins)
+        return f"Patched and reloaded: {names} ({source})"
 
     async def _tool_set_plugin(self, args: dict) -> str:
         if not self._is_admin(self._requester):

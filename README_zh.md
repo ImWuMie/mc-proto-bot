@@ -322,8 +322,9 @@ class HelloReply(Plugin):
 `plugins/llm_agent.py` 把机器人变成游戏内 LLM 智能体（类 Hermes Agent）：
 维护 **agent 对话上下文**，通过 `read_chat` 工具查询最近 **200 条聊天记录**
 （可按玩家/关键词/系统广播过滤），并用 OpenAI 兼容的 function calling 执行
-动作——发消息、执行命令、行走/寻路、查看状态、开关插件、编写新插件，以及
-维护**按服务器分开的 Markdown 记忆**（`MEMORY.md`，可多文件）并自主更新。
+动作——发消息、执行命令、行走/寻路、转头（绝对/相对）、查询玩家位置、
+查看状态、开关/修改(patch)/读取插件源码、编写新插件，以及维护**按服务器
+分开的 Markdown 记忆**（`MEMORY.md`，可多文件）并自主更新。
 
 **首次运行**会自动生成 `plugins/llm_agent.json`——填好端点与密钥后保存一次
 `llm_agent.py` 触发热重载即可：

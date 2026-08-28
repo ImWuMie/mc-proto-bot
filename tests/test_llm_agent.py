@@ -45,12 +45,17 @@ class FakeBot:
         self.sent_commands: list[str] = []
         self.walk_calls: list[tuple] = []
         self.navigate_calls: list[tuple] = []
+        self.look_calls: list[tuple] = []
 
     async def send_message(self, text: str) -> None:
         self.sent_messages.append(text)
 
     async def send_command(self, command: str) -> None:
         self.sent_commands.append(command)
+
+    async def send_look(self, yaw: float, pitch: float, **kwargs) -> None:
+        self.look_calls.append((yaw, pitch))
+        self.player.yaw, self.player.pitch = yaw, pitch
 
     async def walk_to(self, x: float, z: float, **kwargs) -> None:
         self.walk_calls.append((x, z, kwargs))
@@ -191,6 +196,14 @@ class TriggerTest(unittest.IsolatedAsyncioTestCase):
             None, "Steve", {"text": "随便聊聊"}, None, None
         )
         self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_chat_records_player_uuid_mapping(self) -> None:
+        await self.plugin._on_player_chat(
+            "uuid-123", "Steve", {"text": "你好"}, None, None
+        )
+        self.assertEqual(
+            self.plugin._known_players["steve"], ("uuid-123", "Steve")
+        )
 
     async def test_quiet_message_recorded_but_not_triggered(self) -> None:
         self.plugin._settings["reply"] = {
@@ -543,6 +556,121 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_tool_reported(self) -> None:
         result = await self.plugin._run_tool("no_such_tool", {})
         self.assertIn("Unknown tool", result)
+
+    async def test_look_absolute(self) -> None:
+        result = await self.plugin._run_tool(
+            "look", {"yaw": 90, "pitch": -10}
+        )
+        self.assertIn("Facing yaw=90.0", result)
+        self.assertEqual(self.plugin.bot.look_calls, [(90.0, -10.0)])
+
+    async def test_look_relative_rotates_from_current_heading(self) -> None:
+        self.plugin.bot.player.yaw = 90.0
+        result = await self.plugin._run_tool(
+            "look", {"yaw": 30, "pitch": 5, "relative": True}
+        )
+        self.assertIn("Facing yaw=120.0", result)
+        self.assertEqual(self.plugin.bot.look_calls, [(120.0, 5.0)])
+
+    def _player_entity(self, uuid: str, x: float, z: float) -> SimpleNamespace:
+        return SimpleNamespace(
+            entity_uuid=uuid, x=x, y=64.0, z=z, yaw=45.0, pitch=0.0
+        )
+
+    async def test_get_player_by_name(self) -> None:
+        self.plugin._known_players = {"steve": ("uuid-1", "Steve")}
+        self.plugin.bot.entities = {"e1": self._player_entity("uuid-1", 20.5, 30.0)}
+        result = await self.plugin._run_tool("get_player", {"name": "STEVE"})
+        self.assertIn("Player Steve: X=20.5", result)
+        self.assertIn("blocks away", result)
+
+    async def test_get_player_unknown_name(self) -> None:
+        result = await self.plugin._run_tool("get_player", {"name": "ghost"})
+        self.assertIn("Unknown player", result)
+
+    async def test_get_player_known_but_not_visible(self) -> None:
+        self.plugin._known_players = {"steve": ("uuid-1", "Steve")}
+        self.plugin.bot.entities = {"e1": self._player_entity("uuid-9", 0, 0)}
+        result = await self.plugin._run_tool("get_player", {"name": "steve"})
+        self.assertIn("not visible nearby", result)
+
+    async def test_get_player_without_name_lists_visible_known_players(self) -> None:
+        self.plugin._known_players = {
+            "steve": ("uuid-1", "Steve"),
+            "alex": ("uuid-2", "Alex"),
+        }
+        self.plugin.bot.entities = {"e1": self._player_entity("uuid-1", 20.5, 30.0)}
+        result = await self.plugin._run_tool("get_player", {})
+        self.assertIn("Player Steve", result)
+        self.assertNotIn("Player Alex", result)
+
+    async def test_read_plugin_source_real_file(self) -> None:
+        result = await self.plugin._run_tool(
+            "read_plugin_source", {"name": "chat_logger"}
+        )
+        self.assertIn("--- chat_logger", result)
+        self.assertIn("chat_logger", result)
+
+    async def test_read_plugin_source_unknown(self) -> None:
+        result = await self.plugin._run_tool(
+            "read_plugin_source", {"name": "nope"}
+        )
+        self.assertIn("Plugin not found", result)
+
+    async def test_patch_plugin_old_new_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "a.py"
+            file.write_text(TEMP_PLUGIN_SRC, encoding="utf-8")
+            await self.manager.hot_load_file(file)
+            result = await self.plugin._run_tool(
+                "patch_plugin",
+                {"name": "temp_a", "old": '"temp_a"', "new": '"temp_b"'},
+            )
+            self.assertIn("Patched and reloaded: temp_b", result)
+            self.assertNotIn("temp_a", self.manager.plugins)
+            self.assertIn("temp_b", self.manager.plugins)
+            self.assertIn('name = "temp_b"', file.read_text(encoding="utf-8"))
+
+    async def test_patch_plugin_full_content_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "a.py"
+            file.write_text(TEMP_PLUGIN_SRC, encoding="utf-8")
+            await self.manager.hot_load_file(file)
+            new_code = TEMP_PLUGIN_SRC.replace('"temp_a"', '"temp_c"')
+            result = await self.plugin._run_tool(
+                "patch_plugin", {"name": "temp_a", "content": new_code}
+            )
+            self.assertIn("Patched and reloaded: temp_c", result)
+            self.assertIn("temp_c", self.manager.plugins)
+
+    async def test_patch_plugin_old_not_found_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "a.py"
+            file.write_text(TEMP_PLUGIN_SRC, encoding="utf-8")
+            await self.manager.hot_load_file(file)
+            result = await self.plugin._run_tool(
+                "patch_plugin", {"name": "temp_a", "old": "zzz", "new": "x"}
+            )
+            self.assertIn("not found in temp_a", result)
+            self.assertIn("temp_a", self.manager.plugins)  # 未受影响
+
+    async def test_patch_plugin_broken_reload_keeps_old(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "a.py"
+            file.write_text(TEMP_PLUGIN_SRC, encoding="utf-8")
+            await self.manager.hot_load_file(file)
+            result = await self.plugin._run_tool(
+                "patch_plugin",
+                {"name": "temp_a", "content": "def broken(:"},
+            )
+            self.assertIn("reload failed", result)
+            self.assertIn("temp_a", self.manager.plugins)  # 旧插件继续运行
+
+    async def test_patch_plugin_refuses_self(self) -> None:
+        result = await self.plugin._run_tool(
+            "patch_plugin", {"name": "llm_agent", "content": "x = 1"}
+        )
+        self.assertIn("Refused", result)
 
     async def test_set_plugin_refuses_self(self) -> None:
         result = await self.plugin._run_tool(
@@ -905,6 +1033,18 @@ class AdminGateTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("Permission denied", result)
         self.assertIn("chat_logger", self.manager.plugins)
+
+    async def test_non_admin_cannot_patch_plugin(self) -> None:
+        self.plugin._requester = "Steve"
+        result = await self.plugin._run_tool(
+            "patch_plugin",
+            {"name": "chat_logger", "old": "log.info", "new": "MARKER_XYZ"},
+        )
+        self.assertIn("Permission denied", result)
+        content = self.manager.source_of("chat_logger").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("MARKER_XYZ", content)  # 未改动
 
     async def test_admin_can_write_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

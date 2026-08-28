@@ -342,9 +342,10 @@ Notes:
 it keeps an **agent conversation context**, looks up the recent **200 chat
 lines through a `read_chat` tool** (filter by players / keyword / system
 broadcasts), and acts through OpenAI-compatible function calling — send chat,
-run commands, walk/navigate, check status, toggle plugins, write new plugins,
-and maintain **per-server Markdown memory** (`MEMORY.md`, multiple files
-allowed) that it updates autonomously.
+run commands, walk/navigate, turn/look, look up player positions, check
+status, toggle/patch/read plugins, write new plugins, and maintain
+**per-server Markdown memory** (`MEMORY.md`, multiple files allowed) that it
+updates autonomously.
 
 **On first run** the plugin generates `plugins/llm_agent.json` — fill in the
 endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
