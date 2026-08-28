@@ -50,7 +50,13 @@ class MyPlugin(Plugin):
 Chat:
 - `system_chat` (component, overlay) — component is decoded NBT (str/dict/list)
 - `player_chat` (sender_uuid\|None, name, message, chat_type_id\|None, target_name\|None)
-  — sender is None for profileless chat; render with `plain_text()`
+  — sender is None for profileless chat. **`name` and `message` are both chat
+  components, not strings** — always `plain_text()` them; servers routinely
+  attach click/hover/insertion data to the name, and using it raw gives you a
+  dict where you expected a player name.
+- `chat_sent` (message) — this bot said something, whoever sent it (any
+  plugin's `send_message`). Use it to tell your own words from a stranger's
+  when the server echoes chat back as `player_chat`.
 
 World/chunks:
 - `world` (WorldSessionState) · `respawn` (WorldSessionState)

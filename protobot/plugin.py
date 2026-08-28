@@ -59,8 +59,10 @@ class ExposedFunction:
     ``tool_name`` is the same thing spelled for function-calling APIs
     (``"<plugin>_<name>"``), which reject dots.  ``parameters`` is a JSON
     Schema object describing the keyword arguments; an empty schema means the
-    function takes none.  ``llm`` opts the function into the agent's tool list
-    and ``admin`` makes the agent refuse it for non-admin players.
+    function takes none.  ``llm`` opts the function into the agent's tool list,
+    and ``admin`` is metadata for agent-style callers -- :meth:`
+    PluginManager.call_service` does not enforce it, because one plugin calling
+    another is trusted code, not a player request.
     """
 
     plugin: str
@@ -201,8 +203,10 @@ class Plugin:
         stale instance can never be called.
 
         Set ``llm=True`` to also offer the function to the LLM agent as a tool
-        (``parameters`` is then the JSON Schema for its keyword arguments), and
-        ``admin=True`` to make the agent refuse it for non-admin players.
+        (``parameters`` is then the JSON Schema for its keyword arguments, and
+        the agent passes only the keys it declares), and ``admin=True`` to make
+        the agent refuse it for non-admin players -- note that this is a hint
+        to such callers, not something ``call_service`` enforces.
         Exceptions propagate to the caller -- unlike event handlers, a service
         call is not isolated, because the caller needs to see the failure.
         """

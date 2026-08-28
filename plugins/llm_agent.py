@@ -535,6 +535,7 @@ class LLMAgent(Plugin):
         self._post_json = _http_post_json  # 测试可替换为假实现
         self.subscribe("player_chat", self._on_player_chat)
         self.subscribe("system_chat", self._on_system_chat)
+        self.subscribe("chat_sent", self._on_chat_sent)
         self.subscribe_session("session_ready", self._on_session_ready)
         self.subscribe_session("session_disconnected", self._on_session_disconnected)
 
@@ -768,6 +769,14 @@ class LLMAgent(Plugin):
         kind = self._should_reply(sender, text)
         if kind:
             self._enqueue(sender, text, follow_up=kind == "follow_up")
+
+    async def _on_chat_sent(self, message: str) -> None:
+        """这只 bot 说出去的每一句（不论哪个插件发的）都登记为「自己说过」。
+
+        服务器会把聊天回显成 player_chat；只记自己发的那份，别的插件
+        （如定时广播）发的话就会被当成第三方，甚至触发自己回自己。
+        """
+        self._remember_sent(message)
 
     async def _on_system_chat(self, component, overlay) -> None:
         text = plain_text(component)

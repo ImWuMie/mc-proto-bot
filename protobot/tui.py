@@ -478,10 +478,13 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             except asyncio.CancelledError:
                 raise
             except BaseException as error:
-                # SystemExit guidance (e.g. missing credentials) lands here;
-                # the task keeps its exception for cli_app to re-await.
+                # SystemExit guidance (e.g. missing credentials) has to reach
+                # cli_app: it re-awaits this task and the process should exit
+                # non-zero, so log it here and re-raise rather than swallowing
+                # it and reporting success.
                 if self.is_running:
                     self._log_write(f"[错误] bot 会话异常退出: {error}")
+                raise
 
         def _command_stop(self) -> None:
             if not self.started:

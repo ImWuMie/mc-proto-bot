@@ -656,6 +656,10 @@ class Bot:
             .to_bytes()
         )
         await self.send_raw(self.version.packets.serverbound_chat, payload)
+        # Let plugins see what this bot said, whoever sent it: the server
+        # echoes chat back as ``player_chat``, and without this a plugin
+        # cannot tell its own words (or another plugin's) from a stranger's.
+        await self.events.emit("chat_sent", message)
 
     def load_block_state_report(self, report: str) -> int:
         """Install a Mojang ``blocks.json`` report for collision prediction."""

@@ -49,6 +49,7 @@ class FakeBot:
 
     async def send_message(self, text: str) -> None:
         self.sent_messages.append(text)
+        await self.events.emit("chat_sent", text)  # 真 Bot 也会发这个事件
 
     async def send_command(self, command: str) -> None:
         self.sent_commands.append(command)
@@ -247,6 +248,17 @@ class ComponentNameTest(unittest.IsolatedAsyncioTestCase):
             "all": False, "name_mention": True, "prefix": "hey,claude",
             "keywords": [], "attention_seconds": 0.0,
         }
+
+    async def test_chat_sent_by_another_plugin_is_not_a_stranger(self) -> None:
+        # 定时广播等别的插件通过同一只 bot 说话，回显不能被当成第三方，
+        # 否则 reply.all 或消息里带自己名字时会自问自答。
+        text = "整点报时：现在 18:00"
+        await self.plugin._on_chat_sent(text)
+        await self.plugin._on_player_chat(
+            "uuid-1", RICH_NAME, {"text": text}, None, None
+        )
+        self.assertEqual(self.plugin._queue.qsize(), 0)
+        self.assertEqual(self.plugin._chat_log, [])
 
     async def test_component_name_becomes_plain_text(self) -> None:
         await self.plugin._on_player_chat(
