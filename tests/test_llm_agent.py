@@ -855,7 +855,12 @@ class SystemPromptTest(unittest.IsolatedAsyncioTestCase):
     def test_keeps_the_human_voice_guidance(self) -> None:
         self.assertIn("regular player", self.prompt)
         self.assertIn("No bullet lists", self.prompt)
-        self.assertIn("bot or an AI", self.prompt)  # 被问到不否认
+        self.assertIn("Stay in character", self.prompt)
+
+    def test_does_not_claim_to_be_human(self) -> None:
+        # 不主动暴露身份，但也不谎称是人类或冒充某个真人
+        self.assertIn("Don't insist you are human", self.prompt)
+        self.assertIn("never claim to be a specific real person", self.prompt)
 
     def test_keeps_plugin_authoring_rules(self) -> None:
         self.assertIn("plain_text", self.prompt)
