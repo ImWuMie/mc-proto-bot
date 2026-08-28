@@ -144,6 +144,91 @@ RICH_NAME = {
 }
 
 
+class WhisperCommandTest(unittest.IsolatedAsyncioTestCase):
+    """模型用 /tell 私聊后，同一句不能再当最终回复发到公屏。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot(username="mie_233")
+        self.plugin._settings["llm"]["api_key"] = "k"
+
+    async def test_whisper_then_same_text_is_not_repeated(self) -> None:
+        # 线上 bug：私聊回完，同一句又发了公屏
+        text = "记住了主人！钓鱼的时候谁的传送我都不接"
+        fake = FakeLLM(
+            assistant(tool_calls=[
+                tool_call("send_command", {"command": f"tell _ImWuMie {text}"})
+            ]),
+            assistant(content=text),
+        )
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("_ImWuMie", "添加限制", private=True)
+        self.assertEqual(self.plugin.bot.sent_commands, [f"tell _ImWuMie {text}"])
+        self.assertEqual(self.plugin.bot.sent_messages, [])  # 公屏干净
+
+    async def test_whisper_result_names_the_target(self) -> None:
+        result = await self.plugin._run_tool(
+            "send_command", {"command": "msg Steve 你好"}
+        )
+        self.assertEqual(result, "Whispered to Steve")
+
+    async def test_whisper_is_recorded_in_the_chat_log(self) -> None:
+        await self.plugin._run_tool(
+            "send_command", {"command": "/tell Steve 你好"}
+        )
+        entry = self.plugin._chat_log[-1]
+        self.assertEqual(entry["name"], "mie_233")
+        self.assertIn("(私聊 Steve)", entry["text"])
+        self.assertIn("你好", entry["text"])
+
+    async def test_whisper_opens_the_attention_window(self) -> None:
+        self.plugin._settings["reply"]["attention_seconds"] = 15.0
+        self.plugin._requester = "Steve"
+        await self.plugin._run_tool(
+            "send_command", {"command": "tell Steve 你好"}
+        )
+        self.assertTrue(self.plugin._in_attention("Steve"))
+
+    async def test_various_whisper_aliases_recognised(self) -> None:
+        for command in (
+            "tell Steve hi", "/msg Steve hi", "w Steve hi",
+            "whisper Steve hi", "PM Steve hi",
+        ):
+            self.plugin._sent_recent.clear()
+            result = await self.plugin._run_tool(
+                "send_command", {"command": command}
+            )
+            self.assertEqual(result, "Whispered to Steve", command)
+
+    async def test_ordinary_commands_are_untouched(self) -> None:
+        result = await self.plugin._run_tool(
+            "send_command", {"command": "say 大家好"}
+        )
+        self.assertIn("Command executed", result)
+        self.assertEqual(self.plugin._sent_recent, [])  # 不进去重表
+        await self.plugin._run_tool("send_message", {"text": "大家好"})
+        self.assertEqual(self.plugin.bot.sent_messages, ["大家好"])
+
+    async def test_tell_without_a_body_is_a_plain_command(self) -> None:
+        result = await self.plugin._run_tool(
+            "send_command", {"command": "tell Steve"}
+        )
+        self.assertIn("Command executed", result)
+
+    async def test_different_text_after_a_whisper_still_sends(self) -> None:
+        fake = FakeLLM(
+            assistant(tool_calls=[
+                tool_call("send_command", {"command": "tell Steve 私下说的"})
+            ]),
+            assistant(content="公开说的"),
+        )
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("Steve", "问题", private=True)
+        self.assertEqual(self.plugin.bot.sent_messages, ["公开说的"])
+
+
 class ComponentNameTest(unittest.IsolatedAsyncioTestCase):
     """player_chat 的 name 是聊天组件，必须渲染成纯文本再用。"""
 
