@@ -876,12 +876,18 @@ class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 configured (restricted)", result)
 
     async def test_reports_the_attention_window(self) -> None:
+        self.plugin._settings["reply"]["attention_seconds"] = 15.0
         result = await self.plugin._run_tool("get_system_info", {})
         self.assertIn("Attention: 15s window, idle", result)
         self.plugin._note_attention("Steve")
         result = await self.plugin._run_tool("get_system_info", {})
         self.assertIn("currently on steve", result)
         self.plugin._settings["reply"]["attention_seconds"] = 0
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Attention: disabled", result)
+
+    async def test_attention_disabled_by_default(self) -> None:
+        # 出厂默认 attention_seconds=0（关闭）；开启需自己设秒数
         result = await self.plugin._run_tool("get_system_info", {})
         self.assertIn("Attention: disabled", result)
 

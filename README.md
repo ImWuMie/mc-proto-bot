@@ -365,7 +365,7 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
     "name_mention": true,       // reply when chat contains the bot's name
     "prefix": "hey,claude",     // special prefix ("" disables it)
     "keywords": ["claude"],     // extra keyword triggers (case-insensitive)
-    "attention_seconds": 15     // keep listening to a player this long after replying (0 = off)
+    "attention_seconds": 15     // keep listening to a player this long after replying (0 = off, the default)
   },
   "admins": ["your_name"],      // only admins may write/toggle plugins ([] = anyone)
   "system_prompt": "...",       // optional, overrides the built-in prompt
@@ -376,12 +376,13 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 }
 ```
 
-- **Sustained attention** — after the agent actually replies to someone, that
-  player stays in an attention window (`attention_seconds`, 15 s by default).
-  Their next lines reach the agent even without naming it, marked
-  `(follow-up)`, and the agent decides whether the line was aimed at it —
-  answering if so, staying silent (`NO_REPLY`) if the conversation moved on.
-  A reply refreshes the window; `NO_REPLY` never opens one.
+- **Sustained attention** (off by default) — set `attention_seconds` to a
+  number and, after the agent actually replies to someone, that player stays
+  in an attention window for that long. Their next lines reach the agent even
+  without naming it, marked `(follow-up)`, and the agent decides whether the
+  line was aimed at it — answering if so, staying silent (`NO_REPLY`) if the
+  conversation moved on. A reply refreshes the window; `NO_REPLY` never opens
+  one. Note that every line inside the window costs an API call.
 - **Character sheet** — `plugins/llm_agent_persona.md` (a template is written
   on first run) is free-form Markdown describing who the bot is: personality,
   backstory, interests, speech habits. It is re-read every time a prompt is
@@ -428,6 +429,36 @@ disabled sample):
   (run once now) — everything except `schedule_list` is admin-only. So
   "every 30 minutes remind people to eat" is enough to create a task in
   game, and "cancel the reminder" removes it.
+
+### Auto-fishing plugin (`fishing`)
+
+`plugins/fishing.py` casts, detects the bite, and reels, in a loop. This
+protocol stack decodes no sound packets, so the canonical
+`entity.fishing_bobber.splash` signal is unavailable; detection works off the
+bobber entity instead:
+
+1. **Claim the bobber** — preferably by looking `minecraft:fishing_bobber` up
+   in the server's `minecraft:entity_type` registry; otherwise the first
+   entity spawned within `spawn_window` seconds of the cast and
+   `spawn_radius` blocks of the bot is adopted, and **its type id is
+   remembered** so later casts are exact.
+2. **Wait for it to settle** — a resting baseline Y is only established after
+   several near-motionless updates, so the cast arc can't be mistaken for a
+   bite.
+3. **Two signals** — a downward `entity_motion` (vanilla's bite is about
+   -0.4 blocks/tick) or a position drop past `bite_drop` below the baseline.
+   Either one reels immediately. Both are ignored until the baseline exists
+   (gravity during flight is downward too), and each can be tuned or turned
+   off on its own.
+
+`max_wait` seconds without a bite (bobber on land, line cut) triggers a
+re-cast, as does the bobber being removed; `recast_delay` is the only gap
+between reeling and casting again.
+
+Settings live in `plugins/fishing.json` (generated on first run, re-read
+within 5 seconds of an edit) and it starts **`enabled: false`** — flip that to
+begin. Holding a rod is up to you: the stack exposes no item names, so the
+plugin cannot verify what is in the bot's hand.
 
 ### Full-screen TUI (optional)
 

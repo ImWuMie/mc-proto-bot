@@ -344,7 +344,7 @@ class HelloReply(Plugin):
     "name_mention": true,       // 聊天包含自己名字时回应
     "prefix": "hey,claude",     // 特殊前缀（留空 "" 表示不使用）
     "keywords": ["claude"],     // 额外关键词触发（忽略大小写）
-    "attention_seconds": 15     // 回复后对该玩家的持续注意窗口（秒，0 关闭）
+    "attention_seconds": 15     // 回复后对该玩家的持续注意窗口（秒，0 关闭，默认 0）
   },
   "admins": ["你的名字"],       // 只有管理员能写插件/开关插件（[] = 不限制）
   "system_prompt": "...",       // 可选，覆盖内置提示词
@@ -355,10 +355,11 @@ class HelloReply(Plugin):
 }
 ```
 
-- **持续注意**：真的回复过某个玩家后，他会进入注意窗口（`attention_seconds`，
-  默认 15 秒）。窗口内他的后续发言即便没提到 bot 也会送进来，标记为
-  `(follow-up)`，由 LLM 判断这句是不是在跟自己说话——是就接着聊，话题已经
-  转走就输出 `NO_REPLY` 保持安静。每次回复都会续上窗口；`NO_REPLY` 不会开窗口。
+- **持续注意**（默认关闭）：把 `attention_seconds` 设成秒数后，真的回复过某个
+  玩家的话，他会进入这么长的注意窗口。窗口内他的后续发言即便没提到 bot 也会
+  送进来，标记为 `(follow-up)`，由 LLM 判断这句是不是在跟自己说话——是就接着
+  聊，话题已经转走就输出 `NO_REPLY` 保持安静。每次回复都会续上窗口；
+  `NO_REPLY` 不会开窗口。注意窗口内每条发言都会产生一次 API 调用。
 - **人物预设**：`plugins/llm_agent_persona.md`（首次运行生成模板）是自由撰写
   的 Markdown 角色设定——性格、经历、喜好、说话习惯。每次构建提示词时都会
   重读，因此**保存文件即生效**，无需重启也无需热重载插件。它只影响语气人格，
@@ -398,6 +399,28 @@ class HelloReply(Plugin):
   `schedule_set`、`schedule_remove`、`schedule_run`（立即执行一次），除
   `schedule_list` 外都仅限管理员。也就是说在游戏里说「每 30 分钟提醒大家
   吃饭」就能建好任务，说「把提醒取消」就能删掉。
+
+### 自动钓鱼插件（fishing）
+
+`plugins/fishing.py` 循环执行抛竿 → 判定咬钩 → 收杆。本协议栈不解码音效包，
+拿不到原版的 `entity.fishing_bobber.splash` 信号，因此判定基于浮标实体：
+
+1. **认领浮标**——优先从服务端下发的 `minecraft:entity_type` 注册表里查
+   `minecraft:fishing_bobber`；查不到就把「抛竿后 `spawn_window` 秒内、
+   `spawn_radius` 格内新生成的实体」当作浮标，并**记住它的 type_id**，
+   之后每次抛竿都能精确认领。
+2. **等它落稳**——连续几次位置更新几乎不动才确立静止水面基准线，避免把
+   抛物线下落当成咬钩。
+3. **两路信号**——`entity_motion` 报出向下速度（原版咬钩约 -0.4 格/tick），
+   或位置从基准线下沉超过 `bite_drop`；任一命中立即收杆。两路都只在基准线
+   确立之后生效（飞行途中重力速度同样是负的），且可各自调阈值或关闭。
+
+`max_wait` 秒没咬钩（浮标落在陆地、线被打断）会收杆重抛，浮标被移除也会重抛；
+收杆到重抛之间只隔 `recast_delay`。
+
+设置在 `plugins/fishing.json`（首次运行生成，改动 5 秒内自动重载），默认
+**`enabled: false`**，改成 true 才开始钓。手持鱼竿需要你自己保证：协议栈拿不到
+物品名称，插件无法校验手里到底是不是鱼竿。
 
 ### 全屏 TUI 界面（可选）
 
