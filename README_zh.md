@@ -353,7 +353,8 @@ class HelloReply(Plugin):
     "name_mention": true,       // 聊天包含自己名字时回应
     "prefix": "hey,claude",     // 特殊前缀（留空 "" 表示不使用）
     "keywords": ["claude"],     // 额外关键词触发（忽略大小写）
-    "attention_seconds": 15     // 回复后对该玩家的持续注意窗口（秒，0 关闭，默认 0）
+    "attention_seconds": 15,    // 回复后对该玩家的持续注意窗口（秒，0 关闭，默认 0）
+    "duplicate_window": 10      // 同一玩家的同一句话，这么多秒内只处理一次
   },
   "admins": ["你的名字"],       // 只有管理员能写插件/开关插件（[] = 不限制）
   "system_prompt": "...",       // 可选，覆盖内置提示词
@@ -373,6 +374,13 @@ class HelloReply(Plugin):
   的 Markdown 角色设定——性格、经历、喜好、说话习惯。每次构建提示词时都会
   重读，因此**保存文件即生效**，无需重启也无需热重载插件。它只影响语气人格，
   不授予权限，也不能放宽信任规则。
+- **待办清单**：与记忆文件同目录的 `TODO.md` 是一份 Markdown 清单，由智能体
+  用 `todo_add` / `todo_list` / `todo_done` / `todo_remove` 维护。未完成项会
+  注入每次提示词，所以它答应过的事重启也不会忘；完成的项不再占用上下文。
+  条目按**文字子串**定位而不是下标，匹配到多条会拒绝执行而不是瞎猜。
+- **重复触发过滤**：同一个玩家的同一句话，若还排在队里、或
+  `duplicate_window` 秒内（默认 10）刚处理过，直接丢掉。玩家连按回车、
+  或几个触发条件同时命中，否则每一次都要花一次 API 调用。
 - **记忆**按服务器存放在 `llm_agent_memory/<host>_<port>/MEMORY.md`，智能体
   通过 `read_memory` / `save_memory` / `write_memory` / `clear_memory` 自主
   维护，每次对话都会带上。
@@ -400,7 +408,8 @@ class HelloReply(Plugin):
 ```
 
 - `interval`（秒，最小 5）循环执行；`time`（`HH:MM` 24 小时本地时间）每天
-  执行一次——两者至少给一个。`action` 为 `chat` 或 `command`；
+  执行一次——两者至少给一个。`action` 为 `chat`（发聊天）、`command`
+  （执行命令）或 `remind`（把内容交给 LLM 智能体，由它决定说什么、做什么）；
   `enabled: false` 暂停该任务。
 - 文件改动后 5 秒内自动重新加载，无需重启或热重载插件。未连接服务器时到期
   任务顺延，不会丢失。
@@ -409,6 +418,10 @@ class HelloReply(Plugin):
   除 `list`、`status` 外都仅限管理员。在游戏里说「每 30 分钟提醒大家吃饭」
   就能建好任务，说「把提醒取消」就能删掉。校验规则只写在插件里，所以文件、
   服务调用、智能体三条路径遵守同一套规则。
+- **叫醒智能体**：`action: remind` 调用暴露出来的 `llm_agent.remind`，内容作为
+  「提醒」进入 LLM 而不是被原样念出来——「每小时看看有没有人需要帮忙」这种任务
+  就由它自己决定做什么、或者干脆不说话。提醒不携带管理员权限；没装智能体插件时
+  任务会被跳过并提示。
 
 ### 自动钓鱼插件（fishing）
 

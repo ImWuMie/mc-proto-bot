@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from protobot.plugin import PluginManager
+from protobot.plugin import ExposedFunction, PluginManager
 
 SCHEDULER_FILE = Path(__file__).resolve().parent.parent / "plugins" / "scheduler.py"
 
@@ -36,6 +36,7 @@ def load_plugin(tmp: str) -> tuple[PluginManager, object]:
     manager = PluginManager([SCHEDULER_FILE.parent])
     manager.discover()
     plugin = manager.plugins["scheduler"]
+    plugin.manager = manager  # 启用时框架会绑定，这里手工模拟
     plugin._file = Path(tmp) / "scheduler.json"
     return manager, plugin
 
@@ -380,6 +381,92 @@ class ExposedServiceTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("scheduled task(s)", result)
         finally:
             await self.manager.disable_all()
+
+
+class RemindActionTest(unittest.IsolatedAsyncioTestCase):
+    """action=remind：把内容交给 LLM 智能体，而不是自己发话。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.manager, self.plugin = load_plugin(self._tmp.name)
+        self.plugin._file.write_text(json.dumps({"tasks": []}), encoding="utf-8")
+        self.plugin._load_tasks()
+        self.plugin.bot = FakeBot()
+        self.reminders: list[dict] = []
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _install_agent(self, result: str = "Reminder queued: x") -> None:
+        async def remind(text: str = "", source: str = "") -> str:
+            self.reminders.append({"text": text, "source": source})
+            return result
+
+        self.manager._services["llm_agent.remind"] = ExposedFunction(
+            plugin="llm_agent", name="remind", handler=remind
+        )
+
+    async def test_remind_is_a_valid_action(self) -> None:
+        result = await self.plugin._service_add(
+            name="喝水", interval=3600, action="remind", text="提醒大家喝水"
+        )
+        self.assertIn("added", result)
+        self.assertEqual(self.plugin._tasks[0]["action"], "remind")
+
+    async def test_remind_calls_the_agent_not_the_chat(self) -> None:
+        self._install_agent()
+        await self.plugin._service_add(
+            name="喝水", interval=3600, action="remind", text="提醒大家喝水"
+        )
+        result = await self.plugin._service_run(name="喝水")
+        self.assertIn("executed once", result)
+        self.assertEqual(
+            self.reminders, [{"text": "提醒大家喝水", "source": "喝水"}]
+        )
+        self.assertEqual(self.plugin.bot.sent_messages, [])  # 不自己发言
+        self.assertEqual(self.plugin.bot.sent_commands, [])
+
+    async def test_remind_without_the_agent_is_reported(self) -> None:
+        await self.plugin._service_add(
+            name="喝水", interval=3600, action="remind", text="x"
+        )
+        result = await self.plugin._service_run(name="喝水")
+        self.assertIn("未加载", result)
+
+    async def test_scheduled_remind_fires_from_the_loop(self) -> None:
+        self._install_agent()
+        self.plugin._tasks = [
+            make_task(name="t", action="remind", text="到点了")
+        ]
+        self.plugin._next_run = {"t": time.monotonic() - 1.0}
+        await self.plugin._run_due()
+        self.assertEqual(self.reminders[0]["text"], "到点了")
+
+    async def test_agent_failure_does_not_break_the_loop(self) -> None:
+        self._install_agent(result="Agent is not running")
+        self.plugin._tasks = [
+            make_task(name="t", action="remind", text="到点了")
+        ]
+        self.plugin._next_run = {"t": time.monotonic() - 1.0}
+        await self.plugin._run_due()  # 不应抛出
+        self.assertGreater(self.plugin._next_run["t"], time.monotonic())
+
+    async def test_remind_does_not_need_a_bot(self) -> None:
+        self._install_agent()
+        self.plugin.bot = None
+        self.plugin._tasks = [
+            make_task(name="t", action="remind", text="到点了")
+        ]
+        self.plugin._next_run = {"t": time.monotonic() - 1.0}
+        await self.plugin._run_due()
+        # 未连接时 _run_due 整体跳过，提醒也顺延（不会凭空发给 agent）
+        self.assertEqual(self.reminders, [])
+
+    async def test_invalid_action_still_rejected(self) -> None:
+        result = await self.plugin._service_add(
+            name="x", interval=60, action="dance", text="y"
+        )
+        self.assertIn("action must be one of", result)
 
 
 class SecondsUntilTest(unittest.TestCase):

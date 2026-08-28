@@ -376,7 +376,8 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
     "name_mention": true,       // reply when chat contains the bot's name
     "prefix": "hey,claude",     // special prefix ("" disables it)
     "keywords": ["claude"],     // extra keyword triggers (case-insensitive)
-    "attention_seconds": 15     // keep listening to a player this long after replying (0 = off, the default)
+    "attention_seconds": 15,    // keep listening to a player this long after replying (0 = off, the default)
+    "duplicate_window": 10      // ignore the same line from the same player again within this many seconds
   },
   "admins": ["your_name"],      // only admins may write/toggle plugins ([] = anyone)
   "system_prompt": "...",       // optional, overrides the built-in prompt
@@ -400,6 +401,17 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
   built, so **saving the file is enough** — no restart, no plugin reload. It
   shapes voice only: it grants no permissions and cannot loosen the trust
   rules.
+- **Todo list** — `TODO.md` sits beside the memory files and is a Markdown
+  checklist the agent maintains with `todo_add` / `todo_list` / `todo_done` /
+  `todo_remove`. Open items are injected into every prompt, so something it
+  agreed to do survives a restart; finished ones stop taking up context. Items
+  are matched by substring rather than index, and an ambiguous match is
+  refused instead of guessed.
+- **Duplicate triggers are filtered** — the same line from the same player is
+  dropped while an identical trigger is still queued, and again if it was
+  handled within `duplicate_window` seconds (10 by default). Players
+  double-tapping enter, or several trigger rules matching at once, would
+  otherwise each cost an API call.
 - **Memory** is stored per server at `llm_agent_memory/<host>_<port>/MEMORY.md`;
   the agent maintains it with the `read_memory` / `save_memory` / `write_memory`
   / `clear_memory` tools, and every conversation includes it.
@@ -430,8 +442,9 @@ disabled sample):
 ```
 
 - `interval` (seconds, minimum 5) repeats forever; `time` (`HH:MM`, 24-hour
-  local) fires once a day — give at least one. `action` is `chat` or
-  `command`; `enabled: false` pauses a task.
+  local) fires once a day — give at least one. `action` is `chat` (say it),
+  `command` (run it), or `remind` (hand the text to the LLM agent and let it
+  decide what to do); `enabled: false` pauses a task.
 - The file is re-read within 5 seconds of any change, so edits apply without
   restarting or hot-reloading the plugin. While the bot is disconnected, due
   tasks are postponed rather than dropped.
@@ -442,6 +455,11 @@ disabled sample):
   eat" is enough to create a task in game, and "cancel the reminder" removes
   it. Validation lives in the plugin, so the file, the services, and the agent
   all obey one set of rules.
+- **Waking the agent** — `action: remind` calls the exposed
+  `llm_agent.remind`, so the text reaches the LLM as a reminder turn rather
+  than being said verbatim: "every hour, check whether anyone needs help" lets
+  it decide what to do, or stay quiet. Reminders carry no admin rights, and
+  the task is skipped with a notice when no agent is loaded.
 
 ### Auto-fishing plugin (`fishing`)
 

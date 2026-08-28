@@ -15,8 +15,9 @@
     }
 
 字段：``interval``（秒，≥5，循环执行）与 ``time``（"HH:MM" 本地时间，每天
-执行一次）至少给一个；``action`` 为 ``chat``（发聊天）或 ``command``
-（执行服务器命令）；``enabled`` 为 false 时暂停。
+执行一次）至少给一个；``action`` 为 ``chat``（发聊天）、``command``（执行
+服务器命令）或 ``remind``（把内容交给 LLM 智能体，由它决定说什么、做什么）；
+``enabled`` 为 false 时暂停。
 
 运行时每 5 秒检查一次 JSON 的修改时间，改动自动重新加载。任务也可以通过
 暴露出去的 ``scheduler.list`` / ``add`` / ``set`` / ``remove`` / ``run`` /
@@ -40,6 +41,13 @@ TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 
 #: interval 下限（秒），防止刷屏
 MIN_INTERVAL = 5.0
+
+#: 支持的动作 -> 日志里的说法
+ACTIONS: dict[str, str] = {
+    "chat": "发送聊天",
+    "command": "执行命令",
+    "remind": "提醒 LLM",
+}
 
 DEFAULT_TASKS: dict = {
     "tasks": [
@@ -68,7 +76,7 @@ TASK_SCHEMA: dict = {
         },
         "action": {
             "type": "string",
-            "description": "chat to send a message, command to run one",
+            "description": "chat to send a message, command to run a server command, remind to wake the LLM agent with this text",
         },
         "text": {"type": "string", "description": "Message body or command"},
         "enabled": {"type": "boolean", "description": "Pause or resume"},
@@ -231,8 +239,8 @@ class Scheduler(Plugin):
         if not name:
             return None, "missing task name"
         action = str(task.get("action") or "chat")
-        if action not in ("chat", "command"):
-            return None, "action must be chat or command"
+        if action not in ACTIONS:
+            return None, f"action must be one of {', '.join(ACTIONS)}"
         text = str(task.get("text") or "").strip()
         if not text:
             return None, "missing text (message body or command)"
@@ -393,10 +401,9 @@ class Scheduler(Plugin):
             bot = self.bot
             if bot is None:
                 return "Not connected to a server"
-            if task["action"] == "command":
-                await bot.send_command(task["text"])
-            else:
-                await bot.send_message(task["text"])
+            error = await self._perform(task)
+            if error:
+                return error
             log.info(f"[定时] 任务 {name}: 手动执行一次。")
             return f"Task {name} executed once"
         return f"Task not found: {name}"
@@ -448,14 +455,38 @@ class Scheduler(Plugin):
             else:
                 self._next_run[name] = now + self._seconds_until(task["time"])
             try:
-                if task["action"] == "command":
-                    await bot.send_command(task["text"])
-                    log.info(f"[定时] 任务 {name}: 已执行命令。")
+                error = await self._perform(task)
+                if error:
+                    log.warn(f"[定时] 任务 {name}: {error}")
                 else:
-                    await bot.send_message(task["text"])
-                    log.info(f"[定时] 任务 {name}: 已发送聊天。")
+                    log.info(f"[定时] 任务 {name}: 已{ACTIONS[task['action']]}。")
             except Exception as error:
                 log.error(f"[定时] 任务 {name} 执行失败: {error}")
+
+    async def _perform(self, task: dict) -> str:
+        """执行一个任务；返回空字符串表示成功，否则是给调用方看的原因。
+
+        ``remind`` 不自己发话，而是把内容交给 LLM 智能体去决定怎么处理——
+        通过暴露出来的 ``llm_agent.remind``，所以这里不需要知道它的内部，
+        没装那个插件时也只是拿到一句「未加载」。
+        """
+        action = task["action"]
+        if action == "remind":
+            manager = self.manager
+            if manager is None or manager.get_service("llm_agent.remind") is None:
+                return "LLM 智能体未加载，提醒已跳过"
+            result = await manager.call_service(
+                "llm_agent.remind", text=task["text"], source=task["name"]
+            )
+            return "" if "queued" in str(result) else str(result)
+        bot = self.bot
+        if bot is None:
+            return "尚未连接服务器"
+        if action == "command":
+            await bot.send_command(task["text"])
+        else:
+            await bot.send_message(task["text"])
+        return ""
 
     def _seconds_until(self, spec: str) -> float:
         """到下一个 ``HH:MM`` 本地时刻的秒数（已过则算到明天）。"""

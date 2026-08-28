@@ -1016,6 +1016,271 @@ class ReadChatToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<Steve>", result)
 
 
+class TodoTest(unittest.IsolatedAsyncioTestCase):
+    """待办清单：TODO.md 与记忆同目录，按服务器分开，未完成项进系统提示词。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self._tmp = tempfile.TemporaryDirectory()
+        configure(self.plugin, self._tmp.name)
+        self.plugin.session = FakeSession()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _file(self) -> Path:
+        return self.plugin._todo_path()
+
+    async def test_empty_list(self) -> None:
+        self.assertIn("empty", await self.plugin._run_tool("todo_list", {}))
+
+    async def test_add_then_list(self) -> None:
+        result = await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        self.assertIn("Added: 找钻石", result)
+        self.assertIn("1 open", result)
+        listing = await self.plugin._run_tool("todo_list", {})
+        self.assertIn("- [ ] 找钻石", listing)
+        self.assertIn("# TODO", self._file().read_text(encoding="utf-8"))
+
+    async def test_add_rejects_a_duplicate(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        result = await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        self.assertIn("Already on the list", result)
+        self.assertEqual(len(self.plugin._read_todo()), 1)
+
+    async def test_add_rejects_empty_text(self) -> None:
+        self.assertIn(
+            "empty", await self.plugin._run_tool("todo_add", {"text": "  "})
+        )
+
+    async def test_done_marks_the_item(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        await self.plugin._run_tool("todo_add", {"text": "修农场"})
+        result = await self.plugin._run_tool("todo_done", {"text": "钻石"})
+        self.assertIn("Done: 找钻石", result)
+        self.assertIn("1 still open", result)
+        self.assertEqual(self.plugin._read_todo()[0], (True, "找钻石"))
+
+    async def test_done_hides_it_from_the_open_list(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        await self.plugin._run_tool("todo_done", {"text": "钻石"})
+        self.assertIn(
+            "all items are done", await self.plugin._run_tool("todo_list", {})
+        )
+        listing = await self.plugin._run_tool(
+            "todo_list", {"include_done": True}
+        )
+        self.assertIn("- [x] 找钻石", listing)
+
+    async def test_done_needs_an_open_match(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        await self.plugin._run_tool("todo_done", {"text": "钻石"})
+        result = await self.plugin._run_tool("todo_done", {"text": "钻石"})
+        self.assertIn("No matching", result)
+
+    async def test_ambiguous_match_is_refused(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石矿"})
+        await self.plugin._run_tool("todo_add", {"text": "找钻石镐"})
+        result = await self.plugin._run_tool("todo_done", {"text": "找钻石"})
+        self.assertIn("be more specific", result)
+        self.assertEqual(
+            [done for done, _ in self.plugin._read_todo()], [False, False]
+        )
+
+    async def test_remove_deletes_the_item(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        result = await self.plugin._run_tool("todo_remove", {"text": "钻石"})
+        self.assertIn("Removed: 找钻石", result)
+        self.assertEqual(self.plugin._read_todo(), [])
+
+    async def test_remove_can_target_a_finished_item(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        await self.plugin._run_tool("todo_done", {"text": "钻石"})
+        self.assertIn(
+            "Removed", await self.plugin._run_tool("todo_remove", {"text": "钻石"})
+        )
+
+    async def test_open_items_reach_the_system_prompt(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        await self.plugin._run_tool("todo_add", {"text": "修农场"})
+        await self.plugin._run_tool("todo_done", {"text": "农场"})
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertIn("<todo>", prompt)
+        self.assertIn("找钻石", prompt)
+        self.assertNotIn("修农场", prompt)  # 已完成的不再占位
+
+    async def test_no_open_items_adds_no_section(self) -> None:
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertNotIn("<todo>", prompt)
+
+    async def test_long_list_is_summarised(self) -> None:
+        for index in range(20):
+            await self.plugin._run_tool("todo_add", {"text": f"任务{index}"})
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertIn("另有 5 条", prompt)
+
+    async def test_todo_is_per_server(self) -> None:
+        await self.plugin._run_tool("todo_add", {"text": "找钻石"})
+        self.plugin.session = FakeSession(host="other.example.com")
+        self.assertIn("empty", await self.plugin._run_tool("todo_list", {}))
+
+    async def test_hand_written_file_is_parsed(self) -> None:
+        directory = self.plugin._server_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        self._file().write_text(
+            "# TODO\n\n随手写的说明\n* [X] 大写也算完成\n- [ ] 待做\n",
+            encoding="utf-8",
+        )
+        items = self.plugin._read_todo()
+        self.assertEqual(items, [(True, "大写也算完成"), (False, "待做")])
+
+    async def test_without_a_session_it_reports_cleanly(self) -> None:
+        self.plugin.session = None
+        self.assertIn("empty", await self.plugin._run_tool("todo_list", {}))
+        self.assertIn(
+            "not available", await self.plugin._run_tool("todo_add", {"text": "x"})
+        )
+
+
+class RemindTest(unittest.IsolatedAsyncioTestCase):
+    """llm_agent.remind：其他插件（定时任务）把提醒送进 agent。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot()
+        self.plugin._queue = asyncio.Queue()
+        self.plugin._settings["llm"]["api_key"] = "k"
+
+    def test_exposed_but_not_offered_to_the_llm(self) -> None:
+        exposed = {service.name: service for service in self.plugin.exposed()}
+        self.assertIn("remind", exposed)
+        # 不给 LLM：它已经能用 scheduler 工具安排提醒，自提醒容易绕圈
+        self.assertFalse(exposed["remind"].llm)
+
+    async def test_remind_queues_a_trigger(self) -> None:
+        result = await self.plugin._service_remind(text="该吃饭了", source="饭点")
+        self.assertIn("queued", result)
+        item = self.plugin._queue.get_nowait()
+        self.assertTrue(item["reminder"])
+        self.assertEqual(item["name"], "饭点")
+        self.assertEqual(item["text"], "该吃饭了")
+
+    async def test_empty_reminder_rejected(self) -> None:
+        self.assertIn("empty", await self.plugin._service_remind(text="  "))
+
+    async def test_reminder_without_a_running_agent(self) -> None:
+        self.plugin._queue = None
+        self.assertIn("not running", await self.plugin._service_remind(text="x"))
+
+    async def test_reminder_turn_is_shaped_as_a_reminder(self) -> None:
+        fake = FakeLLM(assistant(content="好，我去说一声"))
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("饭点", "该吃饭了", reminder=True)
+        self.assertEqual(
+            fake.calls[0][1]["messages"][1]["content"],
+            "[Reminder from 饭点] 该吃饭了",
+        )
+        self.assertEqual(self.plugin.bot.sent_messages, ["好，我去说一声"])
+
+    async def test_reminder_carries_no_admin_rights(self) -> None:
+        # 定时任务不该顺带获得写插件的权限
+        self.plugin._settings["admins"] = ["mie_233"]
+        fake = FakeLLM(
+            assistant(tool_calls=[
+                tool_call("set_plugin", {"name": "chat_logger", "enabled": False})
+            ]),
+            assistant(content="做不到"),
+        )
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("定时", "关掉聊天日志", reminder=True)
+        messages = fake.calls[1][1]["messages"]
+        tool_result = [m for m in messages if m["role"] == "tool"][0]["content"]
+        self.assertIn("Permission denied", tool_result)
+        self.assertIn("chat_logger", self.manager.plugins)
+
+    async def test_reminder_bypasses_the_duplicate_window(self) -> None:
+        # 每小时同一句提醒必须每次都送到，不能被当成重复丢掉
+        await self.plugin._service_remind(text="整点提醒")
+        item = self.plugin._queue.get_nowait()
+        self.plugin._pending.discard(item.get("key"))  # worker 取走时会放开
+        await self.plugin._service_remind(text="整点提醒")
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_identical_reminder_still_queued_is_dropped(self) -> None:
+        # 还没处理就又来一条一模一样的：堆叠没有意义
+        await self.plugin._service_remind(text="整点提醒")
+        await self.plugin._service_remind(text="整点提醒")
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+
+class DuplicateTriggerTest(unittest.IsolatedAsyncioTestCase):
+    """重复触发过滤：排队中的同一句丢掉，刚处理过的同一句在窗口内也丢掉。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.bot = FakeBot(username="mie_233")
+        self.plugin._queue = asyncio.Queue()
+        self.plugin._settings["reply"] = {
+            "all": True, "name_mention": False, "prefix": "",
+            "keywords": [], "attention_seconds": 0.0, "duplicate_window": 10.0,
+        }
+
+    async def _say(self, name: str, text: str) -> None:
+        await self.plugin._on_player_chat(None, name, {"text": text}, None, None)
+
+    async def test_identical_pending_trigger_is_dropped(self) -> None:
+        await self._say("Steve", "在吗")
+        await self._say("Steve", "在吗")
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_different_text_still_queues(self) -> None:
+        await self._say("Steve", "在吗")
+        await self._say("Steve", "你好")
+        self.assertEqual(self.plugin._queue.qsize(), 2)
+
+    async def test_same_text_from_another_player_still_queues(self) -> None:
+        await self._say("Steve", "在吗")
+        await self._say("Alex", "在吗")
+        self.assertEqual(self.plugin._queue.qsize(), 2)
+
+    async def test_repeat_dropped_within_the_window_after_processing(self) -> None:
+        await self._say("Steve", "在吗")
+        self.plugin._pending.discard(("steve", "在吗"))  # 模拟 worker 取走
+        await self._say("Steve", "在吗")
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_repeat_allowed_after_the_window(self) -> None:
+        await self._say("Steve", "在吗")
+        self.plugin._pending.clear()
+        self.plugin._recent_triggers.clear()  # 窗口已过
+        await self._say("Steve", "在吗")
+        self.assertEqual(self.plugin._queue.qsize(), 2)
+
+    async def test_zero_window_only_dedupes_the_queue(self) -> None:
+        self.plugin._settings["reply"]["duplicate_window"] = 0
+        await self._say("Steve", "在吗")
+        self.plugin._pending.clear()
+        await self._say("Steve", "在吗")
+        self.assertEqual(self.plugin._queue.qsize(), 2)
+
+    async def test_name_match_is_case_insensitive(self) -> None:
+        await self._say("Steve", "在吗")
+        await self._say("STEVE", "在吗")
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_worker_releases_the_pending_key(self) -> None:
+        self.plugin._settings["llm"]["api_key"] = "k"
+        self.plugin._post_json = FakeLLM(assistant(content="NO_REPLY"))
+        await self._say("Steve", "在吗")
+        item = self.plugin._queue.get_nowait()
+        self.plugin._pending.discard(item.get("key"))
+        self.assertEqual(self.plugin._pending, set())
+
+
 class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
     """get_system_info：运行状态自检（含上下文占用），且不泄露密钥。"""
 
