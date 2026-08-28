@@ -343,7 +343,8 @@ class HelloReply(Plugin):
     "all": false,               // true = 回应每条聊天
     "name_mention": true,       // 聊天包含自己名字时回应
     "prefix": "hey,claude",     // 特殊前缀（留空 "" 表示不使用）
-    "keywords": ["claude"]      // 额外关键词触发（忽略大小写）
+    "keywords": ["claude"],     // 额外关键词触发（忽略大小写）
+    "attention_seconds": 15     // 回复后对该玩家的持续注意窗口（秒，0 关闭）
   },
   "admins": ["你的名字"],       // 只有管理员能写插件/开关插件（[] = 不限制）
   "system_prompt": "...",       // 可选，覆盖内置提示词
@@ -354,6 +355,10 @@ class HelloReply(Plugin):
 }
 ```
 
+- **持续注意**：真的回复过某个玩家后，他会进入注意窗口（`attention_seconds`，
+  默认 15 秒）。窗口内他的后续发言即便没提到 bot 也会送进来，标记为
+  `(follow-up)`，由 LLM 判断这句是不是在跟自己说话——是就接着聊，话题已经
+  转走就输出 `NO_REPLY` 保持安静。每次回复都会续上窗口；`NO_REPLY` 不会开窗口。
 - **人物预设**：`plugins/llm_agent_persona.md`（首次运行生成模板）是自由撰写
   的 Markdown 角色设定——性格、经历、喜好、说话习惯。每次构建提示词时都会
   重读，因此**保存文件即生效**，无需重启也无需热重载插件。它只影响语气人格，

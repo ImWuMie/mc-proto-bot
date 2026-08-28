@@ -364,7 +364,8 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
     "all": false,               // true = reply to every chat line
     "name_mention": true,       // reply when chat contains the bot's name
     "prefix": "hey,claude",     // special prefix ("" disables it)
-    "keywords": ["claude"]      // extra keyword triggers (case-insensitive)
+    "keywords": ["claude"],     // extra keyword triggers (case-insensitive)
+    "attention_seconds": 15     // keep listening to a player this long after replying (0 = off)
   },
   "admins": ["your_name"],      // only admins may write/toggle plugins ([] = anyone)
   "system_prompt": "...",       // optional, overrides the built-in prompt
@@ -375,6 +376,12 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 }
 ```
 
+- **Sustained attention** — after the agent actually replies to someone, that
+  player stays in an attention window (`attention_seconds`, 15 s by default).
+  Their next lines reach the agent even without naming it, marked
+  `(follow-up)`, and the agent decides whether the line was aimed at it —
+  answering if so, staying silent (`NO_REPLY`) if the conversation moved on.
+  A reply refreshes the window; `NO_REPLY` never opens one.
 - **Character sheet** — `plugins/llm_agent_persona.md` (a template is written
   on first run) is free-form Markdown describing who the bot is: personality,
   backstory, interests, speech habits. It is re-read every time a prompt is

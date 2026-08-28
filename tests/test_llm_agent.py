@@ -253,10 +253,11 @@ class TriggerTest(unittest.IsolatedAsyncioTestCase):
             {"text": "[_ImWuMie -> me] 写个插件"}, False
         )
         self.assertEqual(self.plugin._queue.qsize(), 1)
-        name, text, private = self.plugin._queue.get_nowait()
-        self.assertEqual(name, "_ImWuMie")
-        self.assertEqual(text, "写个插件")
-        self.assertTrue(private)
+        item = self.plugin._queue.get_nowait()
+        self.assertEqual(item["name"], "_ImWuMie")
+        self.assertEqual(item["text"], "写个插件")
+        self.assertTrue(item["private"])
+        self.assertFalse(item["follow_up"])
 
     async def test_outgoing_whisper_does_not_trigger(self) -> None:
         await self.plugin._on_system_chat(
@@ -865,7 +866,7 @@ class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
     async def test_reports_reply_triggers_and_admins(self) -> None:
         self.plugin._settings["reply"] = {
             "all": False, "name_mention": True, "prefix": "hey,claude",
-            "keywords": ["a", "b"],
+            "keywords": ["a", "b"], "attention_seconds": 15.0,
         }
         self.plugin._settings["admins"] = ["mie_233"]
         result = await self.plugin._run_tool("get_system_info", {})
@@ -873,6 +874,16 @@ class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("'hey,claude'", result)
         self.assertIn("2 keyword(s)", result)
         self.assertIn("1 configured (restricted)", result)
+
+    async def test_reports_the_attention_window(self) -> None:
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Attention: 15s window, idle", result)
+        self.plugin._note_attention("Steve")
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("currently on steve", result)
+        self.plugin._settings["reply"]["attention_seconds"] = 0
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Attention: disabled", result)
 
     async def test_reply_all_mode_and_no_admins(self) -> None:
         self.plugin._settings["reply"] = {"all": True}
@@ -937,6 +948,126 @@ class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
         result = await self.plugin._run_tool("get_system_info", {})
         self.assertIn("Backstage diagnostics", result)
         self.assertIn("never paste this into chat", result)
+
+
+class AttentionWindowTest(unittest.IsolatedAsyncioTestCase):
+    """持续注意：回复某玩家后的 15 秒内，他的后续发言也送给 LLM 判断。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.bot = FakeBot(username="FakeBot")
+        self.plugin._queue = asyncio.Queue()
+        self.plugin._settings["reply"] = {
+            "all": False, "name_mention": True, "prefix": "hey,claude",
+            "keywords": [], "attention_seconds": 15.0,
+        }
+
+    async def _say(self, name: str, text: str) -> None:
+        await self.plugin._on_player_chat(None, name, {"text": text}, None, None)
+
+    async def test_quiet_follow_up_triggers_inside_the_window(self) -> None:
+        self.plugin._note_attention("Steve")
+        await self._say("Steve", "那你觉得呢")  # 没提名字
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+        item = self.plugin._queue.get_nowait()
+        self.assertTrue(item["follow_up"])
+
+    async def test_direct_trigger_is_not_marked_follow_up(self) -> None:
+        self.plugin._note_attention("Steve")
+        await self._say("Steve", "FakeBot 在吗")
+        item = self.plugin._queue.get_nowait()
+        self.assertFalse(item["follow_up"])
+
+    async def test_window_expires(self) -> None:
+        self.plugin._note_attention("Steve")
+        self.plugin._attention["steve"] -= 16.0  # 15 秒窗口已过
+        await self._say("Steve", "那你觉得呢")
+        self.assertEqual(self.plugin._queue.qsize(), 0)
+
+    async def test_window_is_per_player(self) -> None:
+        self.plugin._note_attention("Steve")
+        await self._say("Alex", "随便聊聊")  # 别人不在窗口内
+        self.assertEqual(self.plugin._queue.qsize(), 0)
+        await self._say("Steve", "随便聊聊")
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_window_name_match_is_case_insensitive(self) -> None:
+        self.plugin._note_attention("STEVE")
+        await self._say("steve", "那你觉得呢")
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_zero_seconds_disables_the_window(self) -> None:
+        self.plugin._settings["reply"]["attention_seconds"] = 0
+        self.plugin._note_attention("Steve")
+        self.assertEqual(self.plugin._attention, {})
+        await self._say("Steve", "那你觉得呢")
+        self.assertEqual(self.plugin._queue.qsize(), 0)
+
+    async def test_expired_entries_are_pruned(self) -> None:
+        self.plugin._note_attention("Old")
+        self.plugin._attention["old"] -= 100.0
+        self.plugin._note_attention("New")
+        self.assertEqual(list(self.plugin._attention), ["new"])
+
+    async def test_sending_a_reply_opens_the_window(self) -> None:
+        self.plugin._settings["llm"]["api_key"] = "k"
+        self.plugin._post_json = FakeLLM(assistant(content="嗯呢"))
+        await self.plugin._handle_trigger("Steve", "FakeBot 在吗")
+        self.assertTrue(self.plugin._in_attention("Steve"))
+
+    async def test_no_reply_does_not_open_the_window(self) -> None:
+        self.plugin._settings["llm"]["api_key"] = "k"
+        self.plugin._post_json = FakeLLM(assistant(content="NO_REPLY"))
+        await self.plugin._handle_trigger("Steve", "FakeBot 在吗")
+        self.assertFalse(self.plugin._in_attention("Steve"))
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_follow_up_turn_is_labelled_for_the_llm(self) -> None:
+        self.plugin._settings["llm"]["api_key"] = "k"
+        fake = FakeLLM(assistant(content="NO_REPLY"))
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("Steve", "那你觉得呢", follow_up=True)
+        self.assertEqual(
+            fake.calls[0][1]["messages"][1]["content"],
+            "<Steve> (follow-up): 那你觉得呢",
+        )
+
+    async def test_reply_refreshes_the_window(self) -> None:
+        self.plugin._settings["llm"]["api_key"] = "k"
+        self.plugin._note_attention("Steve")
+        self.plugin._attention["steve"] -= 14.0  # 只剩 1 秒
+        self.plugin._post_json = FakeLLM(assistant(content="嗯呢"))
+        await self.plugin._handle_trigger("Steve", "那你觉得呢", follow_up=True)
+        self.assertGreater(
+            self.plugin._attention["steve"], time.monotonic() + 10.0
+        )
+
+    async def test_whisper_reply_also_opens_the_window(self) -> None:
+        self.plugin._settings["llm"]["api_key"] = "k"
+        self.plugin._post_json = FakeLLM(assistant(content="好"))
+        await self.plugin._handle_trigger("Steve", "在吗", private=True)
+        self.assertTrue(self.plugin._in_attention("Steve"))
+
+    def test_settings_clamp_attention_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.plugin._settings_file = Path(tmp) / "llm_agent.json"
+            self.plugin._settings_file.write_text(
+                json.dumps({"reply": {"attention_seconds": 9999}}),
+                encoding="utf-8",
+            )
+            self.plugin._load_settings()
+            self.assertEqual(
+                self.plugin._settings["reply"]["attention_seconds"], 300.0
+            )
+            self.plugin._settings_file.write_text(
+                json.dumps({"reply": {"attention_seconds": -5}}),
+                encoding="utf-8",
+            )
+            self.plugin._load_settings()
+            self.assertEqual(
+                self.plugin._settings["reply"]["attention_seconds"], 0.0
+            )
 
 
 class PersonaTest(unittest.IsolatedAsyncioTestCase):
