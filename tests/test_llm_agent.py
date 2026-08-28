@@ -818,6 +818,127 @@ class ReadChatToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<Steve>", result)
 
 
+class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
+    """get_system_info：运行状态自检（含上下文占用），且不泄露密钥。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot()
+        self.plugin.session = FakeSession()
+        self.plugin._settings["llm"].update(
+            {"api_key": "sk-secret-value", "model": "gemini-3.7-flash"}
+        )
+
+    async def test_reports_llm_context_config(self) -> None:
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("gemini-3.7-flash", result)
+        self.assertIn("api key configured: yes", result)
+        self.assertIn("1000000 window", result)
+        self.assertIn("5% auto-compact reserve", result)
+        self.assertIn("Max tool rounds", result)
+
+    async def test_never_leaks_the_api_key_or_endpoint(self) -> None:
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertNotIn("sk-secret-value", result)
+        self.assertNotIn(self.plugin._settings["llm"]["base_url"], result)
+
+    async def test_context_usage_grows_with_the_conversation(self) -> None:
+        first = self.plugin._context_usage()[0]
+        self.plugin._conversation.extend(
+            {"role": "user", "content": "消息" * 100} for _ in range(5)
+        )
+        second = self.plugin._context_usage()[0]
+        self.assertGreater(second, first + 900)  # 5 × 200 CJK 字符
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn(f"{second} / 950000 tokens used", result)
+        self.assertIn("5 message(s)", result)
+
+    async def test_counts_compacted_summaries(self) -> None:
+        self.plugin._conversation.append(
+            {"role": "user", "content": "[Auto-compacted history]\n摘要"}
+        )
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("1 compacted summary", result)
+
+    async def test_reports_reply_triggers_and_admins(self) -> None:
+        self.plugin._settings["reply"] = {
+            "all": False, "name_mention": True, "prefix": "hey,claude",
+            "keywords": ["a", "b"],
+        }
+        self.plugin._settings["admins"] = ["mie_233"]
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("name mentions", result)
+        self.assertIn("'hey,claude'", result)
+        self.assertIn("2 keyword(s)", result)
+        self.assertIn("1 configured (restricted)", result)
+
+    async def test_reply_all_mode_and_no_admins(self) -> None:
+        self.plugin._settings["reply"] = {"all": True}
+        self.plugin._settings["admins"] = []
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("every chat line", result)
+        self.assertIn("unrestricted", result)
+
+    async def test_reports_bot_and_world_state(self) -> None:
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Name: FakeBot", result)
+        self.assertIn("wolfx.jp:25565", result)
+        self.assertIn("online mode", result)
+        self.assertIn("X=10.5", result)
+        self.assertIn("survival", result)
+        self.assertIn("3 chunks loaded", result)
+
+    async def test_reports_uptime_after_session_ready(self) -> None:
+        await self.plugin._on_session_ready(self.plugin.bot)
+        self.plugin._connected_at -= 3665  # 01:01:05 前连上
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Connected for 01:01:05", result)
+
+    async def test_uptime_cleared_on_disconnect(self) -> None:
+        await self.plugin._on_session_ready(self.plugin.bot)
+        await self.plugin._on_session_disconnected("bye", 1)
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertNotIn("Connected for", result)
+
+    async def test_without_bot_reports_disconnected(self) -> None:
+        self.plugin.bot = None
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Not connected to a server", result)
+        self.assertIn("== Agent runtime ==", result)  # 其余分区照常
+
+    async def test_reports_storage_and_plugin_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            configure(self.plugin, tmp)
+            self.plugin.session = FakeSession()
+            await self.plugin._run_tool("save_memory", {"note": "记住 A"})
+            self.plugin._generated = ["hello.py"]
+            result = await self.plugin._run_tool("get_system_info", {})
+            self.assertIn("Memory: 1 file(s) for wolfx_jp_25565", result)
+            self.assertIn("Generated plugins registered: 1", result)
+            self.assertIn("llm_agent", result)  # 插件列表
+            self.assertIn("Enabled (", result)
+
+    async def test_reports_scheduled_task_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.plugin._scheduler_file_override = Path(tmp) / "scheduler.json"
+            await self.plugin._run_tool(
+                "schedule_add", {"name": "a", "interval": 60, "text": "x"}
+            )
+            await self.plugin._run_tool(
+                "schedule_add",
+                {"name": "b", "interval": 60, "text": "y", "enabled": False},
+            )
+            result = await self.plugin._run_tool("get_system_info", {})
+            self.assertIn("Scheduled tasks: 2 (1 enabled)", result)
+
+    async def test_marks_output_as_backstage(self) -> None:
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Backstage diagnostics", result)
+        self.assertIn("never paste this into chat", result)
+
+
 class SystemPromptTest(unittest.IsolatedAsyncioTestCase):
     """系统提示词的人格与注入防护约定（回归锁定，不测模型行为）。"""
 
