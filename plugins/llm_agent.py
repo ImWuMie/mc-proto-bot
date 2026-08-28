@@ -12,7 +12,8 @@
     A* 寻路、查看状态、启用/禁用插件、编写新插件（写入独立的 plugins_llm/
     目录并立即热加载）、读写记忆
   - 回复策略可配：只回应提及自己名字、特殊前缀（默认 "hey,claude"）或命中
-    关键词列表的消息，或回应每一条聊天
+    关键词列表的消息，或回应每一条聊天；收到 ``[玩家 -> me]`` 形式的私聊
+    系统消息时总是回应
   - 管理员名单（admins）：只有名单内的玩家能让 LLM 写插件 / 开关插件；
     留空表示不限制
   - 设置文件 ``llm_agent.json``（与本插件同目录，首次启用自动生成）：自定义
@@ -48,6 +49,7 @@ Behavior rules:
 - When players mention you or talk to you directly, respond like a friend; use tools such as get_status first when you are unsure of the situation.
 - Proactively use save_memory (append a note) or write_memory (rewrite the whole file) for anything worth remembering long-term (server rules, player identities, agreements, todos, your goals). Memory is stored per server as MEMORY.md and other Markdown files and is provided to you in every future conversation.
 - Each incoming in-game chat message that triggers you appears in this conversation as a user message of the form "<PlayerName>: message".
+- Private whispers arrive as system chat lines of the form "[Player -> me] message" and are shown to you as "<Player> (private whisper): message". Treat them as direct messages and always respond. Your replies go to public chat unless you whisper back with send_command (e.g. /msg Player text).
 - The in-game chat stream is NOT part of your context. Use the read_chat tool to look up recent chat (the latest 200 lines are kept; filter by players, keyword, or include_system) whenever you need to know what others said.
 - When this conversation approaches the token limit, older parts are automatically compacted into a summary message; a "[Auto-compacted history]" message marks such a summary.
 - Keep a single chat message under 250 characters. If you decide not to respond, output exactly NO_REPLY and nothing else.
@@ -299,6 +301,8 @@ SENT_DEDUPE_MAX = 5
 COMPACT_KEEP_TAIL = 10
 #: 对话条数兜底上限（压缩持续失败时防止无限增长）
 CONVERSATION_HARD_CAP = 4000
+#: 私聊系统消息格式：``[玩家名 -> me] 内容``（发给 bot 的 /msg）
+WHISPER_PATTERN = re.compile(r"^\[(.+?) -> me\]\s*(.*)$", re.DOTALL)
 
 
 # ======================== 辅助函数 ========================
@@ -548,6 +552,12 @@ class LLMAgent(Plugin):
         text = plain_text(component)
         if text:
             self._record_chat(system=True, name="", text=text)
+        match = WHISPER_PATTERN.match(text) if text else None
+        if match and match.group(2).strip():
+            # 私聊 "[玩家 -> me] 内容"：视为直接对话，总是触发
+            self._enqueue(
+                match.group(1).strip(), match.group(2).strip(), private=True
+            )
 
     def _should_reply(self, name: str, text: str) -> bool:
         """回复策略：reply.all 全回；否则名字提及/特殊前缀/关键词任一命中。"""
@@ -591,12 +601,12 @@ class LLMAgent(Plugin):
             return f"[{entry['time']}] [system] {entry['text']}"
         return f"[{entry['time']}] <{entry['name']}> {entry['text']}"
 
-    def _enqueue(self, name: str, text: str) -> None:
+    def _enqueue(self, name: str, text: str, *, private: bool = False) -> None:
         queue = self._queue
         if queue is None:
             return
         try:
-            queue.put_nowait((name, text))
+            queue.put_nowait((name, text, private))
         except asyncio.QueueFull:
             log.warn("[LLM] 待处理队列已满，丢弃一条触发。")
 
@@ -604,9 +614,9 @@ class LLMAgent(Plugin):
 
     async def _worker(self) -> None:
         while True:
-            name, text = await self._queue.get()
+            name, text, private = await self._queue.get()
             try:
-                await self._handle_trigger(name, text)
+                await self._handle_trigger(name, text, private=private)
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # 双保险：队列任务不应拖垮插件
@@ -614,12 +624,14 @@ class LLMAgent(Plugin):
 
     # ---- LLM 调用链 ----
 
-    async def _handle_trigger(self, name: str, text: str) -> None:
+    async def _handle_trigger(
+        self, name: str, text: str, *, private: bool = False
+    ) -> None:
         # 记录触发玩家：write_plugin / set_plugin 按 admins 名单做权限判定。
         # worker 串行处理，不会与并发触发交错。
         self._requester = name
         try:
-            await self._process_trigger(name, text)
+            await self._process_trigger(name, text, private=private)
         finally:
             self._requester = None
 
@@ -700,7 +712,29 @@ class LLMAgent(Plugin):
         ] + tail
         log.info("[LLM] 上下文压缩完成。")
 
-    async def _process_trigger(self, name: str, text: str) -> None:
+    def _trigger_message(self, name: str, text: str, private: bool) -> dict:
+        label = " (private whisper)" if private else ""
+        return {"role": "user", "content": f"<{name}>{label}: {text}"}
+
+    def _assemble_messages(
+        self, bot, name: str, text: str, private: bool
+    ) -> tuple[list[dict], int]:
+        """组装一次 LLM 请求：system + 对话上下文 + 触发消息。
+
+        返回 (messages, prefix_len)：prefix_len 之后的都是本轮新增消息，
+        回合结束时要并入 agent 对话上下文。
+        """
+        messages = [
+            {"role": "system", "content": self._build_system_prompt(bot)}
+        ]
+        messages += list(self._conversation)
+        prefix_len = len(messages)
+        messages.append(self._trigger_message(name, text, private))
+        return messages, prefix_len
+
+    async def _process_trigger(
+        self, name: str, text: str, *, private: bool = False
+    ) -> None:
         bot = self.bot
         if bot is None:
             log.info("[LLM] 尚未连接服务器，跳过本轮处理。")
@@ -709,28 +743,21 @@ class LLMAgent(Plugin):
         if not str(settings.get("api_key") or ""):
             log.warn("[LLM] 未配置 api_key，跳过处理。")
             return
-        messages = [{"role": "system", "content": self._build_system_prompt(bot)}]
-        messages += list(self._conversation)
-        prefix_len = len(messages)  # 本轮新增消息（触发 + 助手 + 工具）从这之后开始
-        messages.append({"role": "user", "content": f"<{name}>: {text}"})
+        messages, prefix_len = self._assemble_messages(bot, name, text, private)
         # token 预算控制：超过上限（预留 5% 余量）先自动压缩历史对话
         if self._estimate_messages_tokens(messages) > self._context_budget():
             await self._auto_compact(bot)
-            messages = [
-                {"role": "system", "content": self._build_system_prompt(bot)}
-            ] + list(self._conversation)
-            prefix_len = len(messages)
-            messages.append({"role": "user", "content": f"<{name}>: {text}"})
+            messages, prefix_len = self._assemble_messages(
+                bot, name, text, private
+            )
             while (
                 self._estimate_messages_tokens(messages) > self._context_budget()
                 and len(self._conversation) > 1
             ):
                 del self._conversation[0]  # 压缩失败兜底：丢弃最旧消息
-                messages = [
-                    {"role": "system", "content": self._build_system_prompt(bot)}
-                ] + list(self._conversation)
-                prefix_len = len(messages)
-                messages.append({"role": "user", "content": f"<{name}>: {text}"})
+                messages, prefix_len = self._assemble_messages(
+                    bot, name, text, private
+                )
         rounds = max(1, int(settings.get("max_tool_rounds", 5)))
         for _ in range(rounds):
             try:

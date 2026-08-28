@@ -227,6 +227,35 @@ class TriggerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(entry["system"])
         self.assertEqual(entry["text"], "[服务器] 欢迎 Steve 加入")
 
+    async def test_plain_system_broadcast_does_not_trigger(self) -> None:
+        await self.plugin._on_system_chat({"text": "[服务器] 欢迎 Steve 加入"}, False)
+        self.assertEqual(self.plugin._queue.qsize(), 0)
+
+    async def test_whisper_system_message_triggers(self) -> None:
+        # "[玩家 -> me] 内容" 形式的私聊总是触发，且忽略回复策略
+        self.plugin._settings["reply"] = {
+            "all": False, "name_mention": False, "prefix": "", "keywords": []
+        }
+        await self.plugin._on_system_chat(
+            {"text": "[_ImWuMie -> me] 写个插件"}, False
+        )
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+        name, text, private = self.plugin._queue.get_nowait()
+        self.assertEqual(name, "_ImWuMie")
+        self.assertEqual(text, "写个插件")
+        self.assertTrue(private)
+
+    async def test_outgoing_whisper_does_not_trigger(self) -> None:
+        await self.plugin._on_system_chat(
+            {"text": "[me -> _ImWuMie] 你好"}, False
+        )
+        self.assertEqual(self.plugin._queue.qsize(), 0)
+        self.assertEqual(len(self.plugin._chat_log), 1)  # 仍记录
+
+    async def test_empty_whisper_does_not_trigger(self) -> None:
+        await self.plugin._on_system_chat({"text": "[_ImWuMie -> me]"}, False)
+        self.assertEqual(self.plugin._queue.qsize(), 0)
+
     async def test_history_capped_at_limit(self) -> None:
         self.plugin._settings["history_limit"] = 3
         for index in range(5):
@@ -748,6 +777,19 @@ class LlmLoopTest(unittest.IsolatedAsyncioTestCase):
         self.plugin._post_json = fake
         await self.plugin._handle_trigger("Steve", "在吗")
         self.assertEqual(self.plugin.bot.sent_messages, [text])
+
+    async def test_private_whisper_trigger_message_format(self) -> None:
+        fake = FakeLLM(assistant(content="收到"))
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger(
+            "_ImWuMie", "写个插件", private=True
+        )
+        payload = fake.calls[0][1]
+        self.assertEqual(
+            payload["messages"][1]["content"],
+            "<_ImWuMie> (private whisper): 写个插件",
+        )
+        self.assertEqual(self.plugin.bot.sent_messages, ["收到"])
 
     async def test_no_reply_marker_suppressed(self) -> None:
         self.plugin._post_json = FakeLLM(assistant(content="NO_REPLY"))

@@ -355,6 +355,8 @@ class HelloReply(Plugin):
   维护，每次对话都会带上。
 - **管理工具**（`write_plugin`、`set_plugin`）仅限 `admins` 名单；生成的插件
   写入独立的 `plugins_llm/` 目录（与手工 `plugins/` 分开），重启后自动恢复。
+- **私聊**：形如 `[玩家 -> me] ...` 的系统私聊消息总是触发回复；发送者参与
+  管理员权限判定。
 - `llm_agent.json`、记忆目录与 `plugins_llm/` 已加入 .gitignore——设置文件
   含 api_key，切勿提交到版本库。
 

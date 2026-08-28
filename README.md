@@ -377,6 +377,9 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 - **Admin tools** (`write_plugin`, `set_plugin`) are restricted to the `admins`
   list. Generated plugins go to the separate `plugins_llm/` directory — never
   the hand-written `plugins/` folder — and are re-registered after restarts.
+- **Whispers** — system messages of the form `[Player -> me] ...` (private
+  messages to the bot) always trigger a reply; the sender is what admin
+  checks compare against.
 - `llm_agent.json`, the memory directory, and `plugins_llm/` are gitignored:
   the settings file holds an API key, keep it out of version control.
 
