@@ -360,6 +360,7 @@ class HelloReply(Plugin):
   "system_prompt": "...",       // 可选，覆盖内置提示词
   "history_limit": 200,         // read_chat 保留的聊天条数
   "persona_file": "llm_agent_persona.md",
+  "skills_dir": "../.claude/skills",
   "memory_dir": "llm_agent_memory",
   "generated_dir": "../plugins_llm"
 }
@@ -374,6 +375,13 @@ class HelloReply(Plugin):
   的 Markdown 角色设定——性格、经历、喜好、说话习惯。每次构建提示词时都会
   重读，因此**保存文件即生效**，无需重启也无需热重载插件。它只影响语气人格，
   不授予权限，也不能放宽信任规则。
+- **写插件读技能**：写插件的权威契约是 `.claude/skills/protobot-plugin/SKILL.md`，
+  智能体用 `list_skills` / `read_skill` 现读——系统提示词只留不可省的核心，
+  详细规则不再内联（内联的那一份已经和框架漂移过一次）。技能目录可用
+  `skills_dir` 指定。
+- **插话**：写插件常要好几轮工具调用，这期间**同一个玩家**的新发言会并入
+  正在跑的那一轮（标记 `(interjection)`），所以可以中途改主意、补要求；
+  别人的发言仍排队走各自的回合，不会顺带获得本轮的管理员权限。
 - **待办清单**：与记忆文件同目录的 `TODO.md` 是一份 Markdown 清单，由智能体
   用 `todo_add` / `todo_list` / `todo_done` / `todo_remove` 维护。未完成项会
   注入每次提示词，所以它答应过的事重启也不会忘；完成的项不再占用上下文。

@@ -383,6 +383,7 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
   "system_prompt": "...",       // optional, overrides the built-in prompt
   "history_limit": 200,         // chat lines kept for the read_chat tool
   "persona_file": "llm_agent_persona.md",
+  "skills_dir": "../.claude/skills",
   "memory_dir": "llm_agent_memory",
   "generated_dir": "../plugins_llm"
 }
@@ -401,6 +402,17 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
   built, so **saving the file is enough** — no restart, no plugin reload. It
   shapes voice only: it grants no permissions and cannot loosen the trust
   rules.
+- **Skills** — the authoritative contract for writing plugins is
+  `.claude/skills/protobot-plugin/SKILL.md`, which the agent reads at the time
+  with `list_skills` / `read_skill`. The system prompt keeps only the
+  irreducible core; the detailed rules are no longer inlined, because the
+  inlined copy had already drifted from the framework. `skills_dir` points at
+  the directory.
+- **Interjections** — writing a plugin takes several tool rounds, and during
+  them a new line **from the same player** is folded into the running turn
+  (marked `(interjection)`), so they can change their mind or add a
+  requirement mid-task. Everyone else keeps their own turn, and their words
+  never extend the running turn's permissions.
 - **Todo list** — `TODO.md` sits beside the memory files and is a Markdown
   checklist the agent maintains with `todo_add` / `todo_list` / `todo_done` /
   `todo_remove`. Open items are injected into every prompt, so something it

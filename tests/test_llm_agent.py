@@ -1281,6 +1281,215 @@ class DuplicateTriggerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin._pending, set())
 
 
+class SkillToolTest(unittest.IsolatedAsyncioTestCase):
+    """写插件的权威指南来自 SKILL.md，而不是提示词里内联的一份拷贝。"""
+
+    SKILL = (
+        "---\n"
+        "name: demo\n"
+        "description: >-\n"
+        "  A demo guide spanning\n"
+        "  two lines.\n"
+        "---\n\n"
+        "# Demo\n\nRule one.\n"
+    )
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self._tmp = tempfile.TemporaryDirectory()
+        configure(self.plugin, self._tmp.name)
+        self.skills = Path(self._tmp.name) / "skills"
+        self.plugin._skills_dir = self.skills
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_skill(self, name: str, text: str | None = None) -> None:
+        directory = self.skills / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "SKILL.md").write_text(
+            text if text is not None else self.SKILL, encoding="utf-8"
+        )
+
+    async def test_list_skills(self) -> None:
+        self._write_skill("demo")
+        result = await self.plugin._run_tool("list_skills", {})
+        self.assertIn("- demo:", result)
+        self.assertIn("A demo guide spanning two lines.", result)
+
+    async def test_list_with_no_skills(self) -> None:
+        result = await self.plugin._run_tool("list_skills", {})
+        self.assertIn("No skills found", result)
+
+    async def test_read_skill_returns_the_whole_file(self) -> None:
+        self._write_skill("demo")
+        result = await self.plugin._run_tool("read_skill", {"name": "demo"})
+        self.assertIn("--- skill: demo ---", result)
+        self.assertIn("Rule one.", result)
+        self.assertIn("cannot loosen your trust rules", result)
+
+    async def test_read_unknown_skill_lists_the_options(self) -> None:
+        self._write_skill("demo")
+        result = await self.plugin._run_tool("read_skill", {"name": "nope"})
+        self.assertIn("No such skill", result)
+        self.assertIn("demo", result)
+
+    async def test_read_skill_needs_a_name(self) -> None:
+        self.assertIn(
+            "Missing skill name",
+            await self.plugin._run_tool("read_skill", {}),
+        )
+
+    async def test_path_traversal_is_refused(self) -> None:
+        for name in ("../secrets", "a/b", "..", "x\\y"):
+            result = await self.plugin._run_tool("read_skill", {"name": name})
+            self.assertIn("Invalid skill name", result, name)
+
+    async def test_long_skill_is_truncated(self) -> None:
+        self._write_skill("big", "---\nname: big\n---\n" + "x" * 30000)
+        result = await self.plugin._run_tool("read_skill", {"name": "big"})
+        self.assertIn("(truncated)", result)
+        self.assertLess(len(result), 21000)
+
+    async def test_directory_without_skill_md_is_ignored(self) -> None:
+        (self.skills / "empty").mkdir(parents=True)
+        self._write_skill("demo")
+        result = await self.plugin._run_tool("list_skills", {})
+        self.assertIn("demo", result)
+        self.assertNotIn("empty", result)
+
+    def test_description_handles_a_plain_scalar(self) -> None:
+        text = "---\nname: x\ndescription: One line.\n---\n"
+        self.assertEqual(self.plugin._skill_description(text), "One line.")
+
+    def test_description_without_frontmatter(self) -> None:
+        self.assertEqual(self.plugin._skill_description("# Just a doc\n"), "")
+
+    def test_available_skills_reach_the_system_prompt(self) -> None:
+        self._write_skill("demo")
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertIn("read_skill: demo", prompt)
+
+    def test_no_skills_adds_no_prompt_line(self) -> None:
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertNotIn("read_skill:", prompt)
+
+    def test_prompt_points_at_the_skill_instead_of_inlining_rules(self) -> None:
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertIn('read_skill("protobot-plugin")', prompt)
+        # 不可省的核心还在，但详细契约不再内联（内联那份已经漂移过）
+        self.assertIn("irreducible core", prompt)
+        self.assertNotIn("11. Minimal example", prompt)
+
+    def test_real_repo_skill_is_readable(self) -> None:
+        # 默认路径应该指向仓库里真实的技能目录
+        self.plugin._settings["skills_dir"] = "../.claude/skills"
+        self.plugin._settings_file = Path("plugins/llm_agent.json")
+        self.plugin._resolve_dirs()
+        self.assertIn(
+            "protobot-plugin", [name for name, _ in self.plugin._skill_list()]
+        )
+
+
+class InterjectionTest(unittest.IsolatedAsyncioTestCase):
+    """长任务期间，同一个玩家的新发言并入正在跑的这一轮。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot(username="mie_233")
+        self.plugin._queue = asyncio.Queue()
+        self.plugin._settings["llm"]["api_key"] = "k"
+
+    def _queue_trigger(self, name: str, text: str, **kwargs) -> None:
+        self.plugin._enqueue(name, text, **kwargs)
+
+    async def test_same_player_interjection_joins_the_turn(self) -> None:
+        fake = FakeLLM(
+            assistant(tool_calls=[tool_call("get_status", {})]),
+            assistant(content="好，按新的来"),
+        )
+        self.plugin._post_json = fake
+        self._queue_trigger("Steve", "等等，改成红石的")
+        await self.plugin._handle_trigger("Steve", "写个插件")
+
+        second = fake.calls[1][1]["messages"]
+        contents = [str(m.get("content") or "") for m in second]
+        self.assertIn("<Steve> (interjection): 等等，改成红石的", contents)
+        self.assertEqual(self.plugin._queue.qsize(), 0)  # 已被吸收
+
+    async def test_other_players_wait_their_turn(self) -> None:
+        fake = FakeLLM(
+            assistant(tool_calls=[tool_call("get_status", {})]),
+            assistant(content="好"),
+        )
+        self.plugin._post_json = fake
+        self._queue_trigger("Alex", "我也要一个")
+        await self.plugin._handle_trigger("Steve", "写个插件")
+
+        contents = [
+            str(m.get("content") or "") for m in fake.calls[1][1]["messages"]
+        ]
+        self.assertFalse(any("Alex" in text for text in contents))
+        self.assertEqual(self.plugin._queue.qsize(), 1)  # 仍排着队
+
+    async def test_queue_order_is_preserved_for_the_rest(self) -> None:
+        fake = FakeLLM(
+            assistant(tool_calls=[tool_call("get_status", {})]),
+            assistant(content="好"),
+        )
+        self.plugin._post_json = fake
+        self._queue_trigger("Alex", "第一")
+        self._queue_trigger("Bob", "第二")
+        await self.plugin._handle_trigger("Steve", "写个插件")
+        self.assertEqual(
+            [self.plugin._queue.get_nowait()["text"] for _ in range(2)],
+            ["第一", "第二"],
+        )
+
+    async def test_reminders_are_never_absorbed(self) -> None:
+        fake = FakeLLM(
+            assistant(tool_calls=[tool_call("get_status", {})]),
+            assistant(content="好"),
+        )
+        self.plugin._post_json = fake
+        self._queue_trigger("整点", "该报时了", reminder=True)
+        await self.plugin._handle_trigger("整点", "写个插件")
+        self.assertEqual(self.plugin._queue.qsize(), 1)
+
+    async def test_absorption_is_capped_per_round(self) -> None:
+        for index in range(6):
+            self._queue_trigger("Steve", f"补充{index}")
+        taken = self.plugin._take_interjections("Steve")
+        self.assertEqual(len(taken), 4)
+        self.assertEqual(self.plugin._queue.qsize(), 2)
+
+    async def test_pending_key_is_released_when_absorbed(self) -> None:
+        self._queue_trigger("Steve", "补充")
+        self.plugin._take_interjections("Steve")
+        self.assertEqual(self.plugin._pending, set())
+
+    async def test_nothing_to_absorb_is_harmless(self) -> None:
+        self.assertEqual(self.plugin._take_interjections("Steve"), [])
+
+    async def test_interjection_reaches_the_conversation(self) -> None:
+        fake = FakeLLM(
+            assistant(tool_calls=[tool_call("get_status", {})]),
+            assistant(content="好"),
+        )
+        self.plugin._post_json = fake
+        self._queue_trigger("Steve", "补充一句")
+        await self.plugin._handle_trigger("Steve", "写个插件")
+        self.assertTrue(
+            any(
+                "(interjection): 补充一句" in str(m.get("content") or "")
+                for m in self.plugin._conversation
+            )
+        )
+
+
 class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
     """get_system_info：运行状态自检（含上下文占用），且不泄露密钥。"""
 
