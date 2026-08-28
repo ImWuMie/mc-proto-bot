@@ -26,6 +26,7 @@ import sys
 import traceback
 import types
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -37,11 +38,59 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
     from .client import Bot
     from .session import BotSession
 
-__all__ = ["Plugin", "PluginError", "PluginManager", "PluginWatcher"]
+__all__ = [
+    "ExposedFunction",
+    "Plugin",
+    "PluginError",
+    "PluginManager",
+    "PluginWatcher",
+]
 
 
 class PluginError(Exception):
     """Discovery or dependency-graph failure; ``str`` carries a Chinese message."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExposedFunction:
+    """One capability a plugin publishes for other plugins (and the LLM).
+
+    ``qualified`` is ``"<plugin>.<name>"`` -- the key other plugins call by.
+    ``tool_name`` is the same thing spelled for function-calling APIs
+    (``"<plugin>_<name>"``), which reject dots.  ``parameters`` is a JSON
+    Schema object describing the keyword arguments; an empty schema means the
+    function takes none.  ``llm`` opts the function into the agent's tool list
+    and ``admin`` makes the agent refuse it for non-admin players.
+    """
+
+    plugin: str
+    name: str
+    handler: Callable[..., Any]
+    description: str = ""
+    parameters: dict[str, Any] = field(default_factory=dict)
+    llm: bool = False
+    admin: bool = False
+
+    @property
+    def qualified(self) -> str:
+        return f"{self.plugin}.{self.name}"
+
+    @property
+    def tool_name(self) -> str:
+        return f"{self.plugin}_{self.name}"
+
+    def tool_schema(self) -> dict[str, Any]:
+        """OpenAI-compatible function-calling entry for this function."""
+        parameters = self.parameters or {"type": "object", "properties": {}}
+        return {
+            "type": "function",
+            "function": {
+                "name": self.tool_name,
+                "description": self.description
+                or f"{self.qualified} (exposed by the {self.plugin} plugin)",
+                "parameters": parameters,
+            },
+        }
 
 
 class Plugin:
@@ -71,6 +120,7 @@ class Plugin:
         self.manager: PluginManager | None = None
         self._subscriptions: list[tuple[str, EventHandler]] = []
         self._session_subscriptions: list[tuple[str, EventHandler]] = []
+        self._exposed: list[ExposedFunction] = []
 
     # ---- lifecycle hooks (override in subclasses) ----
 
@@ -112,6 +162,65 @@ class Plugin:
             return wrapped
 
         return register(handler) if handler is not None else register
+
+    # ---- exposing capabilities to other plugins (and the LLM) ----
+
+    def expose(
+        self,
+        name: str,
+        handler: Callable[..., Any] | None = None,
+        *,
+        description: str = "",
+        parameters: dict[str, Any] | None = None,
+        llm: bool = False,
+        admin: bool = False,
+    ):
+        """Publish a function other plugins can call as ``"<plugin>.<name>"``.
+
+        Usable directly or as a decorator, like :meth:`subscribe`.  Declare
+        exposures in ``__init__``: the manager publishes them when the plugin is
+        enabled and withdraws them when it is disabled or hot-reloaded, so a
+        stale instance can never be called.
+
+        Set ``llm=True`` to also offer the function to the LLM agent as a tool
+        (``parameters`` is then the JSON Schema for its keyword arguments), and
+        ``admin=True`` to make the agent refuse it for non-admin players.
+        Exceptions propagate to the caller -- unlike event handlers, a service
+        call is not isolated, because the caller needs to see the failure.
+        """
+
+        def register(candidate: Callable[..., Any]) -> Callable[..., Any]:
+            if not name:
+                raise PluginError(f"[插件] {self.name}: 暴露的函数缺少名称")
+            self._exposed.append(
+                ExposedFunction(
+                    plugin=self.name,
+                    name=name,
+                    handler=candidate,
+                    description=description,
+                    parameters=parameters or {},
+                    llm=llm,
+                    admin=admin,
+                )
+            )
+            return candidate
+
+        return register(handler) if handler is not None else register
+
+    def exposed(self) -> tuple[ExposedFunction, ...]:
+        """This plugin's declared exposures (published while it is enabled)."""
+        return tuple(self._exposed)
+
+    async def call(self, qualified: str, /, **kwargs: Any) -> Any:
+        """Call another plugin's exposed function by ``"<plugin>.<name>"``.
+
+        Raises :class:`PluginError` when the plugin is not enabled or does not
+        expose that name -- which is also what happens if it was hot-closed, so
+        callers should be ready for it rather than caching the handler.
+        """
+        if self.manager is None:
+            raise PluginError(f"[插件] {self.name}: 插件管理器不可用")
+        return await self.manager.call_service(qualified, **kwargs)
 
     # ---- internals (called by PluginManager) ----
 
@@ -262,6 +371,7 @@ class PluginManager:
         self._sources: dict[str, Path] = {}
         self._files: dict[Path, list[str]] = {}
         self._order: list[Plugin] = []
+        self._services: dict[str, ExposedFunction] = {}
         self._counter = 0
         self._current_bot: Bot | None = None
         self._current_session: BotSession | None = None
@@ -355,6 +465,54 @@ class PluginManager:
         """Config-disabled names plus dependents pulled down with them."""
         enabled = {plugin.name for plugin in self._order}
         return set(self._plugins) - enabled
+
+    # ---- exposed functions (plugin-to-plugin services) ----
+
+    def services(self) -> dict[str, ExposedFunction]:
+        """Every function currently exposed by an enabled plugin, by qualified name."""
+        return dict(self._services)
+
+    def get_service(self, qualified: str) -> ExposedFunction | None:
+        return self._services.get(qualified)
+
+    def llm_services(self) -> list[ExposedFunction]:
+        """Exposed functions opted into the LLM agent's tool list."""
+        return [
+            service
+            for _, service in sorted(self._services.items())
+            if service.llm
+        ]
+
+    async def call_service(self, qualified: str, /, **kwargs: Any) -> Any:
+        """Invoke an exposed function; awaits it when it is a coroutine.
+
+        Raises :class:`PluginError` if nothing exposes that name (the plugin may
+        have been disabled or hot-closed); the handler's own exceptions
+        propagate to the caller unchanged.
+        """
+        service = self._services.get(qualified)
+        if service is None:
+            raise PluginError(f"[插件] 未找到暴露的函数: {qualified}")
+        result = service.handler(**kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def _publish_services(self, plugin: Plugin) -> None:
+        for service in plugin.exposed():
+            existing = self._services.get(service.qualified)
+            if existing is not None:
+                warn(
+                    f"[插件] {plugin.name} 重复暴露 {service.qualified}，"
+                    "忽略后一个。"
+                )
+                continue
+            self._services[service.qualified] = service
+
+    def _withdraw_services(self, plugin: Plugin) -> None:
+        for service in plugin.exposed():
+            if self._services.get(service.qualified) is service:
+                del self._services[service.qualified]
 
     # ---- lifecycle ----
 
@@ -521,6 +679,8 @@ class PluginManager:
         plugin.bot = self._current_bot
         plugin.session = self._current_session
         plugin.manager = self  # 先于 on_enable：钩子里可操作管理器
+        # 暴露的函数先发布：依赖已按拓扑序启用，on_enable 里就能互相调用。
+        self._publish_services(plugin)
         if self._current_bot is not None:
             plugin._bind(self._current_bot)
         if self._current_session is not None:
@@ -529,6 +689,7 @@ class PluginManager:
 
     async def _disable_one(self, plugin: Plugin) -> None:
         await self._safe_hook(plugin, "on_disable", plugin.on_disable())
+        self._withdraw_services(plugin)
         if self._current_bot is not None:
             plugin._unbind(self._current_bot)
         if self._current_session is not None:

@@ -48,7 +48,13 @@ from .physics import (
     StatusEffect,
     Vec3,
 )
-from .plugin import Plugin, PluginError, PluginManager, PluginWatcher
+from .plugin import (
+    ExposedFunction,
+    Plugin,
+    PluginError,
+    PluginManager,
+    PluginWatcher,
+)
 from .protocol.versions import SUPPORTED_VERSIONS, VersionSpec, get_version
 from .session import BotContainer, BotSession, SessionConfig
 from .srv import resolve_minecraft_srv
@@ -86,6 +92,7 @@ __all__ = [
     "EntityMetadataValue",
     "EntityState",
     "EquipmentSlot",
+    "ExposedFunction",
     "ItemStack",
     "Loader",
     "LoginRejected",

@@ -316,6 +316,12 @@ class HelloReply(Plugin):
   错误或依赖缺失的重载会被拒绝，**旧插件继续运行**，不会打断在线 bot。
 - **配置开关**：`[plugins] disabled = ["hello_reply"]` 可禁用插件，依赖
   被禁用插件的插件会被一并禁用并提示。
+- **暴露能力**：`self.expose("name", handler, llm=True)` 把函数发布为
+  `"<插件>.<名字>"`。其他插件用 `await self.call("fishing.status")` 调用；
+  标了 `llm=True` 还会自动进入 LLM 智能体的工具表（工具名 `fishing_status`，
+  用 `description` 与 JSON Schema 的 `parameters` 描述），`admin=True` 则让
+  智能体对非管理员拒绝该工具。插件禁用或热重载时暴露会被撤回，不会调到旧
+  实例；handler 抛出的异常会传给调用方而不是被吞掉。
 
 ### LLM 智能体插件（llm_agent）
 
@@ -419,8 +425,10 @@ class HelloReply(Plugin):
 收杆到重抛之间只隔 `recast_delay`。
 
 设置在 `plugins/fishing.json`（首次运行生成，改动 5 秒内自动重载），默认
-**`enabled: false`**，改成 true 才开始钓。手持鱼竿需要你自己保证：协议栈拿不到
-物品名称，插件无法校验手里到底是不是鱼竿。
+**`enabled: false`**，改成 true 才开始钓；也可以直接让智能体开——插件暴露了
+`fishing.start` / `fishing.stop` / `fishing.status`，在游戏里说「开始钓鱼」
+即可（start/stop 仅管理员）。手持鱼竿需要你自己保证：协议栈拿不到物品名称，
+插件无法校验手里到底是不是鱼竿。
 
 ### 全屏 TUI 界面（可选）
 

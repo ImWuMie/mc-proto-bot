@@ -75,7 +75,11 @@ State/misc:
 - `game_event` (event_id, value) · `attributes` (entity_id, updates)
 - `login` (bot) · `ready` (bot) · `reconfiguration` (bot) · `transfer` (host, port)
 - `error` (BaseException) · `close` (reason: str\|None)
-- `packet` (RawPacket) · `packet:{state}:{id}` (RawPacket) — raw fallback
+- `packet` (RawPacket) · `packet:{state}:{id}` (RawPacket) — **every** inbound
+  packet, emitted before the dedicated handler runs (not a fallback). `{state}`
+  is the state value (`play`), `{id}` is the **decimal** packet id, so play
+  packet 0x63 is `packet:play:99`. `RawPacket` has exactly `state`,
+  `packet_id`, `payload` (bytes after the id varint; nothing is pre-parsed).
 - `path` (NavigationPath, attempt) · `gliding_collision` (damage)
 
 `login_plugin_request` / `cookie_request` / `configuration_payload` /
@@ -143,6 +147,44 @@ mod-loader events; ordinary plugins do not need them.
 - Text: `from protobot.text import plain_text` (str/dict/list component →
   plain text; handles translate+fallback and the empty-key `{'': '123'}`
   server-plugin quirk)
+
+## Exposing capabilities to other plugins (and to the LLM agent)
+
+`self.expose(name, handler, *, description, parameters, llm, admin)` publishes a
+function as `"<plugin>.<name>"`. Declare exposures in `__init__` (same place as
+`subscribe`); the manager publishes them when the plugin is enabled and
+withdraws them on disable or hot-reload, so a stale instance can never be
+called. Usable as a decorator too.
+
+```python
+class Fishing(Plugin):
+    name = "fishing"
+
+    def __init__(self):
+        super().__init__()
+        self.expose("start", self._start, description="Start auto-fishing",
+                    llm=True, admin=True)
+        self.expose("status", self._status, llm=True)   # readable by anyone
+
+    async def _start(self):
+        ...
+        return "Auto-fishing started"
+```
+
+- **Call another plugin**: `await self.call("fishing.status")`, or
+  `await self.manager.call_service("fishing.start")`. Coroutine handlers are
+  awaited; sync handlers work too. Missing name (plugin disabled or
+  hot-closed) raises `PluginError`, and the handler's own exceptions
+  **propagate** — service calls are deliberately not isolated, unlike event
+  handlers, because the caller needs to see the failure. Never cache the
+  handler; look it up each time.
+- **Offer it to the LLM**: `llm=True` adds it to the agent's tool list
+  automatically as `<plugin>_<name>`, with `description` and `parameters` (a
+  JSON Schema object for the keyword arguments) shown to the model.
+  `admin=True` makes the agent refuse it for players outside its `admins`
+  list. Nothing needs changing in `llm_agent.py`.
+- **Introspection**: `manager.services()`, `manager.get_service(qualified)`,
+  `manager.llm_services()`.
 
 ## Pre-delivery checklist
 

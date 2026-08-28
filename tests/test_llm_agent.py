@@ -1666,6 +1666,121 @@ class ScheduleToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Scheduler plugin not loaded", result)
 
 
+class ExposedToolTest(unittest.IsolatedAsyncioTestCase):
+    """其他插件用 expose(llm=True) 暴露的能力，会自动进入工具表并可被调用。"""
+
+    PROVIDER = (
+        "from protobot import Plugin\n\n"
+        "class Provider(Plugin):\n"
+        '    name = "provider"\n\n'
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.calls = []\n"
+        '        self.expose("ping", self._ping, description="Ping it",\n'
+        '                    parameters={"type": "object",\n'
+        '                                "properties": {"n": {"type": "number"}}},\n'
+        "                    llm=True)\n"
+        '        self.expose("danger", self._danger, llm=True, admin=True)\n'
+        '        self.expose("hidden", self._hidden)\n'
+        '        self.expose("boom", self._boom, llm=True)\n\n'
+        "    async def _ping(self, n=1):\n"
+        "        self.calls.append(n)\n"
+        '        return f"pong {n}"\n\n'
+        "    async def _danger(self):\n"
+        '        return "did the dangerous thing"\n\n'
+        "    async def _hidden(self):\n"
+        '        return "not for the llm"\n\n'
+        "    async def _boom(self):\n"
+        '        raise ValueError("nope")\n'
+    )
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        tmp_dir = Path(self._tmp.name)
+        (tmp_dir / "provider.py").write_text(self.PROVIDER, encoding="utf-8")
+        self.manager = PluginManager([tmp_dir, PLUGIN_FILE.parent])
+        self.manager.discover()
+        self.plugin = self.manager.plugins["llm_agent"]
+        configure(self.plugin, self._tmp.name, settings={"llm": {"api_key": "k"}})
+        await self.manager.enable_all()
+        self.plugin.bot = FakeBot()
+
+    async def asyncTearDown(self) -> None:
+        await self.manager.disable_all()
+        self._tmp.cleanup()
+
+    def test_exposed_functions_join_the_tool_list(self) -> None:
+        names = [tool["function"]["name"] for tool in self.plugin._tool_list()]
+        self.assertIn("provider_ping", names)
+        self.assertIn("provider_danger", names)
+        self.assertNotIn("provider_hidden", names)  # 未标 llm=True
+        self.assertIn("send_message", names)  # 内置工具照常在
+
+    def test_builtin_tools_are_not_mutated(self) -> None:
+        # 会退化的写法是 TOOLS.extend(...)：那样每调一次工具表就会变长
+        first = len(self.plugin._tool_list())
+        second = len(self.plugin._tool_list())
+        self.assertEqual(first, second)
+
+    async def test_calling_an_exposed_tool(self) -> None:
+        result = await self.plugin._run_tool("provider_ping", {"n": 3})
+        self.assertEqual(result, "pong 3")
+        self.assertEqual(self.manager.plugins["provider"].calls, [3])
+
+    async def test_exposed_tool_without_arguments(self) -> None:
+        self.plugin._settings["admins"] = []
+        result = await self.plugin._run_tool("provider_danger", {})
+        self.assertEqual(result, "did the dangerous thing")
+
+    async def test_admin_exposed_tool_is_gated(self) -> None:
+        self.plugin._settings["admins"] = ["mie_233"]
+        self.plugin._requester = "Steve"
+        result = await self.plugin._run_tool("provider_danger", {})
+        self.assertIn("Permission denied", result)
+        self.assertIn("provider.danger", result)
+
+    async def test_admin_may_use_the_gated_tool(self) -> None:
+        self.plugin._settings["admins"] = ["mie_233"]
+        self.plugin._requester = "mie_233"
+        result = await self.plugin._run_tool("provider_danger", {})
+        self.assertEqual(result, "did the dangerous thing")
+
+    async def test_non_llm_exposure_is_not_callable_as_a_tool(self) -> None:
+        result = await self.plugin._run_tool("provider_hidden", {})
+        self.assertIn("Unknown tool", result)
+
+    async def test_exposed_tool_failure_is_reported(self) -> None:
+        result = await self.plugin._run_tool("provider_boom", {})
+        self.assertIn("provider_boom failed", result)
+        self.assertIn("nope", result)
+
+    async def test_unknown_tool_still_reported(self) -> None:
+        result = await self.plugin._run_tool("no_such_tool", {})
+        self.assertIn("Unknown tool", result)
+
+    async def test_hot_closed_plugin_drops_its_tools(self) -> None:
+        await self.manager.hot_close("provider")
+        names = [tool["function"]["name"] for tool in self.plugin._tool_list()]
+        self.assertNotIn("provider_ping", names)
+        result = await self.plugin._run_tool("provider_ping", {"n": 1})
+        self.assertIn("Unknown tool", result)
+
+    async def test_system_info_lists_exposed_functions(self) -> None:
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Exposed functions", result)
+        self.assertIn("provider.ping*", result)  # * 标记可作为工具
+        self.assertIn("provider.hidden", result)
+
+    async def test_tools_reach_the_api_request(self) -> None:
+        fake = FakeLLM(assistant(content="ok"))
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("Steve", "在吗")
+        names = [
+            tool["function"]["name"] for tool in fake.calls[0][1]["tools"]
+        ]
+        self.assertIn("provider_ping", names)
+
+
 class WorkerPipelineTest(unittest.IsolatedAsyncioTestCase):
     async def test_full_pipeline_chat_to_llm_to_game(self) -> None:
         manager = make_manager()

@@ -335,6 +335,14 @@ Notes:
   rejected and the **old plugin keeps running** — the online bot is untouched.
 - **Config switches** — `[plugins] disabled = ["hello_reply"]` disables a
   plugin; anything depending on it is disabled too, with a notice.
+- **Exposing capabilities** — `self.expose("name", handler, llm=True)`
+  publishes a function as `"<plugin>.<name>"`. Other plugins call it with
+  `await self.call("fishing.status")`; with `llm=True` it also joins the LLM
+  agent's tool list automatically (as `fishing_status`, using the
+  `description` and a JSON-Schema `parameters`), and `admin=True` makes the
+  agent refuse it for non-admin players. Exposures are withdrawn on disable
+  or hot-reload, so a stale instance can never be called, and handler
+  exceptions propagate to the caller instead of being swallowed.
 
 ### LLM agent plugin (`llm_agent`)
 
@@ -457,8 +465,10 @@ between reeling and casting again.
 
 Settings live in `plugins/fishing.json` (generated on first run, re-read
 within 5 seconds of an edit) and it starts **`enabled: false`** — flip that to
-begin. Holding a rod is up to you: the stack exposes no item names, so the
-plugin cannot verify what is in the bot's hand.
+begin, or just ask the agent: the plugin exposes `fishing.start`,
+`fishing.stop`, and `fishing.status`, so "start fishing" in chat works
+(start/stop are admin-only). Holding a rod is up to you: the stack exposes no
+item names, so the plugin cannot verify what is in the bot's hand.
 
 ### Full-screen TUI (optional)
 

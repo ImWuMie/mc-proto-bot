@@ -389,6 +389,89 @@ class RecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin._bobber_type, 130)
 
 
+class ExposedServiceTest(unittest.IsolatedAsyncioTestCase):
+    """fishing.start / stop / status：供其他插件与 LLM 调用。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.manager, self.plugin = load_plugin(self._tmp.name, {"enabled": False})
+        self.plugin.bot = FakeBot()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _saved(self) -> dict:
+        return json.loads(self.plugin._file.read_text(encoding="utf-8"))
+
+    def test_exposures_declared(self) -> None:
+        exposed = {service.name: service for service in self.plugin.exposed()}
+        self.assertEqual(sorted(exposed), ["start", "status", "stop"])
+        self.assertTrue(exposed["start"].llm)
+        self.assertTrue(exposed["start"].admin)
+        self.assertTrue(exposed["status"].llm)
+        self.assertFalse(exposed["status"].admin)  # 查状态不限管理员
+        self.assertEqual(exposed["start"].tool_name, "fishing_start")
+
+    async def test_start_enables_and_persists(self) -> None:
+        result = await self.plugin._service_start()
+        self.assertIn("started", result)
+        self.assertTrue(self.plugin._settings["enabled"])
+        self.assertTrue(self._saved()["enabled"])  # 写回文件，重启后仍开着
+
+    async def test_start_when_already_running(self) -> None:
+        await self.plugin._service_start()
+        result = await self.plugin._service_start()
+        self.assertIn("Already fishing", result)
+
+    async def test_stop_disables_and_resets(self) -> None:
+        await self.plugin._service_start()
+        self.plugin._state = "waiting"
+        self.plugin._bobber_id = 7
+        result = await self.plugin._service_stop()
+        self.assertIn("stopped", result)
+        self.assertFalse(self._saved()["enabled"])
+        self.assertEqual(self.plugin._state, "idle")
+        self.assertIsNone(self.plugin._bobber_id)
+
+    async def test_stop_when_not_running(self) -> None:
+        result = await self.plugin._service_stop()
+        self.assertIn("was not running", result)
+
+    async def test_toggle_does_not_look_like_an_external_edit(self) -> None:
+        # 自己写回文件后必须刷新 mtime，否则 5 秒后会被当成外部改动重载
+        await self.plugin._service_start()
+        self.plugin._maybe_reload()
+        self.assertTrue(self.plugin._settings["enabled"])
+
+    async def test_status_when_off(self) -> None:
+        result = await self.plugin._service_status()
+        self.assertIn("off", result)
+
+    async def test_status_reports_the_current_stage(self) -> None:
+        await self.plugin._service_start()
+        self.plugin._state = "waiting"
+        self.plugin._baseline = None
+        self.assertIn("not settled", await self.plugin._service_status())
+        self.plugin._baseline = 63.0
+        self.assertIn("watching the bobber", await self.plugin._service_status())
+        self.plugin._state = "cooldown"
+        self.assertIn("between casts", await self.plugin._service_status())
+
+    async def test_status_counts_catches(self) -> None:
+        await self.plugin._service_start()
+        self.plugin._catches = 4
+        self.assertIn("4 caught", await self.plugin._service_status())
+
+    async def test_callable_through_the_manager(self) -> None:
+        await self.manager.enable_all()
+        try:
+            result = await self.manager.call_service("fishing.status")
+            self.assertIn("Auto-fishing", result)
+            self.assertIn("fishing.start", self.manager.services())
+        finally:
+            await self.manager.disable_all()
+
+
 class LifecycleTest(unittest.IsolatedAsyncioTestCase):
     async def test_enable_starts_the_loop_and_disable_cancels_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

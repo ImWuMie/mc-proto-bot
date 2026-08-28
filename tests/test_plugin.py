@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -596,6 +597,224 @@ class WatcherTest(unittest.IsolatedAsyncioTestCase):
         finally:
             watcher.request_stop()
             await task
+
+
+class ExposedFunctionTest(unittest.IsolatedAsyncioTestCase):
+    """expose()：插件间互调 + 供 LLM 使用的工具表。"""
+
+    def _sources(self, extra: str = "") -> str:
+        return (
+            "from protobot import Plugin\n\n"
+            "class Provider(Plugin):\n"
+            '    name = "provider"\n\n'
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            "        self.calls = []\n"
+            '        self.expose("add", self._add, description="Add numbers",\n'
+            '                    parameters={"type": "object",\n'
+            '                                "properties": {"a": {"type": "number"}}},\n'
+            "                    llm=True)\n"
+            '        self.expose("secret", self._secret, llm=True, admin=True)\n'
+            '        self.expose("plain", self._plain)\n'
+            '        self.expose("boom", self._boom)\n\n'
+            "    async def _add(self, a=0, b=0):\n"
+            "        self.calls.append((a, b))\n"
+            "        return a + b\n\n"
+            "    def _secret(self):\n"
+            '        return "classified"\n\n'
+            "    def _plain(self):\n"
+            '        return "sync ok"\n\n'
+            "    def _boom(self):\n"
+            '        raise ValueError("nope")\n' + extra
+        )
+
+    async def _manager(self, tmp: str, extra: str = "") -> PluginManager:
+        (Path(tmp) / "provider.py").write_text(
+            self._sources(extra), encoding="utf-8"
+        )
+        manager = PluginManager([Path(tmp)])
+        manager.discover()
+        await manager.enable_all()
+        return manager
+
+    async def test_services_published_while_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            try:
+                self.assertEqual(
+                    sorted(manager.services()),
+                    ["provider.add", "provider.boom", "provider.plain",
+                     "provider.secret"],
+                )
+            finally:
+                await manager.disable_all()
+            self.assertEqual(manager.services(), {})  # 关闭后撤回
+
+    async def test_call_service_awaits_coroutines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            try:
+                self.assertEqual(
+                    await manager.call_service("provider.add", a=2, b=3), 5
+                )
+                self.assertEqual(
+                    manager.plugins["provider"].calls, [(2, 3)]
+                )
+            finally:
+                await manager.disable_all()
+
+    async def test_call_service_handles_sync_handlers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            try:
+                self.assertEqual(
+                    await manager.call_service("provider.plain"), "sync ok"
+                )
+            finally:
+                await manager.disable_all()
+
+    async def test_unknown_service_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            try:
+                with self.assertRaises(PluginError):
+                    await manager.call_service("provider.nope")
+                with self.assertRaises(PluginError):
+                    await manager.call_service("ghost.thing")
+            finally:
+                await manager.disable_all()
+
+    async def test_handler_exceptions_propagate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            try:
+                with self.assertRaises(ValueError):
+                    await manager.call_service("provider.boom")
+            finally:
+                await manager.disable_all()
+
+    async def test_llm_services_filtered_and_schema_shaped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            try:
+                names = [s.qualified for s in manager.llm_services()]
+                self.assertEqual(names, ["provider.add", "provider.secret"])
+                schema = manager.get_service("provider.add").tool_schema()
+                self.assertEqual(schema["function"]["name"], "provider_add")
+                self.assertEqual(
+                    schema["function"]["description"], "Add numbers"
+                )
+                self.assertIn("a", schema["function"]["parameters"]["properties"])
+                # 未给 parameters 的暴露也要产出合法空 schema
+                bare = manager.get_service("provider.secret").tool_schema()
+                self.assertEqual(
+                    bare["function"]["parameters"],
+                    {"type": "object", "properties": {}},
+                )
+                self.assertIn("provider.secret", bare["function"]["description"])
+                self.assertTrue(manager.get_service("provider.secret").admin)
+            finally:
+                await manager.disable_all()
+
+    async def test_plugin_can_call_another_plugin(self) -> None:
+        consumer = (
+            "\n\nclass Consumer(Plugin):\n"
+            '    name = "consumer"\n'
+            '    dependencies = ("provider",)\n\n'
+            "    async def on_enable(self):\n"
+            '        self.result = await self.call("provider.add", a=4, b=6)\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp, extra=consumer)
+            try:
+                # 依赖先启用，因此 consumer 的 on_enable 里就能调用 provider
+                self.assertEqual(manager.plugins["consumer"].result, 10)
+            finally:
+                await manager.disable_all()
+
+    async def test_call_without_a_manager_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            plugin = manager.plugins["provider"]
+            await manager.disable_all()
+            with self.assertRaises(PluginError):
+                await plugin.call("provider.add", a=1)
+
+    async def test_hot_close_withdraws_services(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            try:
+                await manager.hot_close("provider")
+                self.assertEqual(manager.services(), {})
+                with self.assertRaises(PluginError):
+                    await manager.call_service("provider.add")
+            finally:
+                await manager.disable_all()
+
+    async def test_hot_reload_republishes_the_new_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = await self._manager(tmp)
+            try:
+                file = Path(tmp) / "provider.py"
+                file.write_text(
+                    self._sources().replace("return a + b", "return a * b"),
+                    encoding="utf-8",
+                )
+                await manager.hot_reload_file(file)
+                # 服务指向新实例：乘法而不是加法
+                self.assertEqual(
+                    await manager.call_service("provider.add", a=3, b=4), 12
+                )
+                self.assertEqual(len(manager.services()), 4)
+            finally:
+                await manager.disable_all()
+
+    async def test_duplicate_exposure_is_warned_and_ignored(self) -> None:
+        source = (
+            "from protobot import Plugin\n\n"
+            "class Dup(Plugin):\n"
+            '    name = "dup"\n\n'
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            '        self.expose("thing", self._first)\n'
+            '        self.expose("thing", self._second)\n\n'
+            "    def _first(self):\n"
+            '        return "first"\n\n'
+            "    def _second(self):\n"
+            '        return "second"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "dup.py").write_text(source, encoding="utf-8")
+            manager = PluginManager([Path(tmp)])
+            manager.discover()
+            await manager.enable_all()
+            try:
+                self.assertEqual(
+                    await manager.call_service("dup.thing"), "first"
+                )
+            finally:
+                await manager.disable_all()
+
+    async def test_expose_as_a_decorator(self) -> None:
+        source = (
+            "from protobot import Plugin\n\n"
+            "class Deco(Plugin):\n"
+            '    name = "deco"\n\n'
+            "    def __init__(self):\n"
+            "        super().__init__()\n\n"
+            '        @self.expose("hello", description="Say hi")\n'
+            "        async def hello():\n"
+            '            return "hi"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "deco.py").write_text(source, encoding="utf-8")
+            manager = PluginManager([Path(tmp)])
+            manager.discover()
+            await manager.enable_all()
+            try:
+                self.assertEqual(await manager.call_service("deco.hello"), "hi")
+            finally:
+                await manager.disable_all()
 
 
 if __name__ == "__main__":

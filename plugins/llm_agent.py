@@ -1168,6 +1168,16 @@ class LLMAgent(Plugin):
                 )
         log.warn("[LLM] 工具调用轮数达到上限，放弃本轮。")
 
+    def _tool_list(self) -> list[dict]:
+        """内置工具表 + 其他插件用 expose(llm=True) 暴露的能力。"""
+        tools = list(TOOLS)
+        manager = self.manager
+        if manager is not None:
+            tools.extend(
+                service.tool_schema() for service in manager.llm_services()
+            )
+        return tools
+
     async def _complete_chat(
         self, messages: list[dict], *, with_tools: bool = True
     ) -> dict:
@@ -1178,7 +1188,7 @@ class LLMAgent(Plugin):
             "messages": messages,
         }
         if with_tools:
-            payload["tools"] = TOOLS  # 摘要等辅助调用不携带工具表
+            payload["tools"] = self._tool_list()  # 摘要等辅助调用不携带工具表
         headers = {}
         api_key = str(llm.get("api_key") or "")
         if api_key:
@@ -1272,13 +1282,34 @@ class LLMAgent(Plugin):
     async def _run_tool(self, name: str, arguments: dict) -> str:
         handler = getattr(self, f"_tool_{name}", None)
         if handler is None:
-            return f"Unknown tool: {name}"
+            return await self._run_exposed_tool(name, arguments)
         try:
             return str(await handler(arguments) or "")
         except asyncio.CancelledError:
             raise
         except Exception as error:
             return f"Tool {name} failed: {error!r}"
+
+    async def _run_exposed_tool(self, name: str, arguments: dict) -> str:
+        """派发到其他插件用 expose(llm=True) 暴露的能力。"""
+        manager = self.manager
+        if manager is None:
+            return f"Unknown tool: {name}"
+        for service in manager.llm_services():
+            if service.tool_name != name:
+                continue
+            if service.admin and not self._is_admin(self._requester):
+                return self._deny(self._requester, f"use {service.qualified}")
+            try:
+                result = await manager.call_service(
+                    service.qualified, **(arguments or {})
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                return f"Tool {name} failed: {error!r}"
+            return str(result) if result is not None else "Done"
+        return f"Unknown tool: {name}"
 
     async def _tool_send_message(self, args: dict) -> str:
         text = str(args.get("text") or "").strip()
@@ -1492,11 +1523,19 @@ class LLMAgent(Plugin):
             return ["== Plugins ==", "Plugin manager unavailable"]
         enabled = [plugin.name for plugin in manager.load_order()]
         disabled = [name for name in manager.plugins if name not in enabled]
-        return [
+        lines = [
             "== Plugins ==",
             f"Enabled ({len(enabled)}): {', '.join(enabled) or '-'}",
             f"Disabled ({len(disabled)}): {', '.join(disabled) or '-'}",
         ]
+        services = manager.services()
+        if services:
+            offered = ", ".join(
+                f"{name}{'*' if service.llm else ''}"
+                for name, service in sorted(services.items())
+            )
+            lines.append(f"Exposed functions (* = usable as a tool): {offered}")
+        return lines
 
     async def _tool_get_system_info(self, args: dict) -> str:
         sections = [

@@ -76,6 +76,82 @@ class AutoFishing(Plugin):
         self.subscribe("entity_teleport", self._on_entity_teleport)
         self.subscribe("entities_remove", self._on_entities_remove)
         self.subscribe_session("session_ready", self._on_session_ready)
+        # 暴露给其他插件与 LLM：fishing.start / fishing.stop / fishing.status
+        self.expose(
+            "start",
+            self._service_start,
+            description=(
+                "Start auto-fishing: cast, watch the bobber, reel on a bite, "
+                "repeat. The bot must be holding a fishing rod and facing water."
+            ),
+            llm=True,
+            admin=True,
+        )
+        self.expose(
+            "stop",
+            self._service_stop,
+            description="Stop auto-fishing and leave the rod alone.",
+            llm=True,
+            admin=True,
+        )
+        self.expose(
+            "status",
+            self._service_status,
+            description=(
+                "Auto-fishing status: whether it is running, what it is doing "
+                "right now, and how many fish have been reeled in."
+            ),
+            llm=True,
+        )
+
+    # ---- 暴露给其他插件 / LLM 的能力 ----
+
+    async def _service_start(self) -> str:
+        if self._settings["enabled"]:
+            return f"Already fishing ({self._catches} caught so far)"
+        self._set_enabled(True)
+        return "Auto-fishing started (rod in hand and water in front are on you)"
+
+    async def _service_stop(self) -> str:
+        if not self._settings["enabled"]:
+            return "Auto-fishing was not running"
+        self._set_enabled(False)
+        return f"Auto-fishing stopped ({self._catches} caught this session)"
+
+    async def _service_status(self) -> str:
+        states = {
+            "idle": "idle",
+            "casting": "cast, waiting for the bobber to appear",
+            "waiting": "line in the water, watching the bobber",
+            "cooldown": "between casts",
+        }
+        if not self._settings["enabled"]:
+            return f"Auto-fishing is off ({self._catches} caught this session)"
+        detail = states.get(self._state, self._state)
+        if self._state == "waiting" and self._baseline is None:
+            detail = "bobber in flight, not settled yet"
+        return (
+            f"Auto-fishing is on: {detail}; {self._catches} caught this session"
+        )
+
+    def _set_enabled(self, enabled: bool) -> None:
+        """就地改开关并写回 fishing.json，避免 5 秒后被文件内容覆盖回去。"""
+        self._settings["enabled"] = enabled
+        if not enabled:
+            self._reset()
+        path = self._file
+        if path is None:
+            return
+        try:
+            data = dict(self._settings)
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            self._mtime = path.stat().st_mtime  # 自己写的，不算「外部改动」
+        except OSError as error:
+            log.warn(f"[钓鱼] 开关状态写回失败 ({error})")
+        log.info(f"[钓鱼] {'开始' if enabled else '停止'}自动钓鱼。")
+
 
     # ---- 生命周期 ----
 
