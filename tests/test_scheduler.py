@@ -206,6 +206,182 @@ class RunDueTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin._run_due()  # 不应抛出
 
 
+class ExposedServiceTest(unittest.IsolatedAsyncioTestCase):
+    """scheduler.list / add / set / remove / run / status（LLM 与其他插件共用）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.manager, self.plugin = load_plugin(self._tmp.name)
+        self.plugin._file.write_text(
+            json.dumps({"tasks": []}), encoding="utf-8"
+        )
+        self.plugin._load_tasks()
+        self.plugin.bot = FakeBot()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _saved(self) -> list[dict]:
+        return json.loads(self.plugin._file.read_text(encoding="utf-8"))["tasks"]
+
+    def test_exposures_declared(self) -> None:
+        exposed = {service.name: service for service in self.plugin.exposed()}
+        self.assertEqual(
+            sorted(exposed),
+            ["add", "list", "remove", "run", "set", "status"],
+        )
+        self.assertTrue(exposed["add"].admin)
+        self.assertFalse(exposed["list"].admin)  # 只读，不限管理员
+        self.assertFalse(exposed["status"].admin)
+        self.assertEqual(exposed["add"].tool_name, "scheduler_add")
+
+    async def test_add_then_list(self) -> None:
+        result = await self.plugin._service_add(
+            name="报时", interval=300, action="chat", text="整点啦"
+        )
+        self.assertIn("Scheduled task added: 报时", result)
+        self.assertIn("every 300s", result)
+        self.assertEqual(self._saved()[0]["name"], "报时")
+        listing = await self.plugin._service_list()
+        self.assertIn("- 报时", listing)
+        self.assertIn("整点啦", listing)
+
+    async def test_add_takes_effect_immediately(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="x")
+        # 写回后立刻重载：不必等 5 秒轮询
+        self.assertEqual([task["name"] for task in self.plugin._tasks], ["t"])
+
+    async def test_add_does_not_look_like_an_external_edit(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="x")
+        self.plugin._maybe_reload()  # 不应触发「文件已修改」的重载
+        self.assertEqual(len(self.plugin._tasks), 1)
+
+    async def test_add_validation(self) -> None:
+        self.assertIn(
+            "time must be HH:MM",
+            await self.plugin._service_add(name="x", text="y", time="25:00"),
+        )
+        self.assertIn(
+            "provide interval",
+            await self.plugin._service_add(name="x", text="y"),
+        )
+        self.assertIn(
+            "missing text", await self.plugin._service_add(name="x", interval=60)
+        )
+        self.assertIn(
+            "missing task name",
+            await self.plugin._service_add(interval=60, text="y"),
+        )
+        self.assertEqual(self._saved(), [])
+
+    async def test_interval_below_minimum_is_clamped_not_rejected(self) -> None:
+        # 曾经一边（llm_agent）报错、一边（scheduler）静默钳制；现在只有一份规则
+        result = await self.plugin._service_add(name="t", interval=1, text="x")
+        self.assertIn("every 5s", result)
+        self.assertEqual(self._saved()[0]["interval"], 5.0)
+
+    async def test_add_duplicate_rejected(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="x")
+        result = await self.plugin._service_add(name="t", interval=60, text="x")
+        self.assertIn("already exists", result)
+
+    async def test_set_updates_only_given_fields(self) -> None:
+        await self.plugin._service_add(
+            name="t", interval=60, action="chat", text="旧"
+        )
+        result = await self.plugin._service_set(name="t", text="新")
+        self.assertIn("updated", result)
+        task = self._saved()[0]
+        self.assertEqual(task["text"], "新")
+        self.assertEqual(task["interval"], 60)  # 未给的字段保持原样
+        self.assertEqual(task["action"], "chat")
+
+    async def test_set_can_pause_a_task(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="x")
+        await self.plugin._service_set(name="t", enabled=False)
+        self.assertFalse(self._saved()[0]["enabled"])
+
+    async def test_set_rejects_an_invalid_result(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="x")
+        result = await self.plugin._service_set(name="t", time="24:00")
+        self.assertIn("time must be HH:MM", result)
+        self.assertEqual(self._saved()[0]["interval"], 60)  # 未改动
+
+    async def test_set_rejects_unknown_fields(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="x")
+        result = await self.plugin._service_set(name="t", when="tomorrow")
+        self.assertIn("Unknown field(s): when", result)
+
+    async def test_set_unknown_task(self) -> None:
+        self.assertIn(
+            "Task not found", await self.plugin._service_set(name="nope", text="x")
+        )
+
+    async def test_remove(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="x")
+        self.assertIn("removed", await self.plugin._service_remove(name="t"))
+        self.assertEqual(self._saved(), [])
+        self.assertIn("No scheduled tasks", await self.plugin._service_list())
+
+    async def test_remove_unknown_task(self) -> None:
+        self.assertIn(
+            "Task not found", await self.plugin._service_remove(name="nope")
+        )
+
+    async def test_run_executes_once_without_rescheduling(self) -> None:
+        await self.plugin._service_add(
+            name="t", interval=60, action="command", text="say hi"
+        )
+        result = await self.plugin._service_run(name="t")
+        self.assertIn("executed once", result)
+        self.assertEqual(self.plugin.bot.sent_commands, ["say hi"])
+        self.assertEqual(len(self._saved()), 1)
+
+    async def test_run_sends_chat_for_chat_tasks(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="hi")
+        await self.plugin._service_run(name="t")
+        self.assertEqual(self.plugin.bot.sent_messages, ["hi"])
+
+    async def test_run_without_a_bot(self) -> None:
+        await self.plugin._service_add(name="t", interval=60, text="hi")
+        self.plugin.bot = None
+        self.assertIn(
+            "Not connected", await self.plugin._service_run(name="t")
+        )
+
+    async def test_run_unknown_task(self) -> None:
+        self.assertIn("Task not found", await self.plugin._service_run(name="x"))
+
+    async def test_status_counts(self) -> None:
+        await self.plugin._service_add(name="a", interval=60, text="x")
+        await self.plugin._service_add(
+            name="b", interval=60, text="y", enabled=False
+        )
+        self.assertEqual(
+            await self.plugin._service_status(), "2 scheduled task(s), 1 enabled"
+        )
+
+    async def test_hand_written_extra_fields_survive_a_rewrite(self) -> None:
+        self.plugin._file.write_text(
+            json.dumps({"tasks": [
+                {"name": "keep", "interval": 60, "text": "x", "note": "mine"}
+            ]}),
+            encoding="utf-8",
+        )
+        await self.plugin._service_add(name="new", interval=60, text="y")
+        kept = [task for task in self._saved() if task["name"] == "keep"][0]
+        self.assertEqual(kept["note"], "mine")
+
+    async def test_callable_through_the_manager(self) -> None:
+        await self.manager.enable_all()
+        try:
+            self.assertIn("scheduler.add", self.manager.services())
+            result = await self.manager.call_service("scheduler.status")
+            self.assertIn("scheduled task(s)", result)
+        finally:
+            await self.manager.disable_all()
+
+
 class SecondsUntilTest(unittest.TestCase):
     def setUp(self) -> None:
         self.manager = PluginManager([SCHEDULER_FILE.parent])

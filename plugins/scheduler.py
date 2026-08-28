@@ -18,9 +18,11 @@
 执行一次）至少给一个；``action`` 为 ``chat``（发聊天）或 ``command``
 （执行服务器命令）；``enabled`` 为 false 时暂停。
 
-运行时每 5 秒检查一次 JSON 的修改时间，改动自动重新加载——llm_agent 的
-schedule_* 工具就是直接编辑这个文件，无需热重载本插件。未连接服务器时
-任务顺延，不消耗本次调度。
+运行时每 5 秒检查一次 JSON 的修改时间，改动自动重新加载。任务也可以通过
+暴露出去的 ``scheduler.list`` / ``add`` / ``set`` / ``remove`` / ``run`` /
+``status`` 由其他插件或 LLM 直接维护——增删改经由本插件自己的校验，写回后
+立即生效，因此校验规则只有这一份（``_normalize``）。未连接服务器时任务顺延，
+不消耗本次调度。
 """
 
 from __future__ import annotations
@@ -51,6 +53,35 @@ DEFAULT_TASKS: dict = {
     ]
 }
 
+#: 暴露给 LLM 的参数表：add/set 用完整字段，remove/run 只要名字。
+TASK_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "Unique task name"},
+        "interval": {
+            "type": "number",
+            "description": "Seconds between runs (at least 5)",
+        },
+        "time": {
+            "type": "string",
+            "description": "Daily local time HH:MM (24-hour)",
+        },
+        "action": {
+            "type": "string",
+            "description": "chat to send a message, command to run one",
+        },
+        "text": {"type": "string", "description": "Message body or command"},
+        "enabled": {"type": "boolean", "description": "Pause or resume"},
+    },
+    "required": ["name"],
+}
+
+NAME_SCHEMA: dict = {
+    "type": "object",
+    "properties": {"name": {"type": "string", "description": "Task name"}},
+    "required": ["name"],
+}
+
 
 class Scheduler(Plugin):
     name = "scheduler"
@@ -63,6 +94,61 @@ class Scheduler(Plugin):
         self._mtime: float | None = None
         self._loop_task: asyncio.Task | None = None
         self._tick_count = 0
+        # 暴露给其他插件与 LLM：scheduler.list / add / set / remove / run
+        self.expose(
+            "list",
+            self._service_list,
+            description="List scheduled tasks: when each runs, what it does, and whether it is enabled.",
+            llm=True,
+        )
+        self.expose(
+            "add",
+            self._service_add,
+            description=(
+                "Add a scheduled task that repeats every interval seconds "
+                "and/or runs daily at a local HH:MM time. Takes effect within "
+                "5 seconds."
+            ),
+            parameters=TASK_SCHEMA,
+            llm=True,
+            admin=True,
+        )
+        self.expose(
+            "set",
+            self._service_set,
+            description=(
+                "Modify a scheduled task: pass any of interval/time/action/"
+                "text/enabled to change just those fields."
+            ),
+            parameters=TASK_SCHEMA,
+            llm=True,
+            admin=True,
+        )
+        self.expose(
+            "remove",
+            self._service_remove,
+            description="Delete a scheduled task by name.",
+            parameters=NAME_SCHEMA,
+            llm=True,
+            admin=True,
+        )
+        self.expose(
+            "run",
+            self._service_run,
+            description=(
+                "Run a scheduled task once right now without changing its "
+                "schedule."
+            ),
+            parameters=NAME_SCHEMA,
+            llm=True,
+            admin=True,
+        )
+        self.expose(
+            "status",
+            self._service_status,
+            description="How many scheduled tasks exist and how many are enabled.",
+            llm=True,
+        )
 
     # ---- 生命周期 ----
 
@@ -133,38 +219,42 @@ class Scheduler(Plugin):
         log.info(f"[定时] 已加载 {len(valid)} 个任务。")
 
     def _validate(self, task) -> dict | None:
-        """校验并归一化一个任务；非法任务返回 None 并打日志。"""
+        """文件加载路径：非法任务打日志并跳过。"""
+        parsed, error = self._normalize(task)
+        if parsed is None:
+            log.warn(f"[定时] 跳过非法任务：{error}")
+        return parsed
+
+    def _normalize(self, task) -> tuple[dict | None, str]:
+        """校验并归一化一个任务，返回 ``(任务, 错误信息)``。
+
+        文件加载与暴露出去的 add/set 走同一份规则——两处各写一遍曾经
+        造成同一个字段一边报错、一边静默钳制。
+        """
         if not isinstance(task, dict):
-            log.warn("[定时] 跳过非法任务（非对象）。")
-            return None
+            return None, "task must be an object"
         name = str(task.get("name") or "").strip()
         if not name:
-            log.warn("[定时] 跳过无名任务。")
-            return None
+            return None, "missing task name"
         action = str(task.get("action") or "chat")
         if action not in ("chat", "command"):
-            log.warn(f"[定时] 任务 {name} 的 action 非法，已跳过。")
-            return None
+            return None, "action must be chat or command"
         text = str(task.get("text") or "").strip()
         if not text:
-            log.warn(f"[定时] 任务 {name} 缺少 text，已跳过。")
-            return None
+            return None, "missing text (message body or command)"
         interval = None
-        if task.get("interval") is not None:
+        raw_interval = task.get("interval")
+        if raw_interval is not None and str(raw_interval) != "":
             try:
-                interval = float(task["interval"])
-                if interval < MIN_INTERVAL:
-                    interval = MIN_INTERVAL
+                interval = float(raw_interval)
             except (TypeError, ValueError):
-                log.warn(f"[定时] 任务 {name} 的 interval 非法，已跳过。")
-                return None
+                return None, "interval must be a number of seconds"
+            interval = max(interval, MIN_INTERVAL)
         time_spec = str(task.get("time") or "").strip()
         if time_spec and not TIME_PATTERN.match(time_spec):
-            log.warn(f"[定时] 任务 {name} 的 time 非法（需 HH:MM），已跳过。")
-            return None
+            return None, "time must be HH:MM (24-hour, local)"
         if interval is None and not time_spec:
-            log.warn(f"[定时] 任务 {name} 既没有 interval 也没有 time，已跳过。")
-            return None
+            return None, "provide interval (seconds) and/or time (HH:MM)"
         return {
             "name": name,
             "interval": interval,
@@ -172,7 +262,150 @@ class Scheduler(Plugin):
             "action": action,
             "text": text,
             "enabled": bool(task.get("enabled", True)),
-        }
+        }, ""
+
+    @staticmethod
+    def _describe(task: dict) -> str:
+        parts = []
+        if task.get("interval"):
+            parts.append(f"every {float(task['interval']):.0f}s")
+        if task.get("time"):
+            parts.append(f"daily at {task['time']}")
+        schedule = " and ".join(parts) or "no schedule"
+        state = "" if task.get("enabled", True) else " (disabled)"
+        return f"{task.get('action', 'chat')} {schedule}{state}"
+
+
+    # ---- 暴露给其他插件 / LLM 的能力 ----
+
+    def _read_tasks(self) -> tuple[list[dict] | None, str]:
+        """读回文件里的原始任务列表（保留未知字段，不做归一化）。"""
+        path = self._file
+        if path is None:
+            return None, "Scheduler file is not resolved yet"
+        if not path.exists():
+            return [], ""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            return None, f"Failed to read scheduler.json: {error}"
+        if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
+            return None, "scheduler.json has an invalid format"
+        return list(data["tasks"]), ""
+
+    def _write_tasks(self, tasks: list[dict]) -> str:
+        path = self._file
+        if path is None:
+            return "Scheduler file is not resolved yet"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"tasks": tasks}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            return f"Failed to write scheduler.json: {error}"
+        # 立刻重载：既让改动即时生效，也刷新 mtime（自己写的不算外部改动）
+        self._load_tasks()
+        return ""
+
+    async def _service_list(self) -> str:
+        tasks, error = self._read_tasks()
+        if error:
+            return error
+        if not tasks:
+            return "No scheduled tasks"
+        return "\n".join(
+            f"- {task.get('name')}: {self._describe(task)}: {task.get('text')}"
+            for task in tasks
+        )
+
+    async def _service_status(self) -> str:
+        tasks, error = self._read_tasks()
+        if error:
+            return error
+        enabled = sum(1 for task in tasks if task.get("enabled", True))
+        return f"{len(tasks)} scheduled task(s), {enabled} enabled"
+
+    async def _service_add(self, **fields) -> str:
+        task, error = self._normalize(fields)
+        if task is None:
+            return f"Cannot add task: {error}"
+        tasks, error = self._read_tasks()
+        if error:
+            return error
+        if any(str(other.get("name")) == task["name"] for other in tasks):
+            return f"Task already exists: {task['name']} (use set to modify)"
+        tasks.append(task)
+        error = self._write_tasks(tasks)
+        if error:
+            return error
+        return f"Scheduled task added: {task['name']} ({self._describe(task)})"
+
+    async def _service_set(self, name: str = "", **fields) -> str:
+        name = str(name).strip()
+        if not name:
+            return "Missing task name"
+        unknown = set(fields) - set(TASK_SCHEMA["properties"])
+        if unknown:
+            return f"Unknown field(s): {', '.join(sorted(unknown))}"
+        tasks, error = self._read_tasks()
+        if error:
+            return error
+        for index, task in enumerate(tasks):
+            if str(task.get("name")) != name:
+                continue
+            merged = dict(task)
+            merged.update(fields)
+            merged["name"] = name
+            updated, error = self._normalize(merged)
+            if updated is None:
+                return f"Cannot update task: {error}"
+            tasks[index] = updated
+            error = self._write_tasks(tasks)
+            if error:
+                return error
+            return f"Scheduled task updated: {name} ({self._describe(updated)})"
+        return f"Task not found: {name}"
+
+    async def _service_remove(self, name: str = "") -> str:
+        name = str(name).strip()
+        if not name:
+            return "Missing task name"
+        tasks, error = self._read_tasks()
+        if error:
+            return error
+        remaining = [task for task in tasks if str(task.get("name")) != name]
+        if len(remaining) == len(tasks):
+            return f"Task not found: {name}"
+        error = self._write_tasks(remaining)
+        if error:
+            return error
+        return f"Scheduled task removed: {name}"
+
+    async def _service_run(self, name: str = "") -> str:
+        name = str(name).strip()
+        if not name:
+            return "Missing task name"
+        tasks, error = self._read_tasks()
+        if error:
+            return error
+        for raw in tasks:
+            if str(raw.get("name")) != name:
+                continue
+            task, error = self._normalize(raw)
+            if task is None:
+                return f"Task {name} is not runnable: {error}"
+            bot = self.bot
+            if bot is None:
+                return "Not connected to a server"
+            if task["action"] == "command":
+                await bot.send_command(task["text"])
+            else:
+                await bot.send_message(task["text"])
+            log.info(f"[定时] 任务 {name}: 手动执行一次。")
+            return f"Task {name} executed once"
+        return f"Task not found: {name}"
 
     # ---- 主循环 ----
 

@@ -435,11 +435,13 @@ disabled sample):
 - The file is re-read within 5 seconds of any change, so edits apply without
   restarting or hot-reloading the plugin. While the bot is disconnected, due
   tasks are postponed rather than dropped.
-- **The LLM agent can manage these tasks** through `schedule_list`,
-  `schedule_add`, `schedule_set`, `schedule_remove`, and `schedule_run`
-  (run once now) — everything except `schedule_list` is admin-only. So
-  "every 30 minutes remind people to eat" is enough to create a task in
-  game, and "cancel the reminder" removes it.
+- **The LLM agent can manage these tasks** — the plugin exposes
+  `scheduler.list`, `add`, `set`, `remove`, `run` (fire once now), and
+  `status`, which reach the agent as tools automatically; everything except
+  `list` and `status` is admin-only. So "every 30 minutes remind people to
+  eat" is enough to create a task in game, and "cancel the reminder" removes
+  it. Validation lives in the plugin, so the file, the services, and the agent
+  all obey one set of rules.
 
 ### Auto-fishing plugin (`fishing`)
 

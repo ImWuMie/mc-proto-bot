@@ -404,10 +404,11 @@ class HelloReply(Plugin):
   `enabled: false` 暂停该任务。
 - 文件改动后 5 秒内自动重新加载，无需重启或热重载插件。未连接服务器时到期
   任务顺延，不会丢失。
-- **LLM 智能体可以直接管理这些任务**：`schedule_list`、`schedule_add`、
-  `schedule_set`、`schedule_remove`、`schedule_run`（立即执行一次），除
-  `schedule_list` 外都仅限管理员。也就是说在游戏里说「每 30 分钟提醒大家
-  吃饭」就能建好任务，说「把提醒取消」就能删掉。
+- **LLM 智能体可以直接管理这些任务**：插件暴露了 `scheduler.list` / `add` /
+  `set` / `remove` / `run`（立即执行一次）/ `status`，会自动成为智能体的工具，
+  除 `list`、`status` 外都仅限管理员。在游戏里说「每 30 分钟提醒大家吃饭」
+  就能建好任务，说「把提醒取消」就能删掉。校验规则只写在插件里，所以文件、
+  服务调用、智能体三条路径遵守同一套规则。
 
 ### 自动钓鱼插件（fishing）
 

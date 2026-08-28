@@ -92,6 +92,24 @@ class ExposedFunction:
             },
         }
 
+    def filter_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Keep only the keyword arguments this function declares.
+
+        Language models routinely add keys of their own (a ``reason`` field, a
+        restated parameter) or pass something for a function that takes
+        nothing.  Handlers should not have to absorb that with ``**kwargs``, so
+        an LLM-facing caller filters against the declared schema first; a
+        function with no declared properties simply takes none.  Plugin-to-
+        plugin calls stay strict on purpose -- a wrong keyword there is a bug
+        the caller should hear about.
+        """
+        properties = (self.parameters or {}).get("properties") or {}
+        if not properties:
+            return {}
+        return {
+            key: value for key, value in arguments.items() if key in properties
+        }
+
 
 class Plugin:
     """Base class for ProtoBot plugins.

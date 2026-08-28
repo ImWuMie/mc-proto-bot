@@ -85,7 +85,7 @@ How your world reaches you:
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
-- set_plugin, write_plugin, patch_plugin, and the schedule_* tools are admin-only; read_chat, read_memory, read_plugin_source, and schedule_list are not.
+- set_plugin, write_plugin, and patch_plugin are admin-only, and so are some tools other plugins expose (their results say so plainly); read_chat, read_memory, and read_plugin_source are not.
 
 When writing plugins (write_plugin), follow the ProtoBot plugin rules:
 1. A plugin is a Plugin subclass with a unique `name`; optional `dependencies = ("other_plugin",)` declares prerequisites.
@@ -219,7 +219,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "get_system_info",
-            "description": "Backstage self-diagnostics: model and context-window settings, how much of the context budget is in use, reply triggers, admin count, connection and uptime, memory/scheduler/plugin counts. Use it when asked how you are running or how full your context is; secrets are never included",
+            "description": "Backstage self-diagnostics: model and context-window settings, how much of the context budget is in use, reply triggers, admin count, connection and uptime, memory and plugin counts. Use it when asked how you are running or how full your context is; secrets are never included",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -391,80 +391,6 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "schedule_list",
-            "description": "List scheduled tasks of the scheduler plugin",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "schedule_add",
-            "description": "Add a scheduled task that repeats every interval seconds or daily at a local HH:MM time (admin only; takes effect within 5 s)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Unique task name"},
-                    "interval": {"type": "number", "description": "Seconds between runs (>= 5), optional"},
-                    "time": {"type": "string", "description": "Daily local time HH:MM (24-hour), optional"},
-                    "action": {"type": "string", "description": "chat or command, default chat"},
-                    "text": {"type": "string", "description": "Message to send, or command to run"},
-                    "enabled": {"type": "boolean", "description": "Default true"},
-                },
-                "required": ["name", "text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "schedule_set",
-            "description": "Modify a scheduled task: pass any of interval/time/action/text/enabled to update (admin only)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Task name"},
-                    "interval": {"type": "number", "description": "Seconds between runs (>= 5)"},
-                    "time": {"type": "string", "description": "Daily local time HH:MM"},
-                    "action": {"type": "string", "description": "chat or command"},
-                    "text": {"type": "string", "description": "Message or command body"},
-                    "enabled": {"type": "boolean", "description": "Pause/resume the task"},
-                },
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "schedule_remove",
-            "description": "Delete a scheduled task by name (admin only)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Task name"}
-                },
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "schedule_run",
-            "description": "Execute a scheduled task once right now without changing its schedule (admin only)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Task name"}
-                },
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "read_memory",
             "description": "Read all Markdown memory files (MEMORY.md etc.) of this server",
             "parameters": {"type": "object", "properties": {}},
@@ -525,8 +451,6 @@ WHISPER_COMMAND = re.compile(
     r"^/?(?:tell|msg|whisper|w|pm|m|r)\s+(\S+)\s+(.+)$",
     re.IGNORECASE | re.DOTALL,
 )
-#: 定时任务的每日时刻格式（与 scheduler 插件一致：小时/分钟必须合法）
-SCHEDULE_TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 
 
 # ======================== 辅助函数 ========================
@@ -601,7 +525,6 @@ class LLMAgent(Plugin):
         self._conversation: list[dict] = []  # agent 对话上下文（system 之外的消息轮次）
         self._known_players: dict[str, tuple[str, str]] = {}  # 小写名 -> (UUID 字符串, 显示名)
         self._attention: dict[str, float] = {}  # 小写名 -> 注意窗口到期的单调时刻
-        self._scheduler_file_override: Path | None = None  # 测试注入用
         self._queue: asyncio.Queue | None = None
         self._worker_task: asyncio.Task | None = None
         self._settings_task: asyncio.Task | None = None
@@ -1319,8 +1242,10 @@ class LLMAgent(Plugin):
             if service.admin and not self._is_admin(self._requester):
                 return self._deny(self._requester, f"use {service.qualified}")
             try:
+                # 模型常自带 reason 之类的多余键，按声明的 schema 过滤掉，
+                # 插件因此不必给每个暴露函数都写 **kwargs。
                 result = await manager.call_service(
-                    service.qualified, **(arguments or {})
+                    service.qualified, **service.filter_arguments(arguments or {})
                 )
             except asyncio.CancelledError:
                 raise
@@ -1539,15 +1464,6 @@ class LLMAgent(Plugin):
                 f"Memory: {len(self._memory_files())} file(s) for {server_dir.name}"
             )
         lines.append(f"Generated plugins registered: {len(self._generated)}")
-        data, error = self._load_scheduler_tasks()
-        if error:
-            lines.append(f"Scheduled tasks: unavailable ({error})")
-        else:
-            tasks = data.get("tasks", [])
-            enabled = sum(1 for task in tasks if task.get("enabled", True))
-            lines.append(
-                f"Scheduled tasks: {len(tasks)} ({enabled} enabled)"
-            )
         return lines
 
     def _info_plugin_lines(self) -> list[str]:
@@ -1833,208 +1749,6 @@ class LLMAgent(Plugin):
         names = ", ".join(plugin.name for plugin in plugins)
         action = "reloaded" if loaded_here else "loaded"
         return f"Saved and {action} plugin(s): {names} ({target})"
-
-    # ---- 定时任务工具（操作 scheduler 插件的 scheduler.json） ----
-
-    def _scheduler_file(self) -> Path | None:
-        if self._scheduler_file_override is not None:
-            return self._scheduler_file_override
-        manager = self.manager
-        if manager is None:
-            return None
-        source = manager.source_of("scheduler")
-        if source is None:
-            return None
-        return source.parent / "scheduler.json"
-
-    def _load_scheduler_tasks(self) -> tuple[dict | None, str]:
-        """读 scheduler.json；返回 (data, 错误信息)。"""
-        file = self._scheduler_file()
-        if file is None:
-            return None, "Scheduler plugin not loaded"
-        if not file.exists():
-            return {"tasks": []}, ""
-        try:
-            data = json.loads(file.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            return None, f"Failed to read scheduler.json: {error}"
-        if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
-            return None, "scheduler.json has an invalid format"
-        return data, ""
-
-    def _save_scheduler_tasks(self, data: dict) -> str:
-        file = self._scheduler_file()
-        if file is None:
-            return "Scheduler plugin not loaded"
-        try:
-            file.parent.mkdir(parents=True, exist_ok=True)
-            file.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except OSError as error:
-            return f"Failed to write scheduler.json: {error}"
-        return ""  # scheduler 插件约 5 秒内自动重新加载
-
-    def _normalize_task_args(self, args: dict) -> tuple[dict, str]:
-        """校验并归一化一个任务的参数；返回 (任务, 错误信息)。"""
-        name = str(args.get("name") or "").strip()
-        if not name:
-            return {}, "Missing task name"
-        text = str(args.get("text") or "").strip()
-        action = str(args.get("action") or "chat")
-        if action not in ("chat", "command"):
-            return {}, "action must be chat or command"
-        interval = None
-        raw_interval = args.get("interval")
-        if raw_interval is not None and str(raw_interval) != "":
-            try:
-                interval = float(raw_interval)
-            except (TypeError, ValueError):
-                return {}, "interval must be a number (seconds)"
-            if interval < 5:
-                return {}, "interval must be at least 5 seconds"
-        time_value = str(args.get("time") or "").strip()
-        if time_value and not SCHEDULE_TIME_PATTERN.match(time_value):
-            return {}, "time must be HH:MM (24-hour, local)"
-        if interval is None and not time_value:
-            return {}, "Provide interval (seconds) and/or time (HH:MM)"
-        return {
-            "name": name,
-            "interval": interval,
-            "time": time_value or None,
-            "action": action,
-            "text": text,
-            "enabled": bool(args.get("enabled", True)),
-        }, ""
-
-    async def _tool_schedule_list(self, args: dict) -> str:
-        data, error = self._load_scheduler_tasks()
-        if error:
-            return error
-        tasks = data.get("tasks", [])
-        if not tasks:
-            return "No scheduled tasks"
-        lines: list[str] = []
-        for task in tasks:
-            when = (
-                f"every {task.get('interval')}s"
-                if task.get("interval")
-                else f"daily at {task.get('time')}"
-            )
-            status = "" if task.get("enabled", True) else " (disabled)"
-            lines.append(
-                f"- {task.get('name')}{status}: {task.get('action')} "
-                f"{when}: {task.get('text')}"
-            )
-        return "\n".join(lines)
-
-    async def _tool_schedule_add(self, args: dict) -> str:
-        if not self._is_admin(self._requester):
-            return self._deny(self._requester, "manage scheduled tasks")
-        task, error = self._normalize_task_args(args)
-        if error:
-            return error
-        data, error = self._load_scheduler_tasks()
-        if error:
-            return error
-        names = {str(existing.get("name")) for existing in data["tasks"]}
-        if task["name"] in names:
-            return f"Task already exists: {task['name']} (use schedule_set to modify)"
-        data["tasks"].append(task)
-        error = self._save_scheduler_tasks(data)
-        if error:
-            return error
-        return f"Scheduled task added: {task['name']} (takes effect within 5 s)"
-
-    async def _tool_schedule_set(self, args: dict) -> str:
-        if not self._is_admin(self._requester):
-            return self._deny(self._requester, "manage scheduled tasks")
-        name = str(args.get("name") or "").strip()
-        if not name:
-            return "Missing task name"
-        data, error = self._load_scheduler_tasks()
-        if error:
-            return error
-        for task in data["tasks"]:
-            if str(task.get("name")) != name:
-                continue
-            if "text" in args and str(args.get("text") or "").strip():
-                task["text"] = str(args["text"]).strip()
-            if "action" in args:
-                action = str(args.get("action"))
-                if action not in ("chat", "command"):
-                    return "action must be chat or command"
-                task["action"] = action
-            if "interval" in args:
-                raw_interval = args.get("interval")
-                if raw_interval is None or str(raw_interval) == "":
-                    task["interval"] = None
-                else:
-                    try:
-                        value = float(raw_interval)
-                    except (TypeError, ValueError):
-                        return "interval must be a number (seconds)"
-                    if value < 5:
-                        return "interval must be at least 5 seconds"
-                    task["interval"] = value
-            if "time" in args:
-                time_value = str(args.get("time") or "").strip()
-                if time_value and not SCHEDULE_TIME_PATTERN.match(time_value):
-                    return "time must be HH:MM"
-                task["time"] = time_value or None
-            if "enabled" in args:
-                task["enabled"] = bool(args.get("enabled"))
-            if task.get("interval") is None and not task.get("time"):
-                return "Task must keep an interval or a time"
-            error = self._save_scheduler_tasks(data)
-            if error:
-                return error
-            return f"Scheduled task updated: {name} (takes effect within 5 s)"
-        return f"Task not found: {name}"
-
-    async def _tool_schedule_remove(self, args: dict) -> str:
-        if not self._is_admin(self._requester):
-            return self._deny(self._requester, "manage scheduled tasks")
-        name = str(args.get("name") or "").strip()
-        if not name:
-            return "Missing task name"
-        data, error = self._load_scheduler_tasks()
-        if error:
-            return error
-        remaining = [
-            task for task in data["tasks"] if str(task.get("name")) != name
-        ]
-        if len(remaining) == len(data["tasks"]):
-            return f"Task not found: {name}"
-        data["tasks"] = remaining
-        error = self._save_scheduler_tasks(data)
-        if error:
-            return error
-        return f"Scheduled task removed: {name} (takes effect within 5 s)"
-
-    async def _tool_schedule_run(self, args: dict) -> str:
-        if not self._is_admin(self._requester):
-            return self._deny(self._requester, "manage scheduled tasks")
-        name = str(args.get("name") or "").strip()
-        if not name:
-            return "Missing task name"
-        data, error = self._load_scheduler_tasks()
-        if error:
-            return error
-        for task in data["tasks"]:
-            if str(task.get("name")) != name:
-                continue
-            bot = self.bot
-            if bot is None:
-                return "Not connected to a server"
-            text = str(task.get("text") or "")
-            if task.get("action") == "command":
-                await bot.send_command(text)
-                return f"Command executed: {text}"
-            await self._send_chat(text)
-            return f"Task {name} executed once"
-        return f"Task not found: {name}"
 
     # ---- 记忆工具（MEMORY.md 等 Markdown 文件） ----
 
