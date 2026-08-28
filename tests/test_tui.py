@@ -115,6 +115,26 @@ class FakeBot:
         self.sent_commands.append(command)
 
 
+class FakeManager:
+    """PluginManager stand-in: just the service lookup the TUI needs."""
+
+    def __init__(self, services: dict) -> None:
+        self._services = services
+
+    def get_service(self, qualified: str):
+        return self._services.get(qualified)
+
+    async def call_service(self, qualified: str, **kwargs):
+        handler = self._services[qualified]
+        result = handler(**kwargs)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    def load_order(self) -> list:
+        return []
+
+
 class FakeSession:
     """Session stand-in: run() blocks until request_stop(), like the real one."""
 
@@ -424,6 +444,69 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 any("未知命令" in line for line in app.log_lines)
             )
+        finally:
+            task.cancel()
+
+    async def test_dot_llm_without_the_plugin_says_so(self) -> None:
+        app, task = self._make_app(FakeSession(bot=None))  # manager=None
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press(*".llm 在吗", "enter")
+                await wait_until(
+                    lambda: any("未加载 llm_agent" in line for line in app.log_lines)
+                )
+        finally:
+            task.cancel()
+
+    async def test_dot_llm_calls_the_agent_and_prints_the_reply(self) -> None:
+        calls: list[dict] = []
+
+        async def console(text: str = "") -> str:
+            calls.append({"text": text})
+            return "在的，怎么了\n（第二行）"
+
+        manager = FakeManager({"llm_agent.console": console})
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        app = ProtoBotApp(FakeSession(bot=None), manager=manager, proxy=StdoutProxy())
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press(*".llm 在吗", "enter")
+                await wait_until(
+                    lambda: any("第二行" in line for line in app.log_lines)
+                )
+            self.assertEqual(calls, [{"text": "在吗"}])
+            # 提问与回复都留在日志区，多行回复逐行打印
+            self.assertTrue(any("> 在吗" in line for line in app.log_lines))
+            self.assertTrue(any("在的，怎么了" in line for line in app.log_lines))
+        finally:
+            task.cancel()
+
+    async def test_dot_llm_without_text_shows_usage(self) -> None:
+        manager = FakeManager({"llm_agent.console": lambda text="": "unused"})
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        app = ProtoBotApp(FakeSession(bot=None), manager=manager, proxy=StdoutProxy())
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press(*".llm", "enter")
+                await wait_until(
+                    lambda: any("用法" in line for line in app.log_lines)
+                )
+        finally:
+            task.cancel()
+
+    async def test_dot_llm_reports_a_failing_agent(self) -> None:
+        async def console(text: str = "") -> str:
+            raise RuntimeError("api key missing")
+
+        manager = FakeManager({"llm_agent.console": console})
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        app = ProtoBotApp(FakeSession(bot=None), manager=manager, proxy=StdoutProxy())
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press(*".llm 在吗", "enter")
+                await wait_until(
+                    lambda: any("调用失败" in line for line in app.log_lines)
+                )
         finally:
             task.cancel()
 

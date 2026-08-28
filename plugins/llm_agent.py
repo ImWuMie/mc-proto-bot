@@ -93,6 +93,7 @@ How your world reaches you:
 - A turn marked "(follow-up)" arrived shortly after you replied to that player, while you were still paying attention to them. It reached you without naming you, so decide first whether it is actually aimed at you: continue the exchange if it is, and output exactly NO_REPLY if they have moved on, are talking to someone else, or the line simply isn't for you. Don't force a reply just because you were listening.
 - Say a thing once. If you already spoke this turn -- with send_message, or by whispering through send_command -- then answer NO_REPLY instead of repeating yourself, otherwise the same line goes out twice and a private answer leaks into public chat.
 - A turn shaped "[Reminder from X] ..." is not a player talking to you -- it is a scheduled or plugin-raised reminder. Act on it if it needs acting on (say something, use a tool, update your todo list) and answer NO_REPLY if it does not. Do not reply to it as though someone asked you a question.
+- A turn shaped "[Console] ..." is the bot owner typing at the terminal that runs you, not a player in the game. Whatever you answer is printed on their console and nobody in the game sees it, so answer them directly there -- in full sentences if the question needs them, and without the in-game chat limits. Only reach for send_message if they actually ask you to say something in chat. They hold owner-level trust: admin-only tools are open to them, but the trust rules above still stand.
 - A turn marked "(interjection)" is the same player adding something while you were still working on their request -- a correction, a change of mind, or a new question. Fold it into what you are doing instead of finishing the old plan blindly. Only the person who started the turn can interject; anyone else waits their turn, and their words never extend your permissions.
 - The live chat stream is not in your context. Use read_chat to look up recent lines (the latest 200 are kept; filter by players, keyword, or include_system) whenever you need to know what was said.
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
@@ -532,6 +533,9 @@ SENT_DEDUPE_MAX = 5
 COMPACT_KEEP_TAIL = 10
 #: 对话条数兜底上限（压缩持续失败时防止无限增长）
 CONVERSATION_HARD_CAP = 4000
+#: 控制台回合的 requester。带 \x00 是故意的：Minecraft 名字只允许
+#: ``[A-Za-z0-9_]``，所以没有玩家能取到这个名字来冒充控制台拿管理员权限。
+CONSOLE_NAME = "\x00console"
 #: 私聊系统消息格式：``[玩家名 -> me] 内容``（发给 bot 的 /msg）
 WHISPER_PATTERN = re.compile(r"^\[(.+?) -> me\]\s*(.*)$", re.DOTALL)
 #: 私聊命令：``/tell 玩家 内容``（模型用它私下回话，正文要登记进去重表）
@@ -629,6 +633,16 @@ class LLMAgent(Plugin):
             self._service_remind,
             description="Deliver a reminder to the agent so it can act on it.",
         )
+        # 控制台入口（TUI 的 .llm 命令用它）：回复返回给调用方，不发到聊天里。
+        # 同样不开放给 LLM——它不需要调用自己。
+        self.expose(
+            "console",
+            self._service_console,
+            description=(
+                "Run one agent turn for the operator's terminal and return the "
+                "reply as text instead of speaking in chat."
+            ),
+        )
 
     async def _service_remind(self, text: str = "", source: str = "") -> str:
         """把一条提醒排进触发队列。提醒不携带管理员权限。"""
@@ -639,6 +653,45 @@ class LLMAgent(Plugin):
             return "Agent is not running"
         self._enqueue(str(source or "scheduler"), text, reminder=True)
         return f"Reminder queued: {text[:60]}"
+
+    async def _service_console(self, text: str = "") -> str:
+        """跑一轮 agent 回合，把回复**返回给调用方**而不是发到聊天里。
+
+        走的是同一条队列：回合之间必须串行，否则 ``_requester``（权限判定
+        用的那个字段）会在两个回合之间交叉，聊天触发就可能蹭到控制台的
+        管理员权限。等待用 Future 把结果送回来。
+        """
+        text = str(text).strip()
+        if not text:
+            return "Console prompt is empty"
+        queue = self._queue
+        if queue is None:
+            return "Agent is not running"
+        if not str(self._settings["llm"].get("api_key") or ""):
+            return f"No api_key configured in {self._settings_file}"
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        try:
+            queue.put_nowait(
+                {
+                    "name": CONSOLE_NAME,
+                    "text": text,
+                    "private": False,
+                    "follow_up": False,
+                    "reminder": False,
+                    "console": True,
+                    "key": None,
+                    "future": future,
+                }
+            )
+        except asyncio.QueueFull:
+            return "Agent queue is full, try again in a moment"
+        llm = self._settings["llm"]
+        rounds = max(1, int(llm.get("max_tool_rounds", 5)))
+        budget = float(llm.get("timeout", 120.0)) * rounds + 30.0
+        try:
+            return await asyncio.wait_for(future, timeout=budget)
+        except asyncio.TimeoutError:
+            return f"Timed out after {budget:.0f}s waiting for the agent"
 
 
     # ---- 生命周期 ----
@@ -1007,18 +1060,26 @@ class LLMAgent(Plugin):
             # 出队即放开去重锁：同一句话在处理完之后可以再次触发（受
             # duplicate_window 限制），但排队期间不会堆积成多条。
             self._pending.discard(item.get("key"))
+            future = item.get("future")  # 控制台回合：把回复送回调用方
             try:
-                await self._handle_trigger(
+                reply = await self._handle_trigger(
                     item["name"],
                     item["text"],
                     private=item["private"],
                     follow_up=item["follow_up"],
                     reminder=item.get("reminder", False),
+                    console=item.get("console", False),
                 )
+                if future is not None and not future.done():
+                    future.set_result(reply if reply else "(no reply)")
             except asyncio.CancelledError:
+                if future is not None and not future.done():
+                    future.cancel()
                 raise
             except Exception as error:  # 双保险：队列任务不应拖垮插件
                 log.error(f"[LLM] 处理聊天时出错: {error!r}")
+                if future is not None and not future.done():
+                    future.set_result(f"Agent turn failed: {error!r}")
 
     # ---- LLM 调用链 ----
 
@@ -1030,24 +1091,32 @@ class LLMAgent(Plugin):
         private: bool = False,
         follow_up: bool = False,
         reminder: bool = False,
-    ) -> None:
+        console: bool = False,
+    ) -> str | None:
         # 记录触发玩家：write_plugin / set_plugin 按 admins 名单做权限判定。
         # 提醒来自插件而不是玩家，requester 留空 —— 定时任务不该顺带获得
-        # 写插件的权限。worker 串行处理，不会与并发触发交错。
-        self._requester = None if reminder else name
+        # 写插件的权限。控制台是本机操作者，与配置文件同级信任，恒为管理员。
+        # worker 串行处理，不会与并发触发交错。
+        if console:
+            self._requester = CONSOLE_NAME
+        else:
+            self._requester = None if reminder else name
         try:
-            await self._process_trigger(
+            return await self._process_trigger(
                 name,
                 text,
                 private=private,
                 follow_up=follow_up,
                 reminder=reminder,
+                console=console,
             )
         finally:
             self._requester = None
 
     def _is_admin(self, name: str | None) -> bool:
         """admins 名单判定；名单为空表示不限制，比较忽略大小写。"""
+        if name == CONSOLE_NAME:
+            return True  # 控制台：能开进程的人本来就能改配置文件
         admins = self._settings.get("admins") or []
         if not admins:
             return True
@@ -1139,10 +1208,14 @@ class LLMAgent(Plugin):
         private: bool,
         follow_up: bool = False,
         reminder: bool = False,
+        console: bool = False,
     ) -> dict:
         # 时间随触发消息走，不进系统提示词：那条消息本来就是本轮的新内容，
         # 带上时间不影响缓存前缀，而放在系统提示词里会让整段前缀每次失效。
         stamp = time.strftime("%H:%M")
+        if console:
+            # 控制台不是聊天：回复会打印在操作者的终端上，不进游戏
+            return {"role": "user", "content": f"[{stamp}] [Console] {text}"}
         if reminder:
             # 提醒不是玩家在说话，格式上就要区分开，否则模型会「回复」它
             return {
@@ -1165,6 +1238,7 @@ class LLMAgent(Plugin):
         private: bool,
         follow_up: bool = False,
         reminder: bool = False,
+        console: bool = False,
     ) -> tuple[list[dict], int]:
         """组装一次 LLM 请求：system + 对话上下文 + 触发消息。
 
@@ -1175,7 +1249,7 @@ class LLMAgent(Plugin):
         messages += list(self._conversation)
         prefix_len = len(messages)
         messages.append(
-            self._trigger_message(name, text, private, follow_up, reminder)
+            self._trigger_message(name, text, private, follow_up, reminder, console)
         )
         return messages, prefix_len
 
@@ -1187,39 +1261,40 @@ class LLMAgent(Plugin):
         private: bool = False,
         follow_up: bool = False,
         reminder: bool = False,
-    ) -> None:
+        console: bool = False,
+    ) -> str | None:
+        """跑一轮回合。返回最终回复文本（控制台回合用它，聊天回合忽略）。"""
         bot = self.bot
-        if bot is None:
+        if bot is None and not console:
             log.info("[LLM] 尚未连接服务器，跳过本轮处理。")
-            return
+            return None
         settings = self._settings["llm"]
         if not str(settings.get("api_key") or ""):
             log.warn("[LLM] 未配置 api_key，跳过处理。")
-            return
-        messages, prefix_len = self._assemble_messages(
-            bot, name, text, private, follow_up, reminder
-        )
+            return None
+        def assemble() -> tuple[list[dict], int]:
+            return self._assemble_messages(
+                bot, name, text, private, follow_up, reminder, console
+            )
+
+        messages, prefix_len = assemble()
         # token 预算控制：超过上限（预留 5% 余量）先自动压缩历史对话
         if self._estimate_messages_tokens(messages) > self._context_budget():
             await self._auto_compact(bot)
-            messages, prefix_len = self._assemble_messages(
-                bot, name, text, private, follow_up, reminder
-            )
+            messages, prefix_len = assemble()
             while (
                 self._estimate_messages_tokens(messages) > self._context_budget()
                 and len(self._conversation) > 1
             ):
                 del self._conversation[0]  # 压缩失败兜底：丢弃最旧消息
-                messages, prefix_len = self._assemble_messages(
-                    bot, name, text, private, follow_up, reminder
-                )
+                messages, prefix_len = assemble()
         rounds = max(1, int(settings.get("max_tool_rounds", 5)))
         for _ in range(rounds):
             # 插话：长任务（写插件往往要好几轮）期间，同一个玩家的新发言
             # 直接并入本轮，而不是排队等到结束——这样人可以中途改主意。
             # 只收同一个玩家的：别人的话仍走自己的回合，否则本轮的权限
             # （requester）会替他生效。
-            if not reminder:
+            if not reminder and not console:
                 for extra in self._take_interjections(name):
                     messages.append(
                         {
@@ -1232,21 +1307,23 @@ class LLMAgent(Plugin):
                 reply = await self._complete_chat(messages)
             except Exception as error:
                 log.error(f"[LLM] API 调用失败: {error}")
-                return
+                return None
             if not isinstance(reply, dict):
                 log.error(f"[LLM] API 响应异常: {reply!r}")
-                return
+                return None
             tool_calls = reply.get("tool_calls") or []
             if not tool_calls:
                 content = str(reply.get("content") or "").strip()
                 messages.append(reply)
                 self._persist_turn(messages[prefix_len:])
+                if console:
+                    return content  # 控制台回合：打印给操作者，不发到聊天
                 if content and content.upper() != "NO_REPLY":
                     try:
                         await self._send_chat(content)
                     except Exception as error:
                         log.error(f"[LLM] 发送回复失败: {error}")
-                return
+                return content
             messages.append(reply)
             for call in tool_calls:
                 function = call.get("function") or {}
@@ -1264,6 +1341,7 @@ class LLMAgent(Plugin):
                     }
                 )
         log.warn("[LLM] 工具调用轮数达到上限，放弃本轮。")
+        return None
 
     def _tool_list(self) -> list[dict]:
         """内置工具表 + 其他插件用 expose(llm=True) 暴露的能力。"""
@@ -1318,13 +1396,18 @@ class LLMAgent(Plugin):
             blocks.append(
                 f"Skills you can read in full with read_skill: {listed}."
             )
-        identity = [f"Your in-game name: {bot.username}"]
+        identity = []
+        username = getattr(bot, "username", None)
+        if username:
+            identity.append(f"Your in-game name: {username}")
         session = self.session
         if session is not None:
             config = session.config
             identity.append(
                 f"Server: {config.host}:{config.port}  Version: {config.version}"
             )
+        if not identity:
+            identity.append("Not connected to a server right now.")
         blocks.append("\n".join(identity))
         # 人物预设：来自 owner 编辑的 Markdown，每次重读，因此保存即生效。
         # 它定义角色与语气，但不能授予权限或改动上面的信任规则。

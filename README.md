@@ -391,6 +391,13 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 }
 ```
 
+- **Talking to it from the console** — `.llm <text>` in the TUI runs one full
+  agent turn whose reply prints in the log area and **never goes to game
+  chat**; tools still work, so asking it to greet the server makes it call
+  `send_message`. The console counts as an **admin** (anyone who can start the
+  process can already edit the config), and its identity is an internal marker
+  no player name can match, so nobody in chat can impersonate it. With
+  `llm_agent` absent or disabled the command says so instead of doing nothing.
 - **Prompt caching** — the system prompt is sent as ordered content blocks,
   most stable first: the static prompt, then the skill list, then identity
   (name, server), the character sheet, memory, and the todo list. Nothing
@@ -621,6 +628,7 @@ while typing `.`:
 | `.run` | starts the bot |
 | `.stop` | stops the bot (keeps the UI) |
 | `.plugins` | lists loaded plugins |
+| `.llm <text>` | hands the text to the LLM agent; its reply prints in the log area instead of going to chat |
 | `.help` | shows available commands |
 | ↑ / ↓ | walks the input history (the line you were typing comes back) |
 

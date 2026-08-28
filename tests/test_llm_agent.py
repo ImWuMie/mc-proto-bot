@@ -1143,6 +1143,118 @@ class TodoTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ConsoleServiceTest(unittest.IsolatedAsyncioTestCase):
+    """llm_agent.console：TUI 的 .llm 命令走它，回复回到控制台而不是聊天。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot()
+        self.plugin._queue = asyncio.Queue()
+        self.plugin._settings["llm"]["api_key"] = "k"
+        self.plugin._worker_task = asyncio.ensure_future(self.plugin._worker())
+
+    async def asyncTearDown(self) -> None:
+        self.plugin._worker_task.cancel()
+        try:
+            await self.plugin._worker_task
+        except asyncio.CancelledError:
+            pass
+
+    def test_exposed_but_not_offered_to_the_llm(self) -> None:
+        exposed = {service.name: service for service in self.plugin.exposed()}
+        self.assertIn("console", exposed)
+        self.assertFalse(exposed["console"].llm)  # 它不需要调用自己
+
+    async def test_reply_comes_back_instead_of_going_to_chat(self) -> None:
+        fake = FakeLLM(assistant(content="在的，刚在挖矿"))
+        self.plugin._post_json = fake
+        result = await self.plugin._service_console(text="在吗")
+        self.assertEqual(result, "在的，刚在挖矿")
+        self.assertEqual(self.plugin.bot.sent_messages, [])  # 不发到游戏里
+
+    async def test_turn_is_labelled_as_console(self) -> None:
+        fake = FakeLLM(assistant(content="好"))
+        self.plugin._post_json = fake
+        await self.plugin._service_console(text="报告状态")
+        content = fake.calls[0][1]["messages"][1]["content"]
+        self.assertRegex(content, r"^\[\d\d:\d\d\] \[Console\] 报告状态$")
+
+    async def test_tools_still_run_and_can_speak_when_asked(self) -> None:
+        fake = FakeLLM(
+            assistant(tool_calls=[tool_call("send_message", {"text": "大家好"})]),
+            assistant(content="已经跟大家问好了"),
+        )
+        self.plugin._post_json = fake
+        result = await self.plugin._service_console(text="去跟大家问好")
+        self.assertEqual(self.plugin.bot.sent_messages, ["大家好"])
+        self.assertEqual(result, "已经跟大家问好了")
+
+    async def test_console_holds_admin_rights(self) -> None:
+        # 本机控制台与配置文件同级信任：名单里没有它也算管理员
+        self.plugin._settings["admins"] = ["someone_else"]
+        module = sys.modules[type(self.plugin).__module__]
+        self.assertTrue(self.plugin._is_admin(module.CONSOLE_NAME))
+
+    async def test_a_player_cannot_impersonate_the_console(self) -> None:
+        self.plugin._settings["admins"] = ["someone_else"]
+        for name in ("console", "Console", "[Console]", "\\x00console"):
+            self.assertFalse(self.plugin._is_admin(name), name)
+
+    async def test_admin_tool_is_allowed_from_the_console(self) -> None:
+        self.plugin._settings["admins"] = ["someone_else"]
+        fake = FakeLLM(
+            assistant(tool_calls=[tool_call("set_plugin", {"name": "nope"})]),
+            assistant(content="没有这个插件"),
+        )
+        self.plugin._post_json = fake
+        await self.plugin._service_console(text="关掉 nope 插件")
+        tool_result = [
+            m for m in fake.calls[1][1]["messages"] if m["role"] == "tool"
+        ][0]["content"]
+        self.assertNotIn("permission", tool_result.lower())  # 没被权限拦下
+
+    async def test_empty_prompt_rejected(self) -> None:
+        self.assertIn("empty", await self.plugin._service_console(text="  "))
+
+    async def test_without_a_running_agent(self) -> None:
+        self.plugin._queue = None
+        self.assertIn("not running", await self.plugin._service_console(text="x"))
+
+    async def test_without_an_api_key(self) -> None:
+        self.plugin._settings["llm"]["api_key"] = ""
+        self.assertIn("api_key", await self.plugin._service_console(text="x"))
+
+    async def test_works_while_disconnected(self) -> None:
+        # 服务器掉线时仍然可以在控制台问它话
+        self.plugin.bot = None
+        fake = FakeLLM(assistant(content="还没连上服务器"))
+        self.plugin._post_json = fake
+        self.assertEqual(
+            await self.plugin._service_console(text="连上了吗"), "还没连上服务器"
+        )
+
+    async def test_a_failing_turn_reports_back(self) -> None:
+        def boom(url, payload, headers, timeout):
+            raise RuntimeError("endpoint down")
+
+        self.plugin._post_json = boom
+        result = await self.plugin._service_console(text="在吗")
+        self.assertEqual(result, "(no reply)")  # 具体错误进日志，不静默挂住
+
+    async def test_the_turn_joins_the_conversation_history(self) -> None:
+        self.plugin._post_json = FakeLLM(assistant(content="好"))
+        await self.plugin._service_console(text="记住我叫操作员")
+        self.assertTrue(
+            self.plugin._conversation[0]["content"].endswith("[Console] 记住我叫操作员")
+        )
+
+    async def test_qualified_name_is_what_the_tui_looks_up(self) -> None:
+        exposed = {service.name: service for service in self.plugin.exposed()}
+        self.assertEqual(exposed["console"].qualified, "llm_agent.console")
+
+
 class RemindTest(unittest.IsolatedAsyncioTestCase):
     """llm_agent.remind：其他插件（定时任务）把提醒送进 agent。"""
 

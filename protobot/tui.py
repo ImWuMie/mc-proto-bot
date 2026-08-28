@@ -47,6 +47,7 @@ DOT_COMMANDS: dict[str, str] = {
     ".run": "启动 bot（连接服务器并开始运行）",
     ".stop": "停止 bot（保持界面）",
     ".plugins": "列出已加载插件",
+    ".llm": "把后面的内容交给 LLM 智能体，回复打印在这里",
     ".help": "显示可用命令",
 }
 
@@ -445,7 +446,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         # ---- dot commands ----
 
         def _run_dot_command(self, text: str) -> None:
-            name = text.split(" ", 1)[0]
+            name, _, argument = text.partition(" ")
             if name not in DOT_COMMANDS:
                 self._log_write(
                     f"[命令] 未知命令 {name}，输入 .help 查看可用命令。"
@@ -457,8 +458,43 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 self._command_stop()
             elif name == ".plugins":
                 self._command_plugins()
+            elif name == ".llm":
+                self._command_llm(argument)
             elif name == ".help":
                 self._command_help()
+
+        def _command_llm(self, argument: str) -> None:
+            """把内容交给 llm_agent 插件，回复写回日志区。
+
+            插件缺失或未启用时说清楚，而不是静默无反应——``llm_agent`` 是
+            可选插件，用户完全可能没装/禁用了它。
+            """
+            prompt = argument.strip()
+            if not prompt:
+                self._log_write("[LLM] 用法: .llm 要说的内容")
+                return
+            manager = self.manager
+            if manager is None or manager.get_service("llm_agent.console") is None:
+                self._log_write(
+                    "[LLM] 未加载 llm_agent 插件（或它已被禁用），无法调用。"
+                )
+                return
+            self._log_write(f"[LLM] > {prompt}")
+            asyncio.create_task(self._ask_llm(prompt), name="protobot-tui-llm")
+
+        async def _ask_llm(self, prompt: str) -> None:
+            manager = self.manager
+            try:
+                reply = await manager.call_service("llm_agent.console", text=prompt)
+            except Exception as error:
+                self._log_write(f"[LLM] 调用失败: {error}")
+                return
+            lines = str(reply).strip().splitlines()
+            if not lines:
+                self._log_write("[LLM] （无回复）")
+                return
+            for line in lines:
+                self._log_write(f"[LLM] {line}")
 
         def _command_run(self) -> None:
             if self.started:
