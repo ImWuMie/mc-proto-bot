@@ -439,5 +439,159 @@ class ProtoBotAppTest(unittest.IsolatedAsyncioTestCase):
             task.cancel()
 
 
+@unittest.skipUnless(TEXTUAL, "textual extra not installed")
+class AutostartTest(unittest.IsolatedAsyncioTestCase):
+    """配置齐全时进界面即自动 .run，不必手动敲。"""
+
+    async def test_autostart_runs_the_session(self) -> None:
+        session = FakeSession(bot=None)
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        app = ProtoBotApp(session, manager=None, proxy=StdoutProxy(), autostart=True)
+        try:
+            async with app.run_test():
+                await wait_until(lambda: session.run_calls == 1)
+                self.assertTrue(app.started)
+            self.assertTrue(
+                any("自动启动" in line for line in app.log_lines)
+            )
+        finally:
+            session.request_stop()
+            if app.session_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await app.session_task
+            task.cancel()
+
+    async def test_without_autostart_it_waits(self) -> None:
+        session = FakeSession(bot=None)
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        app = ProtoBotApp(session, manager=None, proxy=StdoutProxy())
+        try:
+            async with app.run_test():
+                self.assertEqual(session.run_calls, 0)
+                self.assertFalse(app.started)
+            self.assertTrue(
+                any(".run 启动" in line for line in app.log_lines)
+            )
+        finally:
+            task.cancel()
+
+
+@unittest.skipUnless(TEXTUAL, "textual extra not installed")
+class InputHistoryTest(unittest.IsolatedAsyncioTestCase):
+    """↑/↓ 翻输入历史，像 shell 一样。"""
+
+    def _make_app(self) -> tuple[ProtoBotApp, asyncio.Task]:
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        app = ProtoBotApp(FakeSession(bot=FakeBot()), manager=None, proxy=StdoutProxy())
+        return app, task
+
+    async def test_submissions_are_remembered(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press("h", "i", "enter")
+                await pilot.press("/", "s", "a", "y", " ", "x", "enter")
+                await pilot.press(".", "h", "e", "l", "p", "enter")
+            self.assertEqual(app.input_history, ["hi", "/say x", ".help"])
+        finally:
+            task.cancel()
+
+    async def test_up_walks_back_and_down_returns(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press("o", "n", "e", "enter")
+                await pilot.press("t", "w", "o", "enter")
+                box = app.query_one("#cmd")
+
+                await pilot.press("up")
+                self.assertEqual(box.value, "two")
+                await pilot.press("up")
+                self.assertEqual(box.value, "one")
+                await pilot.press("up")  # 已到最旧，保持不动
+                self.assertEqual(box.value, "one")
+
+                await pilot.press("down")
+                self.assertEqual(box.value, "two")
+                await pilot.press("down")
+                self.assertEqual(box.value, "")  # 回到空白新行
+        finally:
+            task.cancel()
+
+    async def test_draft_is_restored_by_down(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press("o", "l", "d", "enter")
+                await pilot.press("d", "r", "a", "f")  # 正在打字，未提交
+                box = app.query_one("#cmd")
+                await pilot.press("up")
+                self.assertEqual(box.value, "old")
+                await pilot.press("down")
+                self.assertEqual(box.value, "draf")  # 草稿回来了
+        finally:
+            task.cancel()
+
+    async def test_down_without_history_does_nothing(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                box = app.query_one("#cmd")
+                await pilot.press("a")
+                await pilot.press("down")
+                self.assertEqual(box.value, "a")
+                await pilot.press("up")  # 没有历史，也不该清空
+                self.assertEqual(box.value, "a")
+        finally:
+            task.cancel()
+
+    async def test_consecutive_duplicates_collapse(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press("h", "i", "enter")
+                await pilot.press("h", "i", "enter")
+                await pilot.press("y", "o", "enter")
+                await pilot.press("h", "i", "enter")
+            self.assertEqual(app.input_history, ["hi", "yo", "hi"])
+        finally:
+            task.cancel()
+
+    async def test_history_is_capped(self) -> None:
+        app, task = self._make_app()
+        app.history_limit = 3
+        try:
+            async with app.run_test():
+                for text in ("a", "b", "c", "d", "e"):
+                    app._remember(text)
+            self.assertEqual(app.input_history, ["c", "d", "e"])
+        finally:
+            task.cancel()
+
+    async def test_cursor_sits_at_the_end_of_a_recalled_line(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press("h", "e", "l", "l", "o", "enter")
+                await pilot.press("up")
+                box = app.query_one("#cmd")
+                self.assertEqual(box.cursor_position, len("hello"))
+        finally:
+            task.cancel()
+
+    async def test_submitting_a_recalled_line_resets_the_cursor(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press("h", "i", "enter")
+                await pilot.press("up", "enter")  # 重发历史里的那条
+                await wait_until(lambda: len(app.session.bot.sent_messages) == 2)
+                self.assertEqual(app.input_history, ["hi"])  # 连续重复不叠加
+                await pilot.press("up")
+                self.assertEqual(app.query_one("#cmd").value, "hi")
+        finally:
+            task.cancel()
+
+
 if __name__ == "__main__":
     unittest.main()

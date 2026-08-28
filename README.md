@@ -282,6 +282,9 @@ plugins:
   directory: "plugins"      # relative to this config file
   disabled: []              # e.g. ["hello_reply"]
   watch: true               # hot load/reload/close on file changes
+tui:
+  enabled: true             # full-screen interface in a real terminal
+  autostart: true           # connect on launch when credentials are ready
 ```
 
 The sign-in cache lives next to the config file (`auth_cache.json`), so `login`
@@ -500,16 +503,22 @@ while typing `.`:
 | --- | --- |
 | plain text | sends a chat message |
 | `/command` | runs a server command (e.g. `/say hi`) |
-| `.run` | starts the bot (the TUI starts with the bot stopped) |
+| `.run` | starts the bot |
 | `.stop` | stops the bot (keeps the UI) |
 | `.plugins` | lists loaded plugins |
 | `.help` | shows available commands |
+| ↑ / ↓ | walks the input history (the line you were typing comes back) |
 
+- **Autostart** — when the configuration is complete enough to connect
+  (offline mode always, online mode once `protobot login` has cached a token
+  that is valid or refreshable) the session starts by itself, so `.run` is
+  only needed after a `.stop` or when credentials are missing. Turn it off
+  with `[tui] autostart = false`.
 - **Real terminals** (Windows Terminal, VS Code terminal, macOS, Linux) get
   the full-screen UI; **Ctrl+C exits**.
 - **PyCharm consoles, pipes, and CI** fall back to plain line logging
-  automatically (the bot then auto-starts as before, no `.run` needed); a
-  missing extra prints a one-time hint and falls back too.
+  automatically (the bot auto-starts there too); a missing extra prints a
+  one-time hint and falls back as well.
 - Config switch: `[tui] enabled = false` turns it off entirely (default `true`).
 - **Plugin logging**: while the TUI runs, Textual swallows `print()` output —
   plugins should use `from protobot import log` with `log.info/warn/error/

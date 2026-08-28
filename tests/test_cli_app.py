@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -12,11 +14,14 @@ from unittest.mock import AsyncMock, patch
 
 from protobot.cli_app import (
     _parse_address,
+    credentials_ready,
     get_credentials,
     load_plugin_config,
     load_profile,
     load_session_config,
+    load_tui_autostart,
     main,
+    run_setup,
     save_profile,
 )
 from protobot.config import load_config, save_config
@@ -333,6 +338,102 @@ class Demo(Plugin):
         import run_bot  # the PyCharm entry point must survive the refactor
 
         self.assertTrue(callable(run_bot.main))
+
+
+class CredentialsReadyTest(unittest.TestCase):
+    """TUI 自动启动的前提：凭据是否已就绪。"""
+
+    def _config(self, *, online: bool) -> SessionConfig:
+        return SessionConfig(host="h", online_mode=online)
+
+    def test_offline_is_always_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "auth_cache.json"
+            self.assertTrue(credentials_ready(cache, self._config(online=False)))
+
+    def test_online_without_a_cache_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "auth_cache.json"
+            self.assertFalse(credentials_ready(cache, self._config(online=True)))
+
+    def test_online_with_a_fresh_token_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "auth_cache.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "name": "P",
+                        "uuid": str(uuid.uuid4()),
+                        "access_token": "t",
+                        "refresh_token": None,
+                        "expires_at": time.time() + 3600,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(credentials_ready(cache, self._config(online=True)))
+
+    def test_expired_token_with_a_refresh_token_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "auth_cache.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "name": "P",
+                        "uuid": str(uuid.uuid4()),
+                        "access_token": "t",
+                        "refresh_token": "r",
+                        "expires_at": 0.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(credentials_ready(cache, self._config(online=True)))
+
+    def test_expired_token_without_a_refresh_token_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "auth_cache.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "name": "P",
+                        "uuid": str(uuid.uuid4()),
+                        "access_token": "t",
+                        "refresh_token": None,
+                        "expires_at": 0.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(credentials_ready(cache, self._config(online=True)))
+
+    def test_corrupt_cache_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "auth_cache.json"
+            cache.write_text("not json", encoding="utf-8")
+            self.assertFalse(credentials_ready(cache, self._config(online=True)))
+
+
+class TuiAutostartConfigTest(unittest.TestCase):
+    def test_defaults_to_true(self) -> None:
+        self.assertTrue(load_tui_autostart({}))
+        self.assertTrue(load_tui_autostart({"tui": {}}))
+
+    def test_explicit_switch_wins(self) -> None:
+        self.assertFalse(load_tui_autostart({"tui": {"autostart": False}}))
+        self.assertTrue(load_tui_autostart({"tui": {"autostart": True}}))
+
+    def test_non_mapping_section_falls_back(self) -> None:
+        self.assertTrue(load_tui_autostart({"tui": "nope"}))
+
+    def test_wizard_writes_the_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            answers = iter(["1", "Bot", "example.com", "26.2"])
+            with patch("builtins.input", lambda *a: next(answers)):
+                run_setup(config)
+            data = load_config(config)
+            self.assertTrue(data["tui"]["autostart"])
 
 
 if __name__ == "__main__":

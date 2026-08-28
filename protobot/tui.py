@@ -5,7 +5,10 @@ a Claude-Code-style status bar at the very bottom (state glyph on the left,
 position in the middle, ``·``-separated hints and server info on the right).
 The input sends chat messages, ``/``-prefixed server commands, and dot-prefixed
 UI commands (``.run`` starts the bot, ``.stop`` stops it, ``.plugins``,
-``.help``) with a live suggestion dropdown while typing; Ctrl+C exits.
+``.help``) with a live suggestion dropdown while typing; ↑/↓ walk the input
+history and Ctrl+C exits.  When the configuration is complete enough to
+connect, the session starts on its own (``autostart``) instead of waiting for
+``.run``.
 
 The module imports Textual lazily so the plain-log fallback keeps working
 without the extra installed: :func:`tui_enabled` decides, and
@@ -160,9 +163,13 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
 
         # Textual 8 no longer quits on Ctrl+C (it shows a hint and binds
         # Ctrl+C to copy in inputs); the user wants Ctrl+C to exit, so bind it
-        # explicitly with priority over the Input's copy binding.
+        # explicitly with priority over the Input's copy binding.  Up/Down are
+        # bound with priority too so they reach the history instead of the
+        # Input's own cursor handling.
         BINDINGS = [
             Binding("ctrl+c", "quit", "退出", show=False, priority=True),
+            Binding("up", "history_prev", "上一条", show=False, priority=True),
+            Binding("down", "history_next", "下一条", show=False, priority=True),
         ]
 
         CSS = """
@@ -215,14 +222,24 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             proxy: StdoutProxy,
             *,
             log_drain_limit: int = 200,
+            autostart: bool = False,
+            history_limit: int = 200,
         ) -> None:
             super().__init__()
             self.session = session
             self.manager = manager
             self.proxy = proxy
             self.log_drain_limit = log_drain_limit
+            self.autostart = autostart
             self.session_task: asyncio.Task | None = None
             self.connected_at: float | None = None
+            # Input history, newest last; ``_history_index`` walks it and equals
+            # len(history) while the user is typing a fresh line, whose draft is
+            # kept so Down can restore it.
+            self.input_history: list[str] = []
+            self.history_limit = history_limit
+            self._history_index = 0
+            self._history_draft = ""
             # Headless audit trails: every log line and the last footer texts,
             # so tests (and debugging) never need Textual widget internals.
             self.log_lines: list[str] = []
@@ -262,7 +279,17 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self.set_interval(1.0, self._drain_logs)
             self.set_interval(1.0, self._refresh_status)
             self._refresh_status()
-            self._log_write("[提示] 输入 .run 启动 bot，.help 查看可用命令，Ctrl+C 退出。")
+            if self.autostart:
+                self._log_write(
+                    "[提示] 配置齐全，正在自动启动 bot"
+                    "（.stop 停止，↑/↓ 翻历史，.help 查看命令，Ctrl+C 退出）。"
+                )
+                self._command_run()
+            else:
+                self._log_write(
+                    "[提示] 输入 .run 启动 bot，↑/↓ 翻历史，"
+                    ".help 查看可用命令，Ctrl+C 退出。"
+                )
 
         # ---- session events (connection duration) ----
 
@@ -355,11 +382,52 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             event.input.clear()
             if not text:
                 return
+            self._remember(text)
             if text.startswith("."):
                 self._run_dot_command(text)
                 return
             kind, payload = classify_submission(text)
             asyncio.create_task(self._submit(kind, payload))
+
+        # ---- input history (↑/↓, shell style) ----
+
+        def _remember(self, text: str) -> None:
+            """Append to the history, skipping repeats of the previous entry."""
+            if not self.input_history or self.input_history[-1] != text:
+                self.input_history.append(text)
+                del self.input_history[: -self.history_limit]
+            self._history_index = len(self.input_history)
+            self._history_draft = ""
+
+        def _set_input(self, text: str) -> None:
+            try:
+                box = self.query_one("#cmd", Input)
+            except NoMatches:  # pragma: no cover - teardown race
+                return
+            box.value = text
+            box.cursor_position = len(text)
+
+        def action_history_prev(self) -> None:
+            """Older entry; the in-progress line is kept so Down can restore it."""
+            if not self.input_history or self._history_index == 0:
+                return
+            if self._history_index == len(self.input_history):
+                try:
+                    self._history_draft = self.query_one("#cmd", Input).value
+                except NoMatches:  # pragma: no cover - teardown race
+                    self._history_draft = ""
+            self._history_index -= 1
+            self._set_input(self.input_history[self._history_index])
+
+        def action_history_next(self) -> None:
+            """Newer entry, ending back on the draft the user was typing."""
+            if self._history_index >= len(self.input_history):
+                return
+            self._history_index += 1
+            if self._history_index == len(self.input_history):
+                self._set_input(self._history_draft)
+            else:
+                self._set_input(self.input_history[self._history_index])
 
         async def _submit(self, kind: str, payload: str) -> None:
             bot = self.session.bot  # re-read: reconnects replace the bot
@@ -437,7 +505,10 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self._log_write("[命令] 可用命令:")
             for name, description in DOT_COMMANDS.items():
                 self._log_write(f"  {name:<10s} {description}")
-            self._log_write("[提示] 普通文本 = 聊天消息；/命令 = 服务器命令；Ctrl+C 退出。")
+            self._log_write(
+                "[提示] 普通文本 = 聊天消息；/命令 = 服务器命令；"
+                "↑/↓ 翻输入历史；Ctrl+C 退出。"
+            )
 
 else:  # pragma: no cover - exercised on base installs
 

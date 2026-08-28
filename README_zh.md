@@ -268,6 +268,9 @@ plugins:
   directory: "plugins"      # 相对本配置文件所在目录
   disabled: []              # 例: ["hello_reply"]
   watch: true               # 监视插件目录，文件变化即热加载/热重载/热关闭
+tui:
+  enabled: true             # 真终端下启用全屏界面
+  autostart: true           # 凭据齐全时启动即连服
 ```
 
 正版登录的凭据缓存在配置文件旁边的 `auth_cache.json`，`login` 与 `run`
@@ -456,15 +459,20 @@ uv run protobot run              # 在真终端（Windows Terminal 等）中运�
 | --- | --- |
 | 普通文本 | 发送聊天消息 |
 | `/命令` | 执行服务器命令（如 `/say hi`） |
-| `.run` | 启动 bot（进入界面后 bot 默认不启动） |
+| `.run` | 启动 bot |
 | `.stop` | 停止 bot（保持界面） |
 | `.plugins` | 列出已加载插件 |
 | `.help` | 显示可用命令 |
+| ↑ / ↓ | 翻输入历史（正在打的那行会原样回来） |
 
+- **自动启动**：配置齐全到能直接连（离线模式始终齐全；正版模式需要
+  `protobot login` 缓存过、且令牌未过期或还能续期）时，会话会自己启动，
+  `.run` 只在 `.stop` 之后或缺凭据时才需要。用 `[tui] autostart = false`
+  可关闭。
 - **真终端**（Windows Terminal / VS Code 终端 / macOS / Linux）自动启用
   全屏界面，**Ctrl+C 退出**。
-- **PyCharm 控制台、管道、CI** 自动降级为普通逐行日志（此时 bot 照常
-  自动启动，无需 `.run`）；未安装 extra 时会打印一次提示并同样降级。
+- **PyCharm 控制台、管道、CI** 自动降级为普通逐行日志（bot 同样自动启动）；
+  未安装 extra 时会打印一次提示并同样降级。
 - 配置开关：`[tui] enabled = false` 可彻底关闭（默认 `true`）。
 - **插件日志**：TUI 运行期间 Textual 会吞掉 `print()` 输出——插件应使用
   `from protobot import log` 的 `log.info/warn/error/debug(...)`（调用格式

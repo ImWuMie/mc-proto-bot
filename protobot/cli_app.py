@@ -33,11 +33,13 @@ from .tui import ProtoBotApp, StdoutProxy, tui_enabled
 DEFAULT_CONFIG = Path("config.yaml")
 
 __all__ = [
+    "credentials_ready",
     "get_credentials",
     "list_plugins",
     "load_plugin_config",
     "load_profile",
     "load_session_config",
+    "load_tui_autostart",
     "load_tui_config",
     "main",
     "run_bot_session",
@@ -108,6 +110,30 @@ def load_tui_config(data: dict) -> bool:
     """从 config.yaml 读取 [tui] enabled（缺省 True）。"""
     tui = data.get("tui", {})
     return bool(tui.get("enabled", True)) if isinstance(tui, dict) else True
+
+
+def load_tui_autostart(data: dict) -> bool:
+    """从 config.yaml 读取 [tui] autostart（缺省 True）。
+
+    为真时，只要凭据齐全，TUI 一进界面就自动执行 .run，不必手动敲。
+    """
+    tui = data.get("tui", {})
+    return bool(tui.get("autostart", True)) if isinstance(tui, dict) else True
+
+
+def credentials_ready(cache_file: Path, session_config: SessionConfig) -> bool:
+    """连接所需的凭据是否已就绪（决定 TUI 能否自动启动）。
+
+    离线模式永远就绪；正版模式需要本地缓存，且令牌未过期或还能续期——
+    否则 ``get_credentials`` 会抛 SystemExit，不该自动去撞这个错误。
+    """
+    if not session_config.online_mode:
+        return True
+    loaded = load_profile(cache_file)
+    if loaded is None:
+        return False
+    profile, _ = loaded
+    return not profile.expired or bool(profile.refresh_token)
 
 
 # ======================== 凭据缓存（与旧 login.py / run_bot.py 同格式） ========================
@@ -320,7 +346,7 @@ def run_setup(config_path: Path) -> int:
             "reconnect_max_attempts": None,
         },
         "plugins": {"directory": "plugins", "disabled": [], "watch": True},
-        "tui": {"enabled": True},
+        "tui": {"enabled": True, "autostart": True},
     }
     save_config(config_path, data)
 
@@ -442,7 +468,14 @@ async def run_bot_session(args: argparse.Namespace) -> int:
             # 代理队列进入日志区；会话由界面内的 .run 命令启动，UI 退出
             # （Ctrl+C）→ request_stop + 等待会话优雅结束。
             proxy = StdoutProxy()
-            app = ProtoBotApp(session, manager, proxy)
+            ready = credentials_ready(cache_file, session_config)
+            autostart = load_tui_autostart(data) and ready
+            if not ready:
+                print(
+                    "[提示] 未找到可用的正版凭据，bot 不会自动启动。"
+                    "请先运行 protobot login，或在界面里输入 .run 重试。"
+                )
+            app = ProtoBotApp(session, manager, proxy, autostart=autostart)
             await manager.enable_all()
             set_sink(lambda line: proxy.write(line + "\n"))
             try:
