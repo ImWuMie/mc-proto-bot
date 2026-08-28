@@ -456,16 +456,11 @@ async def run_bot_session(args: argparse.Namespace) -> int:
 
     watcher = PluginWatcher(manager) if plugin_config.watch else None
     watcher_task: asyncio.Task | None = None
-    if watcher is not None:
-        watcher_task = asyncio.create_task(
-            watcher.run(), name="protobot-plugin-watcher"
-        )
-        print("[插件] 热更新监视已启动（编辑 plugins/ 下的文件即生效）。")
     try:
         if tui_enabled(load_tui_config(data)):
             # 单事件循环：Textual App 与 session 任务共存。Textual 运行期会
             # 捕获 stdout（print 会丢失），因此 protobot.log 的 sink 直连
-            # 代理队列进入日志区；会话由界面内的 .run 命令启动，UI 退出
+            # 代理队列进入日志区；配置齐全时界面一起来就自动 .run，UI 退出
             # （Ctrl+C）→ request_stop + 等待会话优雅结束。
             proxy = StdoutProxy()
             ready = credentials_ready(cache_file, session_config)
@@ -477,6 +472,7 @@ async def run_bot_session(args: argparse.Namespace) -> int:
                 )
             app = ProtoBotApp(session, manager, proxy, autostart=autostart)
             await manager.enable_all()
+            watcher_task = _start_watcher(watcher)
             set_sink(lambda line: proxy.write(line + "\n"))
             try:
                 await app.run_async()
@@ -485,17 +481,42 @@ async def run_bot_session(args: argparse.Namespace) -> int:
                 if app.session_task is not None:
                     await app.session_task
                 set_sink(None)  # 恢复 print 路由
+                await _stop_watcher(watcher, watcher_task)
+                watcher_task = None
                 await manager.disable_all()
         else:
             container = BotContainer(plugin_manager=manager)
             container.add_session("default", session)
+            # 容器自己负责 enable_all/disable_all，监视器只需覆盖运行期间
+            watcher_task = _start_watcher(watcher)
             await container.run()
     finally:
-        if watcher is not None:
-            watcher.request_stop()
-            if watcher_task is not None:
-                await watcher_task
+        await _stop_watcher(watcher, watcher_task)
     return 0
+
+
+def _start_watcher(watcher: PluginWatcher | None) -> asyncio.Task | None:
+    """插件热更新监视：必须在 enable_all 之后才启动。
+
+    否则监视器可能在 enable_all 之前就热加载某个插件，enable_all 再对同一
+    实例调一次 on_enable——插件里 on_enable 创建的任务会多出一份，而
+    on_disable 只取消它自己记住的那一个。
+    """
+    if watcher is None:
+        return None
+    task = asyncio.create_task(watcher.run(), name="protobot-plugin-watcher")
+    print("[插件] 热更新监视已启动（编辑插件目录下的文件即生效）。")
+    return task
+
+
+async def _stop_watcher(
+    watcher: PluginWatcher | None, task: asyncio.Task | None
+) -> None:
+    """停掉监视器；必须早于 disable_all，否则关闭期间的改动会又启用插件。"""
+    if watcher is None or task is None:
+        return
+    watcher.request_stop()
+    await task
 
 
 def list_plugins(args: argparse.Namespace) -> int:

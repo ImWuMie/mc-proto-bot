@@ -390,6 +390,7 @@ class PluginManager:
         self._files: dict[Path, list[str]] = {}
         self._order: list[Plugin] = []
         self._services: dict[str, ExposedFunction] = {}
+        self._mtimes: dict[Path, float] = {}
         self._counter = 0
         self._current_bot: Bot | None = None
         self._current_session: BotSession | None = None
@@ -405,10 +406,12 @@ class PluginManager:
         self._plugins = {}
         self._sources = {}
         self._files = {}
+        self._mtimes = {}
         for directory in self._directories:
             if not directory.is_dir():
                 continue
             for file in sorted(directory.glob("*.py")):
+                self._record_mtime(file)
                 for plugin in self._instantiate_file(file):
                     if plugin.name in self._plugins:
                         raise PluginError(
@@ -470,6 +473,27 @@ class PluginManager:
     def plugins(self) -> dict[str, Plugin]:
         """All loaded plugins by name, including disabled ones."""
         return self._plugins
+
+    @property
+    def directories(self) -> list[Path]:
+        """The scanned plugin directories (the watcher polls exactly these)."""
+        return list(self._directories)
+
+    def file_mtimes(self) -> dict[Path, float]:
+        """Modification times as of the last load of each file, by the manager.
+
+        :class:`PluginWatcher` diffs against this instead of a private snapshot,
+        so a reload the manager performed itself (``patch_plugin``,
+        ``set_enabled``) is not seen as an external change and reloaded a second
+        time a moment later.
+        """
+        return self._mtimes
+
+    def _record_mtime(self, file: Path) -> None:
+        try:
+            self._mtimes[file] = file.stat().st_mtime
+        except OSError:
+            self._mtimes.pop(file, None)
 
     def source_of(self, name: str) -> Path | None:
         """The file a plugin was discovered from, for the ``plugins`` listing."""
@@ -599,6 +623,7 @@ class PluginManager:
         for plugin in new_plugins:
             self._sources[plugin.name] = file
             self._files.setdefault(file, []).append(plugin.name)
+        self._record_mtime(file)
         await self._apply_order(new_order)
         return new_plugins
 
@@ -633,6 +658,7 @@ class PluginManager:
         for plugin in new_plugins:
             self._sources[plugin.name] = file
         self._files[file] = [plugin.name for plugin in new_plugins]
+        self._record_mtime(file)
         await self._apply_order(new_order)
         return new_plugins
 
@@ -667,29 +693,48 @@ class PluginManager:
 
     async def hot_close_file(self, file: Path) -> list[str]:
         """Hot-close every plugin loaded from a file (and their dependents)."""
-        names = list(self._files.get(Path(file), []))
+        file = Path(file)
+        names = list(self._files.get(file, []))
         closed: list[str] = []
         for name in names:
             if await self.hot_close(name) is not None:
                 closed.append(name)
+        # 文件已不在（或被主动卸载）：从加载记录里去掉，否则监视器每轮都会
+        # 把它当成「刚被删除」再关一次。
+        self._mtimes.pop(file, None)
+        self._files.pop(file, None)
         return closed
 
     async def set_enabled(self, name: str, enabled: bool) -> Plugin | None:
         """Runtime enable/disable toggle (used by plugins such as llm_agent).
 
-        Enabling re-loads the plugin from its recorded source file (a previous
-        ``hot_close`` keeps the source in ``_sources``); disabling goes through
-        :meth:`hot_close`, so plugins depending on it close too.  Returns the
-        target plugin, or ``None`` if no plugin had that name; a failed load
-        raises :class:`PluginError` and leaves the manager unchanged.
+        Disabling records the name in the manager's disabled set and re-resolves
+        the graph, so the instance stays loaded but stops running (and its
+        dependents stop with it, as with a config-disabled plugin).  Keeping it
+        in ``plugins`` is what makes it visible to :meth:`disabled_names`, and
+        keeping it in ``_disabled`` is what stops a later reload of its file --
+        by the watcher, or by an editor save -- from quietly starting it again.
+
+        Returns the target plugin, or ``None`` if the name is unknown; a failed
+        load raises :class:`PluginError` and leaves the manager unchanged.
         """
+        plugin = self._plugins.get(name)
         if enabled:
-            source = self._sources.get(name)
-            if source is None:
+            self._disabled.discard(name)
+            if plugin is None:
+                source = self._sources.get(name)
+                if source is None:
+                    return None
+                await self.hot_load_file(source)  # 已被 hot_close 卸载过
+                return self._plugins.get(name)
+        else:
+            if plugin is None:
                 return None
-            await self.hot_load_file(source)
-            return self._plugins.get(name)
-        return await self.hot_close(name)
+            self._disabled.add(name)
+        await self._apply_order(
+            resolve_load_order(self._plugins, self._disabled)
+        )
+        return self._plugins.get(name)
 
     # ---- internals ----
 
@@ -704,14 +749,24 @@ class PluginManager:
         if self._current_session is not None:
             plugin._bind_session(self._current_session)
         await self._safe_hook(plugin, "on_enable", plugin.on_enable())
+        if self._current_bot is not None:
+            # 中途启用（热加载/热重载/set_enabled）时也要给一次 on_bot_ready：
+            # 它承诺「每只 bot 一次」，否则插件里按连接初始化的代码要等到
+            # 下次重连才跑，而代码本身完全正确，极难排查。
+            await self._safe_hook(
+                plugin, "on_bot_ready", plugin.on_bot_ready()
+            )
 
     async def _disable_one(self, plugin: Plugin) -> None:
-        await self._safe_hook(plugin, "on_disable", plugin.on_disable())
+        # 先摘掉入口再跑钩子：on_disable 里几乎都要 await（取消任务），
+        # 期间事件循环会继续派发事件、别的插件也可能调用它的服务，
+        # 而这个实例已经在退场——旧实例会做出「已经停了」之后的动作。
         self._withdraw_services(plugin)
         if self._current_bot is not None:
             plugin._unbind(self._current_bot)
         if self._current_session is not None:
             plugin._unbind_session(self._current_session)
+        await self._safe_hook(plugin, "on_disable", plugin.on_disable())
         plugin.bot = None
         plugin.session = None
         plugin.manager = None
@@ -752,28 +807,20 @@ class PluginWatcher:
     hot-closed.  A broken edit (syntax error, bad dependencies) is logged and
     retried on the next change; the running plugins are never taken down by a
     failed reload.
+
+    The comparison baseline is the manager's own ``file_mtimes()``, not a
+    private snapshot: a reload the manager did itself (``patch_plugin``,
+    ``set_enabled``) updates that map, so the watcher will not reload the same
+    file again a moment later and throw away the fresh instance's state.
     """
 
     def __init__(self, manager: PluginManager, *, interval: float = 1.0) -> None:
         self._manager = manager
         self._interval = interval
         self._stop = asyncio.Event()
-        self._mtimes: dict[Path, float] = {}
-        self._snapshot()
 
     def request_stop(self) -> None:
         self._stop.set()
-
-    def _snapshot(self) -> None:
-        self._mtimes = {}
-        for directory in self._manager._directories:
-            if not directory.is_dir():
-                continue
-            for file in sorted(directory.glob("*.py")):
-                try:
-                    self._mtimes[file] = file.stat().st_mtime
-                except OSError:
-                    continue
 
     async def run(self) -> None:
         while not self._stop.is_set():
@@ -788,9 +835,9 @@ class PluginWatcher:
                 pass
 
     async def check_once(self) -> None:
-        """One diff of the directories against the last snapshot.  Testable."""
+        """One diff of the directories against the manager's load times."""
         snapshot: dict[Path, float] = {}
-        for directory in self._manager._directories:
+        for directory in self._manager.directories:
             if not directory.is_dir():
                 continue
             for file in sorted(directory.glob("*.py")):
@@ -798,13 +845,14 @@ class PluginWatcher:
                     snapshot[file] = file.stat().st_mtime
                 except OSError:
                     continue
-        known = set(self._mtimes)
+        loaded = self._manager.file_mtimes()
+        known = set(loaded)
         current = set(snapshot)
         for file in sorted(current - known):  # new file -> hot load
             await self._manager.hot_load_file(file)
         for file in sorted(known - current):  # deleted file -> hot close
             await self._manager.hot_close_file(file)
         for file in sorted(known & current):
-            if self._mtimes[file] != snapshot[file]:  # changed -> hot reload
+            if loaded[file] != snapshot[file]:  # changed -> hot reload
                 await self._manager.hot_reload_file(file)
         self._mtimes = snapshot

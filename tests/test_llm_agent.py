@@ -864,13 +864,17 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
                 "set_plugin", {"name": "temp_a", "enabled": False}
             )
             self.assertIn("disabled", result)
-            self.assertNotIn("temp_a", self.manager.plugins)
+            # 实例仍在 plugins 里（因此可见），但已停止运行
+            self.assertIn("temp_a", self.manager.disabled_names())
+            self.assertNotIn(
+                "temp_a", [p.name for p in self.manager.load_order()]
+            )
 
             result = await self.plugin._run_tool(
                 "set_plugin", {"name": "temp_a", "enabled": True}
             )
             self.assertIn("enabled", result)
-            self.assertIn("temp_a", self.manager.plugins)
+            self.assertIn("temp_a", [p.name for p in self.manager.load_order()])
 
     async def test_set_plugin_unknown_name(self) -> None:
         result = await self.plugin._run_tool(
@@ -1424,19 +1428,46 @@ class TokenEstimateTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ManagerSetEnabledTest(unittest.IsolatedAsyncioTestCase):
-    async def test_close_and_reopen_keeps_source(self) -> None:
+    async def test_disable_keeps_it_loaded_but_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "a.py").write_text(TEMP_PLUGIN_SRC, encoding="utf-8")
             manager = PluginManager([Path(tmp)])
             manager.discover()
-            self.assertIn("temp_a", manager.plugins)
-            closed = await manager.set_enabled("temp_a", False)
-            self.assertIsNotNone(closed)
-            self.assertNotIn("temp_a", manager.plugins)
-            restored = await manager.set_enabled("temp_a", True)
-            self.assertIsNotNone(restored)
-            self.assertIn("temp_a", manager.plugins)
-            self.assertIsNotNone(manager.source_of("temp_a"))
+            await manager.enable_all()
+            try:
+                closed = await manager.set_enabled("temp_a", False)
+                self.assertIsNotNone(closed)
+                self.assertIn("temp_a", manager.plugins)  # 仍可见
+                self.assertIn("temp_a", manager.disabled_names())
+                self.assertEqual(manager.load_order(), [])
+                restored = await manager.set_enabled("temp_a", True)
+                self.assertIsNotNone(restored)
+                self.assertEqual(
+                    [p.name for p in manager.load_order()], ["temp_a"]
+                )
+                self.assertIsNotNone(manager.source_of("temp_a"))
+            finally:
+                await manager.disable_all()
+
+    async def test_a_reload_does_not_resurrect_a_disabled_plugin(self) -> None:
+        # 线上隐患：管理员关掉插件后，任何一次保存（编辑器、patch_plugin）
+        # 都会让监视器把它重新启用，而且没有任何日志说明。
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "a.py"
+            file.write_text(TEMP_PLUGIN_SRC, encoding="utf-8")
+            manager = PluginManager([Path(tmp)])
+            manager.discover()
+            await manager.enable_all()
+            try:
+                await manager.set_enabled("temp_a", False)
+                file.write_text(
+                    TEMP_PLUGIN_SRC + "\n# touched\n", encoding="utf-8"
+                )
+                await manager.hot_reload_file(file)
+                self.assertEqual(manager.load_order(), [])  # 依然停着
+                self.assertIn("temp_a", manager.disabled_names())
+            finally:
+                await manager.disable_all()
 
     async def test_unknown_name_returns_none(self) -> None:
         manager = PluginManager([])

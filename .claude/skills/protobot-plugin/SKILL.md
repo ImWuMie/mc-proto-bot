@@ -99,7 +99,11 @@ mod-loader events; ordinary plugins do not need them.
    per spawned bot after binding.
 3. **Own the tasks you create in `on_enable`**: they outlive individual bots;
    cancel them in `on_disable` (the framework never cancels plugin tasks).
-   `on_enable` / `on_disable` run once per process each.
+   `on_enable` / `on_disable` run once per process each. By the time
+   `on_disable` runs, your event handlers are already unbound and your exposed
+   functions already withdrawn, so nothing new arrives while you await.
+   `on_bot_ready` fires once per bot — including when your plugin is enabled
+   or hot-reloaded while a bot is already connected.
 4. **Hot reload means a fresh instance**: saving a file hot-reloads it
    (`[plugins] watch`, on by default) — the old instance's `on_disable` and the
    new instance's `on_enable` both run again; deleting a file hot-closes it
@@ -185,6 +189,15 @@ class Fishing(Plugin):
   list. Nothing needs changing in `llm_agent.py`.
 - **Introspection**: `manager.services()`, `manager.get_service(qualified)`,
   `manager.llm_services()`.
+- **`admin` is metadata, not enforcement**: `call_service` does not check it.
+  It tells agent-style callers (llm_agent) to refuse the function for
+  non-admins; a plugin calling `self.call(...)` is trusted code and gets
+  through regardless.
+- **Arguments from a model are filtered**: the LLM path passes only the keys
+  your `parameters` schema declares, so a model inventing a `reason` field
+  cannot break your signature. Declare the parameters you accept and write a
+  normal signature — no `**kwargs` needed. Plugin-to-plugin calls are strict,
+  so a wrong keyword there raises.
 
 ## Pre-delivery checklist
 

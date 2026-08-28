@@ -817,5 +817,151 @@ class ExposedFunctionTest(unittest.IsolatedAsyncioTestCase):
                 await manager.disable_all()
 
 
+class LifecycleOrderTest(unittest.IsolatedAsyncioTestCase):
+    """启用/停用的顺序契约：中途启用要给 on_bot_ready，停用要先摘入口。"""
+
+    SOURCE = (
+        "from protobot import Plugin\n\n"
+        "class Tracked(Plugin):\n"
+        '    name = "tracked"\n\n'
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.events_seen = []\n"
+        "        self.hooks = []\n"
+        "        self.bound_during_disable = None\n"
+        "        self.service_during_disable = None\n"
+        '        self.subscribe("player_chat", self._on_chat)\n'
+        '        self.expose("ping", self._ping)\n\n'
+        "    async def on_bot_ready(self):\n"
+        '        self.hooks.append("on_bot_ready")\n\n'
+        "    async def on_enable(self):\n"
+        '        self.hooks.append("on_enable")\n\n'
+        "    async def on_disable(self):\n"
+        '        self.hooks.append("on_disable")\n'
+        "        # 停用期间：事件应已解绑，服务应已撤回\n"
+        "        self.bound_during_disable = bool(\n"
+        '            self.bot and self.bot.events._handlers.get("player_chat")\n'
+        "        )\n"
+        "        self.service_during_disable = (\n"
+        '            self.manager.get_service("tracked.ping") is not None\n'
+        "        )\n\n"
+        "    async def _on_chat(self, *args):\n"
+        '        self.events_seen.append("chat")\n\n'
+        "    async def _ping(self):\n"
+        '        return "pong"\n'
+    )
+
+    async def test_mid_session_enable_fires_on_bot_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = PluginManager([])
+            await manager.enable_all()
+            bot = FakeBot()
+            await manager.bind_all(bot)
+            file = Path(tmp) / "tracked.py"
+            file.write_text(self.SOURCE, encoding="utf-8")
+            try:
+                await manager.hot_load_file(file)
+                plugin = manager.plugins["tracked"]
+                # 已经连着 bot 时热加载，也必须收到 on_bot_ready
+                self.assertEqual(
+                    plugin.hooks, ["on_enable", "on_bot_ready"]
+                )
+            finally:
+                await manager.disable_all()
+
+    async def test_no_on_bot_ready_without_a_bot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "tracked.py"
+            file.write_text(self.SOURCE, encoding="utf-8")
+            manager = PluginManager([Path(tmp)])
+            manager.discover()
+            await manager.enable_all()
+            try:
+                self.assertEqual(
+                    manager.plugins["tracked"].hooks, ["on_enable"]
+                )
+            finally:
+                await manager.disable_all()
+
+    async def test_disable_unbinds_before_running_the_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "tracked.py"
+            file.write_text(self.SOURCE, encoding="utf-8")
+            manager = PluginManager([Path(tmp)])
+            manager.discover()
+            await manager.enable_all()
+            bot = FakeBot()
+            await manager.bind_all(bot)
+            plugin = manager.plugins["tracked"]
+            await manager.disable_all()
+            # on_disable 里会 await；那时事件必须已解绑、服务已撤回，
+            # 否则退场中的实例还会收到事件、还会被别的插件调用。
+            self.assertIn("on_disable", plugin.hooks)
+            self.assertFalse(plugin.bound_during_disable)
+            self.assertFalse(plugin.service_during_disable)
+
+
+class WatcherBaselineTest(unittest.IsolatedAsyncioTestCase):
+    """监视器以管理器的加载时间为基准，自己触发的重载不再被重复处理。"""
+
+    SOURCE = (
+        "from protobot import Plugin\n\n"
+        "class Counted(Plugin):\n"
+        '    name = "counted"\n'
+    )
+
+    async def test_manager_reload_is_not_reloaded_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "counted.py"
+            file.write_text(self.SOURCE, encoding="utf-8")
+            manager = PluginManager([Path(tmp)])
+            manager.discover()
+            await manager.enable_all()
+            watcher = PluginWatcher(manager)
+            try:
+                first = manager.plugins["counted"]
+                file.write_text(self.SOURCE + "\n# edit\n", encoding="utf-8")
+                await manager.hot_reload_file(file)  # patch_plugin 走这条路
+                second = manager.plugins["counted"]
+                self.assertIsNot(first, second)
+                await watcher.check_once()  # 不应再换一次实例
+                self.assertIs(manager.plugins["counted"], second)
+            finally:
+                await manager.disable_all()
+
+    async def test_external_edits_are_still_picked_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "counted.py"
+            file.write_text(self.SOURCE, encoding="utf-8")
+            manager = PluginManager([Path(tmp)])
+            manager.discover()
+            await manager.enable_all()
+            watcher = PluginWatcher(manager)
+            try:
+                first = manager.plugins["counted"]
+                manager.file_mtimes()[file] -= 1.0  # 模拟外部改动
+                await watcher.check_once()
+                self.assertIsNot(manager.plugins["counted"], first)
+            finally:
+                await manager.disable_all()
+
+    async def test_deleted_file_is_closed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "counted.py"
+            file.write_text(self.SOURCE, encoding="utf-8")
+            manager = PluginManager([Path(tmp)])
+            manager.discover()
+            await manager.enable_all()
+            watcher = PluginWatcher(manager)
+            try:
+                file.unlink()
+                await watcher.check_once()
+                self.assertNotIn("counted", manager.plugins)
+                self.assertNotIn(file, manager.file_mtimes())
+                await watcher.check_once()  # 第二轮不该再处理它
+            finally:
+                await manager.disable_all()
+
+
 if __name__ == "__main__":
     unittest.main()
