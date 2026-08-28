@@ -348,11 +348,16 @@ class HelloReply(Plugin):
   "admins": ["你的名字"],       // 只有管理员能写插件/开关插件（[] = 不限制）
   "system_prompt": "...",       // 可选，覆盖内置提示词
   "history_limit": 200,         // read_chat 保留的聊天条数
+  "persona_file": "llm_agent_persona.md",
   "memory_dir": "llm_agent_memory",
   "generated_dir": "../plugins_llm"
 }
 ```
 
+- **人物预设**：`plugins/llm_agent_persona.md`（首次运行生成模板）是自由撰写
+  的 Markdown 角色设定——性格、经历、喜好、说话习惯。每次构建提示词时都会
+  重读，因此**保存文件即生效**，无需重启也无需热重载插件。它只影响语气人格，
+  不授予权限，也不能放宽信任规则。
 - **记忆**按服务器存放在 `llm_agent_memory/<host>_<port>/MEMORY.md`，智能体
   通过 `read_memory` / `save_memory` / `write_memory` / `clear_memory` 自主
   维护，每次对话都会带上。

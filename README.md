@@ -369,11 +369,18 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
   "admins": ["your_name"],      // only admins may write/toggle plugins ([] = anyone)
   "system_prompt": "...",       // optional, overrides the built-in prompt
   "history_limit": 200,         // chat lines kept for the read_chat tool
+  "persona_file": "llm_agent_persona.md",
   "memory_dir": "llm_agent_memory",
   "generated_dir": "../plugins_llm"
 }
 ```
 
+- **Character sheet** — `plugins/llm_agent_persona.md` (a template is written
+  on first run) is free-form Markdown describing who the bot is: personality,
+  backstory, interests, speech habits. It is re-read every time a prompt is
+  built, so **saving the file is enough** — no restart, no plugin reload. It
+  shapes voice only: it grants no permissions and cannot loosen the trust
+  rules.
 - **Memory** is stored per server at `llm_agent_memory/<host>_<port>/MEMORY.md`;
   the agent maintains it with the `read_memory` / `save_memory` / `write_memory`
   / `clear_memory` tools, and every conversation includes it.

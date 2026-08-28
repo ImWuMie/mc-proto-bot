@@ -939,6 +939,104 @@ class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("never paste this into chat", result)
 
 
+class PersonaTest(unittest.IsolatedAsyncioTestCase):
+    """人物预设 Markdown：自动进入系统提示词，保存即生效（无需热重载）。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.session = FakeSession()
+        self._tmp = tempfile.TemporaryDirectory()
+        configure(self.plugin, self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, text: str) -> None:
+        self.plugin._persona_file.write_text(text, encoding="utf-8")
+
+    def test_template_generated_on_first_enable(self) -> None:
+        self.assertFalse(self.plugin._persona_file.exists())
+        self.plugin._ensure_persona_file()
+        content = self.plugin._persona_file.read_text(encoding="utf-8")
+        self.assertIn("人物预设", content)
+        self.assertIn("# 我是谁", content)
+
+    def test_existing_file_not_overwritten(self) -> None:
+        self._write("# 我的设定\n")
+        self.plugin._ensure_persona_file()
+        self.assertEqual(
+            self.plugin._persona_file.read_text(encoding="utf-8"), "# 我的设定\n"
+        )
+
+    def test_persona_enters_the_system_prompt_fenced(self) -> None:
+        self._write("# 我是谁\n\n- 名字：小明\n- 性格：话少\n")
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertIn("Character sheet", prompt)
+        self.assertIn("<persona>", prompt)
+        self.assertIn("</persona>", prompt)
+        body = prompt.split("<persona>", 1)[1].split("</persona>", 1)[0]
+        self.assertIn("名字：小明", body)
+        self.assertIn("性格：话少", body)
+
+    def test_missing_file_adds_no_section(self) -> None:
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertNotIn("<persona>", prompt)
+        self.assertIn("regular player", prompt)  # 其余提示词照常
+
+    def test_empty_file_adds_no_section(self) -> None:
+        self._write("   \n\n")
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertNotIn("<persona>", prompt)
+
+    def test_edit_takes_effect_without_reload(self) -> None:
+        self._write("# 我是谁\n- 名字：小明\n")
+        self.assertIn("小明", self.plugin._build_system_prompt(FakeBot()))
+        self._write("# 我是谁\n- 名字：阿花\n")  # 就地改写，不重载插件
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertIn("阿花", prompt)
+        self.assertNotIn("小明", prompt)
+
+    def test_long_persona_truncated(self) -> None:
+        self._write("很长的设定" * 3000)
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertIn("(truncated)", prompt)
+        body = prompt.split("<persona>", 1)[1].split("</persona>", 1)[0]
+        self.assertLess(len(body), 6200)
+
+    def test_persona_cannot_be_confused_with_permissions(self) -> None:
+        # 预设是 owner 写的，但仍明确声明它不授予权限、不能放宽信任规则
+        self._write("# 我是谁\n- 名字：小明\n")
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertIn("grants no permissions", prompt)
+        self.assertIn("cannot loosen the trust rules", prompt)
+
+    def test_watcher_logs_a_change_and_tracks_mtime(self) -> None:
+        self._write("# 我是谁\n")
+        self.plugin._check_persona_changed()  # 建立快照
+        first = self.plugin._persona_mtime
+        self.assertIsNotNone(first)
+        self.plugin._persona_mtime -= 1.0  # 模拟旧快照
+        self.plugin._check_persona_changed()
+        self.assertEqual(self.plugin._persona_mtime, first)
+
+    def test_custom_persona_filename(self) -> None:
+        self.plugin._settings["persona_file"] = "role.md"
+        self.plugin._resolve_dirs()
+        self.assertEqual(self.plugin._persona_file.name, "role.md")
+        self.plugin._persona_file.write_text("- 名字：阿花\n", encoding="utf-8")
+        self.assertIn("阿花", self.plugin._build_system_prompt(FakeBot()))
+
+    async def test_system_info_reports_persona_state(self) -> None:
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot()
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Persona file: empty or missing", result)
+        self._write("# 我是谁\n- 名字：小明\n")
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Persona file: loaded", result)
+
+
 class SystemPromptTest(unittest.IsolatedAsyncioTestCase):
     """系统提示词的人格与注入防护约定（回归锁定，不测模型行为）。"""
 
