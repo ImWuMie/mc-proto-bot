@@ -461,8 +461,20 @@ class RefreshLoginTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(url, MSA_TOKEN)
         self.assertEqual(params["grant_type"], "refresh_token")
         self.assertEqual(params["refresh_token"], "refresh-token-1")
-        self.assertNotIn("scope", params)
+        # login.live.com 的续期同样要 scope：少了它返回 HTTP 400
+        # "The provided request must include a 'scope' input parameter."
+        self.assertEqual(params["scope"], "service::user.auth.xboxlive.com::MBI_SSL")
         self.assertEqual(profile.refresh_token, "refresh-token-2")
+
+    async def test_refresh_scope_matches_the_login_scope(self) -> None:
+        # 续期的 scope 必须和当初签发时用的一致，否则微软拒收
+        fake = FakeEndpoints()
+        fake.install(self)
+        await auth.device_code_login(prompt_callback=_quiet_device_prompt)
+        login_scope = fake.form_calls[0][1]["scope"]
+        fake.form_calls.clear()
+        await auth.refresh_login("refresh-token-1")
+        self.assertEqual(fake.form_calls[0][1]["scope"], login_scope)
 
     async def test_azure_client_refreshes_against_azure(self) -> None:
         fake = FakeEndpoints()
