@@ -323,8 +323,8 @@ class HelloReply(Plugin):
 维护 **agent 对话上下文**，通过 `read_chat` 工具查询最近 **200 条聊天记录**
 （可按玩家/关键词/系统广播过滤），并用 OpenAI 兼容的 function calling 执行
 动作——发消息、执行命令、行走/寻路、转头（绝对/相对）、查询玩家位置、
-查看状态、开关/修改(patch)/读取插件源码、编写新插件，以及维护**按服务器
-分开的 Markdown 记忆**（`MEMORY.md`，可多文件）并自主更新。
+查看状态、开关/修改(patch)/读取插件源码、编写新插件、管理定时任务，以及
+维护**按服务器分开的 Markdown 记忆**（`MEMORY.md`，可多文件）并自主更新。
 
 **首次运行**会自动生成 `plugins/llm_agent.json`——填好端点与密钥后保存一次
 `llm_agent.py` 触发热重载即可：
@@ -334,7 +334,9 @@ class HelloReply(Plugin):
   "llm": {
     "base_url": "https://api.openai.com/v1",   // 任意 OpenAI 兼容端点
     "api_key": "sk-...",
-    "model": "gpt-4o-mini"
+    "model": "gpt-4o-mini",
+    "max_tokens": 1000000,          // 模型上下文窗口
+    "compact_reserve_ratio": 0.05   // 预留 5%，超出后自动压缩旧对话
   },
   "reply": {
     "all": false,               // true = 回应每条聊天
@@ -345,7 +347,6 @@ class HelloReply(Plugin):
   "admins": ["你的名字"],       // 只有管理员能写插件/开关插件（[] = 不限制）
   "system_prompt": "...",       // 可选，覆盖内置提示词
   "history_limit": 200,         // read_chat 保留的聊天条数
-  "context_limit": 40,          // agent 对话上下文保留的消息条数
   "memory_dir": "llm_agent_memory",
   "generated_dir": "../plugins_llm"
 }
@@ -360,6 +361,32 @@ class HelloReply(Plugin):
   管理员权限判定。
 - `llm_agent.json`、记忆目录与 `plugins_llm/` 已加入 .gitignore——设置文件
   含 api_key，切勿提交到版本库。
+
+### 定时任务插件（scheduler）
+
+`plugins/scheduler.py` 按计划自动发送聊天或执行服务器命令。任务存放在
+`plugins/scheduler.json`（首次运行生成，内含一个默认禁用的示例）：
+
+```json
+{
+  "tasks": [
+    {"name": "晚间问候", "time": "18:00", "action": "chat",
+     "text": "晚上好！", "enabled": true},
+    {"name": "清理提醒", "interval": 1800, "action": "command",
+     "text": "say 该清理掉落物啦", "enabled": true}
+  ]
+}
+```
+
+- `interval`（秒，最小 5）循环执行；`time`（`HH:MM` 24 小时本地时间）每天
+  执行一次——两者至少给一个。`action` 为 `chat` 或 `command`；
+  `enabled: false` 暂停该任务。
+- 文件改动后 5 秒内自动重新加载，无需重启或热重载插件。未连接服务器时到期
+  任务顺延，不会丢失。
+- **LLM 智能体可以直接管理这些任务**：`schedule_list`、`schedule_add`、
+  `schedule_set`、`schedule_remove`、`schedule_run`（立即执行一次），除
+  `schedule_list` 外都仅限管理员。也就是说在游戏里说「每 30 分钟提醒大家
+  吃饭」就能建好任务，说「把提醒取消」就能删掉。
 
 ### 全屏 TUI 界面（可选）
 
@@ -431,7 +458,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `tui.py` | Textual 全屏 TUI（可选 `tui` extra）与普通日志降级 |
 | `data/` | 内置各版本方块状态表 |
 | `cli.py` | 诊断控制台命令 |
-| `plugins/` | 示例插件（chat_logger、llm_agent） |
+| `plugins/` | 示例插件（chat_logger、llm_agent、scheduler） |
 | `config.yaml` | 本地配置文件（首次启动向导生成，不入库） |
 
 ## 开发

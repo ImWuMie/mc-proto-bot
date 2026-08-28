@@ -1081,6 +1081,158 @@ class AdminGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.plugin._requester)
 
 
+class ScheduleToolTest(unittest.IsolatedAsyncioTestCase):
+    """llm_agent 的 schedule_* 工具：操作调度插件的 scheduler.json。
+
+    通过 _scheduler_file_override 把目标文件指向临时路径，
+    避免污染真实的 plugins/scheduler.json。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.manager = PluginManager([PLUGIN_FILE.parent])
+        self.manager.discover()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot()
+        self.scheduler_json = Path(self._tmp.name) / "scheduler.json"
+        self.plugin._scheduler_file_override = self.scheduler_json
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _tasks(self) -> list[dict]:
+        data = json.loads(self.scheduler_json.read_text(encoding="utf-8"))
+        return data["tasks"]
+
+    async def test_add_then_list(self) -> None:
+        result = await self.plugin._run_tool(
+            "schedule_add",
+            {"name": "报时", "interval": 300, "action": "chat", "text": "整点啦"},
+        )
+        self.assertIn("Scheduled task added", result)
+        tasks = self._tasks()
+        self.assertEqual(tasks[0]["name"], "报时")
+        self.assertEqual(tasks[0]["interval"], 300)
+        listing = await self.plugin._run_tool("schedule_list", {})
+        self.assertIn("- 报时", listing)
+        self.assertIn("every 300", listing)
+
+    async def test_add_validation_errors(self) -> None:
+        result = await self.plugin._run_tool(
+            "schedule_add", {"name": "x", "text": "y", "time": "25:00"}
+        )
+        self.assertIn("time must be HH:MM", result)
+        result = await self.plugin._run_tool(
+            "schedule_add", {"name": "x", "text": "y", "time": "12:60"}
+        )
+        self.assertIn("time must be HH:MM", result)
+        result = await self.plugin._run_tool(
+            "schedule_add", {"name": "x", "text": "y"}
+        )
+        self.assertIn("Provide interval", result)
+        result = await self.plugin._run_tool(
+            "schedule_add", {"name": "x", "text": "y", "interval": 1}
+        )
+        self.assertIn("at least 5 seconds", result)
+        self.assertFalse(self.scheduler_json.exists())  # 非法请求不落盘
+
+    async def test_add_accepts_valid_daily_time(self) -> None:
+        result = await self.plugin._run_tool(
+            "schedule_add", {"name": "晚安", "text": "睡了", "time": "23:59"}
+        )
+        self.assertIn("Scheduled task added", result)
+        self.assertEqual(self._tasks()[0]["time"], "23:59")
+
+    async def test_set_rejects_out_of_range_time(self) -> None:
+        await self.plugin._run_tool(
+            "schedule_add", {"name": "t", "interval": 60, "text": "x"}
+        )
+        result = await self.plugin._run_tool(
+            "schedule_set", {"name": "t", "time": "24:00"}
+        )
+        self.assertIn("time must be HH:MM", result)
+        self.assertEqual(self._tasks()[0]["interval"], 60)  # 未被改动
+
+    async def test_add_duplicate_rejected(self) -> None:
+        await self.plugin._run_tool(
+            "schedule_add", {"name": "t", "interval": 60, "text": "x"}
+        )
+        result = await self.plugin._run_tool(
+            "schedule_add", {"name": "t", "interval": 60, "text": "x"}
+        )
+        self.assertIn("already exists", result)
+
+    async def test_set_updates_fields(self) -> None:
+        await self.plugin._run_tool(
+            "schedule_add", {"name": "t", "interval": 60, "text": "旧文本"}
+        )
+        result = await self.plugin._run_tool(
+            "schedule_set",
+            {"name": "t", "text": "新文本", "enabled": False, "interval": 120},
+        )
+        self.assertIn("updated", result)
+        task = self._tasks()[0]
+        self.assertEqual(task["text"], "新文本")
+        self.assertEqual(task["interval"], 120)
+        self.assertFalse(task["enabled"])
+
+    async def test_set_unknown_task(self) -> None:
+        result = await self.plugin._run_tool(
+            "schedule_set", {"name": "nope", "text": "x"}
+        )
+        self.assertIn("Task not found", result)
+
+    async def test_remove(self) -> None:
+        await self.plugin._run_tool(
+            "schedule_add", {"name": "t", "interval": 60, "text": "x"}
+        )
+        result = await self.plugin._run_tool(
+            "schedule_remove", {"name": "t"}
+        )
+        self.assertIn("removed", result)
+        listing = await self.plugin._run_tool("schedule_list", {})
+        self.assertIn("No scheduled tasks", listing)
+
+    async def test_remove_unknown_task(self) -> None:
+        result = await self.plugin._run_tool(
+            "schedule_remove", {"name": "nope"}
+        )
+        self.assertIn("Task not found", result)
+
+    async def test_run_executes_command_once(self) -> None:
+        await self.plugin._run_tool(
+            "schedule_add",
+            {"name": "t", "interval": 60, "action": "command", "text": "say hi"},
+        )
+        result = await self.plugin._run_tool("schedule_run", {"name": "t"})
+        self.assertIn("Command executed", result)
+        self.assertEqual(self.plugin.bot.sent_commands, ["say hi"])
+        self.assertEqual(len(self._tasks()), 1)  # 调度未被改动
+
+    async def test_run_executes_chat_once(self) -> None:
+        await self.plugin._run_tool(
+            "schedule_add", {"name": "t", "interval": 60, "text": "hi"}
+        )
+        await self.plugin._run_tool("schedule_run", {"name": "t"})
+        self.assertEqual(self.plugin.bot.sent_messages, ["hi"])
+
+    async def test_admin_gate(self) -> None:
+        self.plugin._settings["admins"] = ["mie_233"]
+        self.plugin._requester = "Steve"
+        result = await self.plugin._run_tool(
+            "schedule_add", {"name": "t", "interval": 60, "text": "x"}
+        )
+        self.assertIn("Permission denied", result)
+        self.assertFalse(self.scheduler_json.exists())
+
+    async def test_scheduler_plugin_not_loaded(self) -> None:
+        self.plugin._scheduler_file_override = None
+        self.plugin.manager = PluginManager([])
+        result = await self.plugin._run_tool("schedule_list", {})
+        self.assertIn("Scheduler plugin not loaded", result)
+
+
 class WorkerPipelineTest(unittest.IsolatedAsyncioTestCase):
     async def test_full_pipeline_chat_to_llm_to_game(self) -> None:
         manager = make_manager()

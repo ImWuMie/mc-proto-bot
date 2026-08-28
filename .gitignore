@@ -18,4 +18,7 @@ plugins/llm_agent.json
 plugins/llm_agent_memory/
 plugins_llm/
 
+# 定时任务插件数据（运行时自动生成/修改）
+plugins/scheduler.json
+
 /run/
