@@ -369,7 +369,9 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
     "api_key": "sk-...",
     "model": "gpt-4o-mini",
     "max_tokens": 1000000,          // model context window
-    "compact_reserve_ratio": 0.05   // reserve 5%; older turns auto-compact
+    "compact_reserve_ratio": 0.05,  // reserve 5%; older turns auto-compact
+    "system_blocks": true,          // send the system prompt as content blocks
+    "cache_control": false          // tag the last block {"type":"ephemeral"}
   },
   "reply": {
     "all": false,               // true = reply to every chat line
@@ -389,6 +391,17 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 }
 ```
 
+- **Prompt caching** — the system prompt is sent as ordered content blocks,
+  most stable first: the static prompt, then the skill list, then identity
+  (name, server), the character sheet, memory, and the todo list. Nothing
+  per-request goes in it; the wall clock rides on the trigger message instead
+  (`[HH:MM] <Player>: text`), so the whole system prompt plus the conversation
+  history stays a byte-identical prefix from one call to the next, which is
+  what endpoints match on when they cache. Set `system_blocks: false` for an
+  endpoint that only accepts a plain string, and `cache_control: true` to tag
+  the last block `{"type": "ephemeral"}` on endpoints that want an explicit
+  cache breakpoint (most do not, hence the default). `get_system_info` reports
+  the block count and marker state.
 - **Sustained attention** (off by default) — set `attention_seconds` to a
   number and, after the agent actually replies to someone, that player stays
   in an attention window for that long. Their next lines reach the agent even

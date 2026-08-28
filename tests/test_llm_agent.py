@@ -327,8 +327,8 @@ class ComponentNameTest(unittest.IsolatedAsyncioTestCase):
         fake = FakeLLM(assistant(content="嗯"))
         self.plugin._post_json = fake
         await self.plugin._handle_trigger("_ImWuMie", "钓鱼")
-        self.assertEqual(
-            fake.calls[0][1]["messages"][1]["content"], "<_ImWuMie>: 钓鱼"
+        self.assertTrue(
+            fake.calls[0][1]["messages"][1]["content"].endswith("<_ImWuMie>: 钓鱼")
         )
 
 
@@ -1179,9 +1179,10 @@ class RemindTest(unittest.IsolatedAsyncioTestCase):
         fake = FakeLLM(assistant(content="好，我去说一声"))
         self.plugin._post_json = fake
         await self.plugin._handle_trigger("饭点", "该吃饭了", reminder=True)
-        self.assertEqual(
-            fake.calls[0][1]["messages"][1]["content"],
-            "[Reminder from 饭点] 该吃饭了",
+        self.assertTrue(
+            fake.calls[0][1]["messages"][1]["content"].endswith(
+                "[Reminder from 饭点] 该吃饭了"
+            )
         )
         self.assertEqual(self.plugin.bot.sent_messages, ["好，我去说一声"])
 
@@ -1692,9 +1693,10 @@ class AttentionWindowTest(unittest.IsolatedAsyncioTestCase):
         fake = FakeLLM(assistant(content="NO_REPLY"))
         self.plugin._post_json = fake
         await self.plugin._handle_trigger("Steve", "那你觉得呢", follow_up=True)
-        self.assertEqual(
-            fake.calls[0][1]["messages"][1]["content"],
-            "<Steve> (follow-up): 那你觉得呢",
+        self.assertTrue(
+            fake.calls[0][1]["messages"][1]["content"].endswith(
+                "<Steve> (follow-up): 那你觉得呢"
+            )
         )
 
     async def test_reply_refreshes_the_window(self) -> None:
@@ -1896,6 +1898,106 @@ class SystemPromptTest(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class PromptCachingTest(unittest.IsolatedAsyncioTestCase):
+    """system 提示词分块，且前缀在两次请求之间保持一致（提示词缓存的前提）。
+
+    曾经 "Current time: %H:%M:%S" 排在第二块，每次请求都不一样，于是除了
+    第一块之外的所有内容（人物预设、记忆、待办，以及后面的全部对话历史）
+    每次都错过缓存——这组测试就是把那个坑钉住。
+    """
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.bot = FakeBot(username="FakeBot")
+        self.plugin.session = FakeSession()
+        self.plugin._settings["llm"]["api_key"] = "k"
+
+    def test_static_prompt_comes_first(self) -> None:
+        blocks = self.plugin._system_blocks(FakeBot())
+        self.assertGreater(len(blocks), 1)
+        self.assertEqual(blocks[0], self.plugin._settings["system_prompt"])
+
+    def test_no_wall_clock_anywhere_in_the_system_prompt(self) -> None:
+        prompt = self.plugin._build_system_prompt(FakeBot())
+        self.assertNotIn("Current time", prompt)
+
+    def test_blocks_are_identical_across_calls(self) -> None:
+        first = self.plugin._system_blocks(FakeBot())
+        second = self.plugin._system_blocks(FakeBot())
+        self.assertEqual(first, second)  # 前缀逐字节一致才可能命中缓存
+
+    def test_volatile_parts_sort_after_stable_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            configure(self.plugin, tmp)
+            directory = self.plugin._server_dir()
+            directory.mkdir(parents=True)
+            (directory / "MEMORY.md").write_text("- 记忆一条\n", encoding="utf-8")
+            (directory / "TODO.md").write_text("- [ ] 待办一条\n", encoding="utf-8")
+            blocks = self.plugin._system_blocks(FakeBot())
+            memory_at = next(i for i, b in enumerate(blocks) if "记忆一条" in b)
+            todo_at = next(i for i, b in enumerate(blocks) if "待办一条" in b)
+            self.assertLess(0, memory_at)  # 静态提示词在前
+            self.assertLess(memory_at, todo_at)  # 待办比记忆变得更频繁
+
+    def test_system_message_is_a_list_of_text_parts(self) -> None:
+        message = self.plugin._system_message(FakeBot())
+        self.assertEqual(message["role"], "system")
+        self.assertIsInstance(message["content"], list)
+        for part in message["content"]:
+            self.assertEqual(part["type"], "text")
+            self.assertIsInstance(part["text"], str)
+            self.assertNotIn("cache_control", part)  # 默认不打标记
+
+    def test_single_string_fallback_for_strict_endpoints(self) -> None:
+        self.plugin._settings["llm"]["system_blocks"] = False
+        message = self.plugin._system_message(FakeBot())
+        self.assertIsInstance(message["content"], str)
+        self.assertIn("Long-term memory", message["content"])
+
+    def test_cache_control_marks_only_the_last_block(self) -> None:
+        self.plugin._settings["llm"]["cache_control"] = True
+        parts = self.plugin._system_message(FakeBot())["content"]
+        self.assertEqual(parts[-1]["cache_control"], {"type": "ephemeral"})
+        self.assertFalse(any("cache_control" in part for part in parts[:-1]))
+
+    def test_the_stamp_rides_on_the_trigger_message(self) -> None:
+        message = self.plugin._trigger_message("Steve", "在吗", False)
+        self.assertRegex(message["content"], r"^\[\d\d:\d\d\] <Steve>: 在吗$")
+
+    async def test_prefix_is_byte_identical_between_two_turns(self) -> None:
+        fake = FakeLLM(assistant(content="嗯"), assistant(content="嗯嗯"))
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("Steve", "在吗")
+        await self.plugin._handle_trigger("Steve", "还在吗")
+        first = fake.calls[0][1]["messages"][0]
+        second = fake.calls[1][1]["messages"][0]
+        self.assertEqual(first, second)
+        # 第二轮的历史以第一轮的消息开头，前缀没被改写
+        self.assertEqual(
+            fake.calls[1][1]["messages"][1], fake.calls[0][1]["messages"][1]
+        )
+
+    def test_token_estimate_counts_block_content(self) -> None:
+        blocked = self.plugin._system_message(FakeBot())
+        self.plugin._settings["llm"]["system_blocks"] = False
+        plain = self.plugin._system_message(FakeBot())
+        self.assertEqual(
+            self.plugin._estimate_messages_tokens([blocked]),
+            self.plugin._estimate_messages_tokens([plain]),
+        )
+
+    async def test_system_info_reports_the_prompt_shape(self) -> None:
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("System prompt:", result)
+        self.assertIn("block(s)", result)
+
+    async def test_system_info_survives_without_a_bot(self) -> None:
+        self.plugin.bot = None
+        result = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("System prompt:", result)
+
+
 class TokenEstimateTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.manager = make_manager()
@@ -1990,14 +2092,16 @@ class LlmLoopTest(unittest.IsolatedAsyncioTestCase):
         tool_names = [tool["function"]["name"] for tool in payload["tools"]]
         for expected in ("send_message", "read_chat", "write_plugin", "save_memory"):
             self.assertIn(expected, tool_names)  # 工具表随请求发送
-        self.assertIn("Long-term memory", payload["messages"][0]["content"])
+        # system 消息按稳定性分块发送，记忆在其中一块里
+        blocks = [part["text"] for part in payload["messages"][0]["content"]]
+        self.assertTrue(any("Long-term memory" in block for block in blocks))
         # agent 对话上下文：触发消息是 user 轮次，不塞聊天日志
-        self.assertEqual(payload["messages"][1]["content"], "<Steve>: 在吗")
+        self.assertTrue(payload["messages"][1]["content"].endswith("<Steve>: 在吗"))
         # 第二轮请求携带工具结果
         self.assertIn("tool", [m["role"] for m in fake.calls[1][1]["messages"]])
         # 本轮并入对话上下文：触发 + 工具调用 + 工具结果 + 最终回复
-        self.assertEqual(
-            self.plugin._conversation[0]["content"], "<Steve>: 在吗"
+        self.assertTrue(
+            self.plugin._conversation[0]["content"].endswith("<Steve>: 在吗")
         )
         self.assertEqual(
             self.plugin._conversation[-1]["content"], "任务完成。"
@@ -2022,9 +2126,10 @@ class LlmLoopTest(unittest.IsolatedAsyncioTestCase):
             "_ImWuMie", "写个插件", private=True
         )
         payload = fake.calls[0][1]
-        self.assertEqual(
-            payload["messages"][1]["content"],
-            "<_ImWuMie> (private whisper): 写个插件",
+        self.assertTrue(
+            payload["messages"][1]["content"].endswith(
+                "<_ImWuMie> (private whisper): 写个插件"
+            )
         )
         self.assertEqual(self.plugin.bot.sent_messages, ["收到"])
 

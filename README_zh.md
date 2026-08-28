@@ -346,7 +346,9 @@ class HelloReply(Plugin):
     "api_key": "sk-...",
     "model": "gpt-4o-mini",
     "max_tokens": 1000000,          // 模型上下文窗口
-    "compact_reserve_ratio": 0.05   // 预留 5%，超出后自动压缩旧对话
+    "compact_reserve_ratio": 0.05,  // 预留 5%，超出后自动压缩旧对话
+    "system_blocks": true,          // 系统提示词按块发送（content 数组）
+    "cache_control": false          // 给最后一块打 {"type":"ephemeral"} 缓存标记
   },
   "reply": {
     "all": false,               // true = 回应每条聊天
@@ -366,6 +368,14 @@ class HelloReply(Plugin):
 }
 ```
 
+- **提示词缓存**：系统提示词按**稳定性从高到低**分块发送——整段静态提示词、
+  技能清单、身份（名字与服务器）、人物预设、记忆、待办。里面不再放任何每次
+  请求都变的东西：时间改由触发消息携带（`[HH:MM] <玩家>: 内容`）。这样系统
+  提示词加上对话历史在两次请求之间**逐字节一致**，端点才可能命中缓存——以前
+  「Current time」排在第二块，每秒都不一样，于是除了第一块之外全都白算，
+  这就是命中率低的原因。只认字符串的端点把 `system_blocks` 设为 false；需要
+  显式缓存断点的端点把 `cache_control` 设为 true（多数端点不需要，故默认关）。
+  `get_system_info` 会报当前块数与标记状态。
 - **持续注意**（默认关闭）：把 `attention_seconds` 设成秒数后，真的回复过某个
   玩家的话，他会进入这么长的注意窗口。窗口内他的后续发言即便没提到 bot 也会
   送进来，标记为 `(follow-up)`，由 LLM 判断这句是不是在跟自己说话——是就接着
