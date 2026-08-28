@@ -1,8 +1,9 @@
 """LLM 智能体插件：把大语言模型接入游戏内聊天（类 Hermes Agent）。
 
 功能：
-  - LLM 上下文为 agent 对话上下文（系统提示 + 对话轮次，条数可配）；游戏内
-    聊天记录最近 N 条（默认 200），通过 read_chat 工具按参数过滤查询
+  - LLM 上下文为 agent 对话上下文（系统提示 + 对话轮次），按 token 预算管理：
+    超过 max_tokens × (1 − 5% 预留) 时自动把旧对话压缩成摘要（auto compact）；
+    游戏内聊天记录最近 N 条（默认 200），通过 read_chat 工具按参数过滤查询
   - 按服务器分开的长期记忆，以 Markdown 文件保存
     （``llm_agent_memory/<host>_<port>/MEMORY.md``，可以有多个 .md 文件），
     LLM 通过 read_memory / save_memory / write_memory / clear_memory 工具
@@ -48,6 +49,7 @@ Behavior rules:
 - Proactively use save_memory (append a note) or write_memory (rewrite the whole file) for anything worth remembering long-term (server rules, player identities, agreements, todos, your goals). Memory is stored per server as MEMORY.md and other Markdown files and is provided to you in every future conversation.
 - Each incoming in-game chat message that triggers you appears in this conversation as a user message of the form "<PlayerName>: message".
 - The in-game chat stream is NOT part of your context. Use the read_chat tool to look up recent chat (the latest 200 lines are kept; filter by players, keyword, or include_system) whenever you need to know what others said.
+- When this conversation approaches the token limit, older parts are automatically compacted into a summary message; a "[Auto-compacted history]" message marks such a summary.
 - Keep a single chat message under 250 characters. If you decide not to respond, output exactly NO_REPLY and nothing else.
 - set_plugin and write_plugin are admin-only (players listed in the admins setting). Calls from non-admins return a permission-denied result; tell them politely and do not retry.
 
@@ -88,6 +90,8 @@ DEFAULT_SETTINGS: dict = {
         "model": "gpt-4o-mini",
         "timeout": 120.0,
         "max_tool_rounds": 5,
+        "max_tokens": 1000000,  # 模型上下文窗口（gemini-3.7-flash 为 1M）
+        "compact_reserve_ratio": 0.05,  # 预留 5% 余量，超预算时自动压缩旧对话
     },
     "reply": {
         "all": False,  # true = 回应每一条玩家聊天；false = 仅按下面几种方式触发
@@ -98,7 +102,6 @@ DEFAULT_SETTINGS: dict = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "admins": [],  # 管理员玩家名列表：只有名单内玩家能让 LLM 写插件/开关插件；留空不限制
     "history_limit": 200,  # 游戏内聊天日志保留条数（read_chat 工具查询范围）
-    "context_limit": 600,  # agent 对话上下文保留的消息条数
     "memory_dir": "llm_agent_memory",  # 记忆根目录（每服务器一个子目录，记忆为 MEMORY.md 等 Markdown 文件）
     "generated_dir": "../plugins_llm",  # LLM 生成插件的目录（与 plugins/ 分开）
 }
@@ -292,9 +295,23 @@ SENT_ECHO_WINDOW = 10.0
 #: 重复发送去重窗口（秒）与参与比较的最近条数
 SENT_DEDUPE_WINDOW = 120.0
 SENT_DEDUPE_MAX = 5
+#: auto compact 时保留的最近消息条数
+COMPACT_KEEP_TAIL = 10
+#: 对话条数兜底上限（压缩持续失败时防止无限增长）
+CONVERSATION_HARD_CAP = 4000
 
 
 # ======================== 辅助函数 ========================
+
+
+def estimate_tokens(text: str) -> int:
+    """粗略估算 token 数：CJK 字符约 1 token，其余约 4 字符 1 token。
+
+    1M 窗口下无需精确（不引入 tiktoken 依赖），估算保持保守即可；每条
+    消息另加 4 个 token 的角色/格式开销（见 _estimate_messages_tokens）。
+    """
+    cjk = sum(1 for char in text if "一" <= char <= "鿿")
+    return cjk + (len(text) - cjk + 3) // 4
 
 
 def _deep_merge(base: dict, extra: dict) -> dict:
@@ -444,10 +461,19 @@ class LLMAgent(Plugin):
         except (TypeError, ValueError):
             self._settings["history_limit"] = 200
         try:
-            context = int(merged.get("context_limit", 40))
-            self._settings["context_limit"] = max(4, min(1000, context))
-        except (TypeError, ValueError):
-            self._settings["context_limit"] = 40
+            max_tokens = int(merged["llm"].get("max_tokens", 1_000_000))
+            self._settings["llm"]["max_tokens"] = max(
+                1000, min(10_000_000, max_tokens)
+            )
+        except (TypeError, ValueError, KeyError):
+            self._settings["llm"]["max_tokens"] = 1_000_000
+        try:
+            ratio = float(merged["llm"].get("compact_reserve_ratio", 0.05))
+            self._settings["llm"]["compact_reserve_ratio"] = max(
+                0.01, min(0.5, ratio)
+            )
+        except (TypeError, ValueError, KeyError):
+            self._settings["llm"]["compact_reserve_ratio"] = 0.05
         if not isinstance(merged.get("reply"), dict):
             self._settings["reply"] = dict(DEFAULT_SETTINGS["reply"])
         self._settings["admins"] = [
@@ -608,11 +634,71 @@ class LLMAgent(Plugin):
         return str(name).lower() in lowered
 
     def _persist_turn(self, turn: list[dict]) -> None:
-        """把一轮对话（触发消息 + 助手消息 + 工具消息）并入 agent 上下文。"""
-        limit = int(self._settings.get("context_limit", 40))
+        """把一轮对话（触发消息 + 助手消息 + 工具消息）并入 agent 上下文。
+
+        不再按条数裁剪——上下文按 token 预算管理，超预算时由
+        :meth:`_auto_compact` 压缩旧消息；这里只保留宽松的条数兜底，
+        防止压缩持续失败时无限增长。
+        """
         self._conversation.extend(turn)
-        if len(self._conversation) > limit:
-            del self._conversation[:-limit]
+        if len(self._conversation) > CONVERSATION_HARD_CAP:
+            self._conversation = self._conversation[-CONVERSATION_HARD_CAP // 2 :]
+            log.warn("[LLM] 对话上下文条数触顶，已丢弃最旧的一半（压缩可能持续失败）。")
+
+    # ---- token 预算与 auto compact ----
+
+    def _estimate_messages_tokens(self, messages: list[dict]) -> int:
+        total = 0
+        for message in messages:
+            total += 4 + estimate_tokens(str(message.get("content") or ""))
+        return total
+
+    def _context_budget(self) -> int:
+        """上下文 token 预算 = max_tokens × (1 − 预留比例)。"""
+        llm = self._settings["llm"]
+        max_tokens = int(llm.get("max_tokens", 1_000_000))
+        ratio = float(llm.get("compact_reserve_ratio", 0.05))
+        return int(max_tokens * (1.0 - ratio))
+
+    async def _auto_compact(self, bot) -> None:
+        """上下文超出 token 预算时，把较旧的对话压缩成摘要。
+
+        摘要请求不携带工具、不计入对话；失败时丢弃最旧的一半消息兜底。
+        """
+        if len(self._conversation) <= COMPACT_KEEP_TAIL + 4:
+            self._conversation = []  # 太短无可压缩（预算极小的情况）
+            log.warn("[LLM] 上下文预算极小且历史较短，已清空对话历史。")
+            return
+        old = self._conversation[:-COMPACT_KEEP_TAIL]
+        tail = self._conversation[-COMPACT_KEEP_TAIL:]
+        log.info(f"[LLM] 上下文接近上限，正在自动压缩 {len(old)} 条历史消息...")
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conversation compactor. Summarize the "
+                    "conversation below into a compact form (in Chinese). "
+                    "Keep: important facts, player identities, decisions, "
+                    "pending tasks, and what you said or promised. Drop "
+                    "small talk. Output only the summary text."
+                ),
+            },
+            *old,
+            {"role": "user", "content": "Summarize the above conversation now."},
+        ]
+        try:
+            reply = await self._complete_chat(prompt, with_tools=False)
+            content = str(reply.get("content") or "").strip()
+        except Exception as error:
+            log.error(f"[LLM] 自动压缩失败，改为丢弃最旧消息 ({error})")
+            content = ""
+        if not content:
+            self._conversation = self._conversation[len(self._conversation) // 2 :]
+            return
+        self._conversation = [
+            {"role": "user", "content": f"[Auto-compacted history]\n{content}"}
+        ] + tail
+        log.info("[LLM] 上下文压缩完成。")
 
     async def _process_trigger(self, name: str, text: str) -> None:
         bot = self.bot
@@ -623,13 +709,28 @@ class LLMAgent(Plugin):
         if not str(settings.get("api_key") or ""):
             log.warn("[LLM] 未配置 api_key，跳过处理。")
             return
-        context_limit = int(self._settings.get("context_limit", 40))
-        context = list(self._conversation[-context_limit:])
-        messages = [
-            {"role": "system", "content": self._build_system_prompt(bot)}
-        ] + context
+        messages = [{"role": "system", "content": self._build_system_prompt(bot)}]
+        messages += list(self._conversation)
         prefix_len = len(messages)  # 本轮新增消息（触发 + 助手 + 工具）从这之后开始
         messages.append({"role": "user", "content": f"<{name}>: {text}"})
+        # token 预算控制：超过上限（预留 5% 余量）先自动压缩历史对话
+        if self._estimate_messages_tokens(messages) > self._context_budget():
+            await self._auto_compact(bot)
+            messages = [
+                {"role": "system", "content": self._build_system_prompt(bot)}
+            ] + list(self._conversation)
+            prefix_len = len(messages)
+            messages.append({"role": "user", "content": f"<{name}>: {text}"})
+            while (
+                self._estimate_messages_tokens(messages) > self._context_budget()
+                and len(self._conversation) > 1
+            ):
+                del self._conversation[0]  # 压缩失败兜底：丢弃最旧消息
+                messages = [
+                    {"role": "system", "content": self._build_system_prompt(bot)}
+                ] + list(self._conversation)
+                prefix_len = len(messages)
+                messages.append({"role": "user", "content": f"<{name}>: {text}"})
         rounds = max(1, int(settings.get("max_tool_rounds", 5)))
         for _ in range(rounds):
             try:
@@ -669,14 +770,17 @@ class LLMAgent(Plugin):
                 )
         log.warn("[LLM] 工具调用轮数达到上限，放弃本轮。")
 
-    async def _complete_chat(self, messages: list[dict]) -> dict:
+    async def _complete_chat(
+        self, messages: list[dict], *, with_tools: bool = True
+    ) -> dict:
         llm = self._settings["llm"]
         url = str(llm.get("base_url") or "").rstrip("/") + "/chat/completions"
-        payload = {
+        payload: dict = {
             "model": str(llm.get("model") or "gpt-4o-mini"),
             "messages": messages,
-            "tools": TOOLS,
         }
+        if with_tools:
+            payload["tools"] = TOOLS  # 摘要等辅助调用不携带工具表
         headers = {}
         api_key = str(llm.get("api_key") or "")
         if api_key:
@@ -867,12 +971,21 @@ class LLMAgent(Plugin):
         player = bot.player
         return f"Arrived at X={player.x:.1f} Z={player.z:.1f}"
 
+    def _deny(self, requester: str | None, action: str) -> str:
+        """权限拒绝：同时写控制台日志，方便在 TUI 里确认当前名单。"""
+        admins = self._settings.get("admins") or []
+        log.info(
+            f"[LLM] 权限拒绝: {requester or '未知玩家'} 请求{action}"
+            f"（当前管理员: {', '.join(admins) if admins else '未限制'}）。"
+        )
+        return (
+            f"Permission denied for {requester or 'unknown'}: "
+            f"only admins can {action}"
+        )
+
     async def _tool_set_plugin(self, args: dict) -> str:
         if not self._is_admin(self._requester):
-            return (
-                f"Permission denied for {self._requester or 'unknown'}: "
-                "only admins can manage plugins"
-            )
+            return self._deny(self._requester, "manage plugins")
         name = str(args.get("name") or "").strip()
         enabled = bool(args.get("enabled", True))
         if not name:
@@ -902,10 +1015,7 @@ class LLMAgent(Plugin):
 
     async def _tool_write_plugin(self, args: dict) -> str:
         if not self._is_admin(self._requester):
-            return (
-                f"Permission denied for {self._requester or 'unknown'}: "
-                "only admins can write plugins"
-            )
+            return self._deny(self._requester, "write plugins")
         filename = str(args.get("filename") or "").strip()
         code = str(args.get("code") or "")
         if not re.fullmatch(r"[A-Za-z0-9_]{1,64}\.py", filename):

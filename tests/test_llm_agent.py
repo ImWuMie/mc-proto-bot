@@ -258,7 +258,8 @@ class SettingsTest(unittest.TestCase):
             )
             self.assertEqual(saved["llm"]["model"], "gpt-4o-mini")
             self.assertEqual(saved["history_limit"], 200)
-            self.assertGreaterEqual(saved["context_limit"], 4)  # 默认值可调
+            self.assertEqual(saved["llm"]["max_tokens"], 1_000_000)
+            self.assertEqual(saved["llm"]["compact_reserve_ratio"], 0.05)
             self.assertIn("hey,claude", saved["reply"]["prefix"])
             self.assertEqual(saved["reply"]["keywords"], [])
 
@@ -286,12 +287,21 @@ class SettingsTest(unittest.TestCase):
 
     def test_limits_clamped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            self._load(tmp, {"history_limit": 5, "context_limit": 2})
+            self._load(tmp, {"history_limit": 5})
             self.assertEqual(self.plugin._settings["history_limit"], 10)
-            self.assertEqual(self.plugin._settings["context_limit"], 4)
-            self._load(tmp, {"history_limit": 99999, "context_limit": 99999})
+            self._load(tmp, {"history_limit": 99999})
             self.assertEqual(self.plugin._settings["history_limit"], 2000)
-            self.assertEqual(self.plugin._settings["context_limit"], 1000)
+
+    def test_llm_window_clamped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._load(
+                tmp,
+                {"llm": {"max_tokens": 100, "compact_reserve_ratio": 0.99}},
+            )
+            self.assertEqual(self.plugin._settings["llm"]["max_tokens"], 1000)
+            self.assertEqual(
+                self.plugin._settings["llm"]["compact_reserve_ratio"], 0.5
+            )
 
 
 class SettingsReloadTest(unittest.IsolatedAsyncioTestCase):
@@ -647,6 +657,28 @@ class ReadChatToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<Steve>", result)
 
 
+class TokenEstimateTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+
+    def test_cjk_counts_one_token_per_char(self) -> None:
+        # 2 个中文字符 + 每条消息 4 token 开销
+        self.assertEqual(
+            self.plugin._estimate_messages_tokens([{"content": "中文"}]), 6
+        )
+
+    def test_ascii_counts_quarter_token_per_char(self) -> None:
+        self.assertEqual(
+            self.plugin._estimate_messages_tokens([{"content": "abcd"}]), 5
+        )
+
+    def test_budget_leaves_the_configured_reserve(self) -> None:
+        self.plugin._settings["llm"]["max_tokens"] = 1_000_000
+        self.plugin._settings["llm"]["compact_reserve_ratio"] = 0.05
+        self.assertEqual(self.plugin._context_budget(), 950_000)
+
+
 class ManagerSetEnabledTest(unittest.IsolatedAsyncioTestCase):
     async def test_close_and_reopen_keeps_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -749,14 +781,60 @@ class LlmLoopTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin._handle_trigger("Steve", "在吗")
         self.assertEqual(fake.calls, [])
 
-    async def test_conversation_trimmed_to_context_limit(self) -> None:
-        self.plugin._settings["context_limit"] = 4
-        for index in range(3):
-            fake = FakeLLM(assistant(content=f"回复{index}"))
-            self.plugin._post_json = fake
-            await self.plugin._handle_trigger("Steve", f"消息{index}")
-        self.assertEqual(len(self.plugin._conversation), 4)
-        self.assertEqual(self.plugin._conversation[-1]["content"], "回复2")
+    def _fill_conversation(self, count: int) -> None:
+        for index in range(count):
+            self.plugin._conversation.append(
+                {
+                    "role": "user",
+                    "content": f"<Steve>: 消息消息消息消息消息消息消息消息消息消息{index}",
+                }
+            )  # 每条约 24 token（20 个 CJK + 4 开销）
+
+    async def test_auto_compact_when_over_token_budget(self) -> None:
+        self.plugin._settings["llm"]["max_tokens"] = 2000  # 预算 1900
+        self._fill_conversation(60)  # 远超预算
+        fake = FakeLLM(
+            assistant(content="摘要内容"),
+            assistant(content="回复"),
+        )
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("Steve", "在吗")
+
+        self.assertEqual(self.plugin.bot.sent_messages, ["回复"])
+        self.assertEqual(len(fake.calls), 2)
+        self.assertNotIn("tools", fake.calls[0][1])  # 摘要请求不携带工具表
+        self.assertIn("tools", fake.calls[1][1])
+        summary = self.plugin._conversation[0]["content"]
+        self.assertTrue(summary.startswith("[Auto-compacted history]"))
+        self.assertIn("摘要内容", summary)
+        # 摘要 1 条 + 保留最近 10 条 + 本轮触发与回复
+        self.assertEqual(len(self.plugin._conversation), 1 + 10 + 2)
+
+    async def test_compact_failure_drops_oldest(self) -> None:
+        self.plugin._settings["llm"]["max_tokens"] = 2000
+        self._fill_conversation(60)
+        fake = FakeLLM(
+            RuntimeError("boom"),  # 摘要请求失败 → 丢弃最旧一半兜底
+            assistant(content="回复"),
+        )
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("Steve", "在吗")
+        self.assertEqual(self.plugin.bot.sent_messages, ["回复"])
+        self.assertGreater(len(self.plugin._conversation), 20)
+        self.assertFalse(
+            any(
+                "[Auto-compacted history]" in message["content"]
+                for message in self.plugin._conversation
+            )
+        )
+
+    async def test_no_compact_within_budget(self) -> None:
+        self._fill_conversation(5)
+        fake = FakeLLM(assistant(content="回复"))
+        self.plugin._post_json = fake
+        await self.plugin._handle_trigger("Steve", "在吗")
+        self.assertEqual(len(fake.calls), 1)  # 未触发压缩
+        self.assertEqual(self.plugin.bot.sent_messages, ["回复"])
 
 
 class AdminGateTest(unittest.IsolatedAsyncioTestCase):

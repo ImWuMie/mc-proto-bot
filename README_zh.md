@@ -266,7 +266,7 @@ session:
   reconnect_max_attempts: null   # 可选：最大重连次数（null = 无限）
 plugins:
   directory: "plugins"      # 相对本配置文件所在目录
-  disabled: []              # 例: ["auto_reply"]
+  disabled: []              # 例: ["hello_reply"]
   watch: true               # 监视插件目录，文件变化即热加载/热重载/热关闭
 ```
 
@@ -282,8 +282,8 @@ plugins:
 ```python
 from protobot import Plugin, plain_text
 
-class AutoReply(Plugin):
-    name = "auto_reply"
+class HelloReply(Plugin):
+    name = "hello_reply"
     dependencies = ("chat_logger",)   # 前置插件：必须先于本插件加载
 
     def __init__(self):
@@ -314,7 +314,7 @@ class AutoReply(Plugin):
 - **热更新**：`plugins.watch = true`（默认）时，编辑 `plugins/` 下的文件
   保存即热重载——新增文件热加载、修改文件热重载、删除文件热关闭。语法
   错误或依赖缺失的重载会被拒绝，**旧插件继续运行**，不会打断在线 bot。
-- **配置开关**：`[plugins] disabled = ["auto_reply"]` 可禁用插件，依赖
+- **配置开关**：`[plugins] disabled = ["hello_reply"]` 可禁用插件，依赖
   被禁用插件的插件会被一并禁用并提示。
 
 ### LLM 智能体插件（llm_agent）
@@ -428,7 +428,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `tui.py` | Textual 全屏 TUI（可选 `tui` extra）与普通日志降级 |
 | `data/` | 内置各版本方块状态表 |
 | `cli.py` | 诊断控制台命令 |
-| `plugins/` | 示例插件（chat_logger、auto_reply、llm_agent） |
+| `plugins/` | 示例插件（chat_logger、llm_agent） |
 | `config.yaml` | 本地配置文件（首次启动向导生成，不入库） |
 
 ## 开发
