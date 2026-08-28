@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 import tempfile
 import time
 import unittest
@@ -16,6 +18,7 @@ from types import SimpleNamespace
 
 from protobot.plugin import PluginManager
 from protobot.protocol import PacketWriter
+from protobot.settings import PluginSettings
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
 
@@ -37,6 +40,10 @@ class FakeBot:
         self.username = "FakeBot"
         self.player = SimpleNamespace(x=0.0, y=64.0, z=0.0, yaw=0.0, pitch=0.0)
         self.registries = FakeRegistries(entity_types)
+        # 26.x 的包表里音效包是 117；插件默认从这里取，不再硬编码
+        self.version = SimpleNamespace(
+            packets=SimpleNamespace(clientbound_sound=117)
+        )
         self.entities: dict[int, object] = {}
         self.use_calls: list[str] = []
         self.fail_use = False
@@ -52,14 +59,24 @@ def bobber(entity_id: int = 7, type_id: int = 130, x=0.5, y=63.0, z=0.5):
     return SimpleNamespace(entity_id=entity_id, type_id=type_id, x=x, y=y, z=z)
 
 
+def plugin_module(plugin):
+    """插件被 exec 进匿名模块，取它的模块级常量只能这样拿。"""
+    return sys.modules[type(plugin).__module__]
+
+
 def load_plugin(tmp: str, settings: dict | None = None):
     manager = PluginManager([PLUGIN_DIR])
     manager.discover()
     plugin = manager.plugins["fishing"]
     plugin.manager = manager
-    plugin._file = Path(tmp) / "fishing.json"
+    plugin._config = PluginSettings(
+        Path(tmp) / "fishing.json",
+        plugin_module(plugin).DEFAULT_SETTINGS,
+        label="钓鱼",
+        normalize=type(plugin)._normalize,
+    )
     if settings is not None:
-        plugin._file.write_text(json.dumps(settings), encoding="utf-8")
+        plugin._config.path.write_text(json.dumps(settings), encoding="utf-8")
     plugin._load_settings()
     return manager, plugin
 
@@ -68,7 +85,7 @@ class SettingsTest(unittest.TestCase):
     def test_template_written_and_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _, plugin = load_plugin(tmp)
-            saved = json.loads(plugin._file.read_text(encoding="utf-8"))
+            saved = json.loads(plugin._config.path.read_text(encoding="utf-8"))
             self.assertFalse(saved["enabled"])
             self.assertEqual(saved["hand"], "main_hand")
             self.assertFalse(plugin._settings["enabled"])
@@ -99,7 +116,7 @@ class SettingsTest(unittest.TestCase):
     def test_corrupt_file_falls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _, plugin = load_plugin(tmp)
-            plugin._file.write_text("not json", encoding="utf-8")
+            plugin._config.path.write_text("not json", encoding="utf-8")
             plugin._load_settings()
             self.assertEqual(plugin._settings["bite_drop"], 0.12)
 
@@ -108,10 +125,10 @@ class SettingsTest(unittest.TestCase):
             _, plugin = load_plugin(tmp, {"enabled": True})
             plugin._state = "waiting"
             plugin._bobber_id = 7
-            plugin._file.write_text(
+            plugin._config.path.write_text(
                 json.dumps({"enabled": False}), encoding="utf-8"
             )
-            plugin._mtime -= 1.0
+            os.utime(plugin._config.path, (0, 0))  # 让 mtime 明确不同
             plugin._maybe_reload()
             self.assertFalse(plugin._settings["enabled"])
             self.assertEqual(plugin._state, "idle")  # 关闭时清空追踪
@@ -475,7 +492,9 @@ class SoundBiteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.use_calls, [])
 
     async def test_zero_packet_id_disables_the_sound_path(self) -> None:
+        # 设置里显式写 0 = 关闭这一路（版本表也不再参与）
         self.plugin._settings["sound_packet_id"] = 0
+        self.bot.version.packets.clientbound_sound = 0
         await self.plugin._on_packet(self._packet(sound_payload()))
         self.assertEqual(self.bot.use_calls, [])
 
@@ -519,6 +538,24 @@ class SoundBiteTest(unittest.IsolatedAsyncioTestCase):
         decoded = self.plugin._decode_sound(sound_payload(640, 1.25, 62.5, -3.0))
         self.assertEqual(decoded, (640, 1.25, 62.5, -3.0))
 
+    def test_packet_id_comes_from_the_version_table(self) -> None:
+        self.assertEqual(self.plugin._sound_packet_id(), 117)
+
+    def test_explicit_setting_overrides_the_version_table(self) -> None:
+        self.plugin._settings["sound_packet_id"] = 200
+        self.assertEqual(self.plugin._sound_packet_id(), 200)
+
+    async def test_unverified_version_disables_the_sound_path(self) -> None:
+        # 1.21.11 那一类版本的音效包 ID 未核实，表里是 0：宁可不判也不误判
+        self.bot.version.packets.clientbound_sound = 0
+        self.assertEqual(self.plugin._sound_packet_id(), 0)
+        await self.plugin._on_packet(self._packet(sound_payload()))
+        self.assertEqual(self.bot.use_calls, [])
+
+    async def test_missing_version_disables_the_sound_path(self) -> None:
+        self.plugin.bot = SimpleNamespace(entities={})  # 没有 version 属性
+        self.assertEqual(self.plugin._sound_packet_id(), 0)
+
 
 class ExposedServiceTest(unittest.IsolatedAsyncioTestCase):
     """fishing.start / stop / status：供其他插件与 LLM 调用。"""
@@ -532,7 +569,7 @@ class ExposedServiceTest(unittest.IsolatedAsyncioTestCase):
         self._tmp.cleanup()
 
     def _saved(self) -> dict:
-        return json.loads(self.plugin._file.read_text(encoding="utf-8"))
+        return json.loads(self.plugin._config.path.read_text(encoding="utf-8"))
 
     def test_exposures_declared(self) -> None:
         exposed = {service.name: service for service in self.plugin.exposed()}
@@ -607,7 +644,6 @@ class LifecycleTest(unittest.IsolatedAsyncioTestCase):
     async def test_enable_starts_the_loop_and_disable_cancels_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager, plugin = load_plugin(tmp, {"enabled": True})
-            plugin._file = Path(tmp) / "fishing.json"
             await plugin.on_enable()
             try:
                 self.assertIsNotNone(plugin._loop_task)

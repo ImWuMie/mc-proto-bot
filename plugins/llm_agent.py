@@ -47,7 +47,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from protobot import Plugin, PluginError, log, plain_text
+from protobot import Plugin, PluginError, PluginSettings, log, plain_text
 
 # ======================== 默认设置 ========================
 
@@ -466,17 +466,6 @@ def estimate_tokens(text: str) -> int:
     return cjk + (len(text) - cjk + 3) // 4
 
 
-def _deep_merge(base: dict, extra: dict) -> dict:
-    """递归合并两个字典；extra 覆盖 base，嵌套字典逐层合并。"""
-    result = dict(base)
-    for key, value in extra.items():
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-
 def _http_post_json(
     url: str, payload: dict, headers: dict, timeout: float
 ) -> dict:
@@ -514,7 +503,8 @@ class LLMAgent(Plugin):
     def __init__(self) -> None:
         super().__init__()
         self._settings: dict = copy.deepcopy(DEFAULT_SETTINGS)
-        self._settings_file: Path | None = None
+        self._config: PluginSettings | None = None
+        self._settings_file: Path | None = None  # = self._config.path，供日志引用
         self._persona_file: Path | None = None
         self._persona_mtime: float | None = None
         self._memory_dir: Path | None = None
@@ -528,7 +518,6 @@ class LLMAgent(Plugin):
         self._queue: asyncio.Queue | None = None
         self._worker_task: asyncio.Task | None = None
         self._settings_task: asyncio.Task | None = None
-        self._settings_mtime: float | None = None  # 设置文件修改时间快照
         self._requester: str | None = None  # 当前触发聊天的玩家名（权限判定用）
         self._connected_at: float | None = None  # 本次连接建立的单调时刻
         self._sent_recent: list[tuple[float, str]] = []  # 近期发送 (时间, 内容)
@@ -583,79 +572,51 @@ class LLMAgent(Plugin):
         log.info("[LLM] 智能体插件已关闭。")
 
     def _resolve_settings_file(self) -> None:
-        if self._settings_file is not None:
-            return
-        source = (
-            self.manager.source_of(self.name)
-            if self.manager is not None
-            else None
-        )
-        base = source.parent if source is not None else Path("plugins")
-        self._settings_file = base / "llm_agent.json"
+        if self._config is None:
+            self._config = self.settings_file(
+                "llm_agent.json", DEFAULT_SETTINGS,
+                label="LLM", normalize=self._normalize,
+            )
+            self._settings_file = self._config.path
+
+    @staticmethod
+    def _normalize(merged: dict) -> dict:
+        """本插件自己的取值钳制（读写与热重载的管线交给框架）。"""
+        try:
+            merged["history_limit"] = max(
+                10, min(2000, int(merged.get("history_limit", 200)))
+            )
+        except (TypeError, ValueError):
+            merged["history_limit"] = 200
+        if not isinstance(merged.get("llm"), dict):
+            merged["llm"] = copy.deepcopy(DEFAULT_SETTINGS["llm"])
+        try:
+            merged["llm"]["max_tokens"] = max(
+                1000, min(10_000_000, int(merged["llm"].get("max_tokens", 1_000_000)))
+            )
+        except (TypeError, ValueError):
+            merged["llm"]["max_tokens"] = 1_000_000
+        try:
+            merged["llm"]["compact_reserve_ratio"] = max(
+                0.01,
+                min(0.5, float(merged["llm"].get("compact_reserve_ratio", 0.05))),
+            )
+        except (TypeError, ValueError):
+            merged["llm"]["compact_reserve_ratio"] = 0.05
+        if not isinstance(merged.get("reply"), dict):
+            merged["reply"] = copy.deepcopy(DEFAULT_SETTINGS["reply"])
+        try:
+            merged["reply"]["attention_seconds"] = max(
+                0.0, min(300.0, float(merged["reply"].get("attention_seconds", 0.0)))
+            )
+        except (TypeError, ValueError):
+            merged["reply"]["attention_seconds"] = 0.0
+        merged["admins"] = [str(admin) for admin in (merged.get("admins") or [])]
+        return merged
 
     def _load_settings(self) -> None:
-        """读取设置文件；缺失时写出默认设置，损坏时回退默认并警告。"""
-        merged = copy.deepcopy(DEFAULT_SETTINGS)
-        path = self._settings_file
-        if path is not None and path.exists():
-            try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    merged = _deep_merge(merged, loaded)
-                else:
-                    log.warn("[LLM] 设置文件不是 JSON 对象，使用默认设置。")
-            except (OSError, ValueError) as error:
-                log.warn(f"[LLM] 设置文件读取失败，使用默认设置 ({error})")
-        elif path is not None:
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    json.dumps(DEFAULT_SETTINGS, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                log.info(f"[LLM] 已生成默认设置文件: {path}（请填写 api_key）")
-            except OSError as error:
-                log.warn(f"[LLM] 无法写入默认设置文件 ({error})")
-        self._settings = merged
-        try:
-            limit = int(merged.get("history_limit", 200))
-            self._settings["history_limit"] = max(10, min(2000, limit))
-        except (TypeError, ValueError):
-            self._settings["history_limit"] = 200
-        try:
-            max_tokens = int(merged["llm"].get("max_tokens", 1_000_000))
-            self._settings["llm"]["max_tokens"] = max(
-                1000, min(10_000_000, max_tokens)
-            )
-        except (TypeError, ValueError, KeyError):
-            self._settings["llm"]["max_tokens"] = 1_000_000
-        try:
-            ratio = float(merged["llm"].get("compact_reserve_ratio", 0.05))
-            self._settings["llm"]["compact_reserve_ratio"] = max(
-                0.01, min(0.5, ratio)
-            )
-        except (TypeError, ValueError, KeyError):
-            self._settings["llm"]["compact_reserve_ratio"] = 0.05
-        if not isinstance(merged.get("reply"), dict):
-            self._settings["reply"] = dict(DEFAULT_SETTINGS["reply"])
-        try:
-            attention = float(
-                self._settings["reply"].get("attention_seconds", 15.0)
-            )
-            self._settings["reply"]["attention_seconds"] = max(
-                0.0, min(300.0, attention)
-            )
-        except (TypeError, ValueError):
-            self._settings["reply"]["attention_seconds"] = 15.0
-        self._settings["admins"] = [
-            str(admin) for admin in (merged.get("admins") or [])
-        ]
-        try:
-            self._settings_mtime = (
-                path.stat().st_mtime if path is not None and path.exists() else None
-            )
-        except OSError:
-            self._settings_mtime = None
+        self._config.load()
+        self._settings = self._config.data
 
     async def _settings_watcher(self) -> None:
         """监视 llm_agent.json：修改后自动重新加载设置（约 3 秒生效）。
@@ -681,21 +642,15 @@ class LLMAgent(Plugin):
         self._persona_mtime = mtime
 
     async def _check_settings_changed(self) -> None:
-        path = self._settings_file
-        if path is None or not path.exists():
+        if self._config is None or not self._config.reload_if_changed():
             return
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return
-        if self._settings_mtime is not None and mtime != self._settings_mtime:
-            self._load_settings()
-            self._resolve_dirs()
-            admins = self._settings.get("admins") or []
-            log.info(
-                f"[LLM] 设置文件已更新并重新加载"
-                f"（管理员: {', '.join(admins) if admins else '未限制'}）。"
-            )
+        self._settings = self._config.data
+        self._resolve_dirs()
+        admins = self._settings.get("admins") or []
+        log.info(
+            f"[LLM] 设置文件已更新并重新加载"
+            f"（管理员: {', '.join(admins) if admins else '未限制'}）。"
+        )
 
     def _resolve_dirs(self) -> None:
         base = self._settings_file.parent

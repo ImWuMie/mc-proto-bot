@@ -31,17 +31,16 @@ LLM 调用暴露出来的 ``fishing.start`` / ``fishing.stop`` / ``fishing.statu
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from pathlib import Path
 
-from protobot import Plugin, log
+from protobot import Plugin, PluginSettings, log
 from protobot.protocol import PacketReader
 
 DEFAULT_SETTINGS: dict = {
     "enabled": False,  # 改成 true 才开始自动钓鱼
     "hand": "main_hand",  # 用哪只手甩竿：main_hand / off_hand
-    "sound_packet_id": 117,  # 音效包 ID（协议 775/776 均为 117/0x75）；0 关闭该路
+    "sound_packet_id": None,  # 音效包 ID；null = 按连接的协议版本自动取（26.x 为 117）
     "sound_id": None,  # 咬钩音效的数字 ID；null = 自动学习并记住
     "sound_radius": 1.5,  # 音效位置与浮标的最大距离（格）
     "bite_velocity": -0.15,  # 向下速度阈值（格/tick，原版咬钩约 -0.4）；0 关闭该路
@@ -63,9 +62,8 @@ class AutoFishing(Plugin):
 
     def __init__(self) -> None:
         super().__init__()
-        self._file: Path | None = None
-        self._settings: dict = dict(DEFAULT_SETTINGS)
-        self._mtime: float | None = None
+        self._config: PluginSettings | None = None
+        self._settings: dict = AutoFishing._normalize(dict(DEFAULT_SETTINGS))
         self._loop_task: asyncio.Task | None = None
         self._tick_count = 0
         # 浮标追踪
@@ -81,6 +79,7 @@ class AutoFishing(Plugin):
         self._reeling = False
         self._catches = 0
         self._learned_sound: int | None = None  # 学到的咬钩音效 ID
+        self._warned_no_sound = False  # 版本没有已核实的音效包 ID 时只提示一次
         self.subscribe("entity_add", self._on_entity_add)
         self.subscribe("entity_motion", self._on_entity_motion)
         self.subscribe("entity_move", self._on_entity_move)
@@ -147,35 +146,28 @@ class AutoFishing(Plugin):
         )
 
     def _set_enabled(self, enabled: bool) -> None:
-        """就地改开关并写回 fishing.json，避免 5 秒后被文件内容覆盖回去。"""
-        self._settings["enabled"] = enabled
+        """改开关并只把这一个键写回 fishing.json。
+
+        只 patch 一个键，不整份回写：否则会覆盖用户在这期间改过的其他值，
+        还会把一个只写了一行的文件展开成全部默认项。
+        """
         if not enabled:
             self._reset()
-        path = self._file
-        if path is None:
-            return
-        try:
-            data = dict(self._settings)
-            path.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            self._mtime = path.stat().st_mtime  # 自己写的，不算「外部改动」
-        except OSError as error:
+        error = self._config.patch({"enabled": enabled})
+        self._settings = self._config.data
+        if error:
             log.warn(f"[钓鱼] 开关状态写回失败 ({error})")
+            self._settings["enabled"] = enabled  # 至少让本进程内生效
         log.info(f"[钓鱼] {'开始' if enabled else '停止'}自动钓鱼。")
-
 
     # ---- 生命周期 ----
 
     async def on_enable(self) -> None:
-        if self._file is None:
-            source = (
-                self.manager.source_of(self.name)
-                if self.manager is not None
-                else None
+        if self._config is None:
+            self._config = self.settings_file(
+                "fishing.json", DEFAULT_SETTINGS,
+                label="钓鱼", normalize=self._normalize,
             )
-            base = source.parent if source is not None else Path("plugins")
-            self._file = base / "fishing.json"
         self._load_settings()
         self._loop_task = asyncio.create_task(
             self._loop(), name="protobot-fishing"
@@ -184,7 +176,7 @@ class AutoFishing(Plugin):
             log.info("[钓鱼] 已启用，等待连接后开始自动抛竿。")
         else:
             log.info(
-                f"[钓鱼] 插件已加载但未开启：把 {self._file} 里的 "
+                f"[钓鱼] 插件已加载但未开启：把 {self._config.path} 里的 "
                 'enabled 改成 true 即可（约 5 秒生效）。'
             )
 
@@ -210,31 +202,10 @@ class AutoFishing(Plugin):
         self._state = "idle"
         self._reeling = False
 
-    # ---- 设置：生成模板 + mtime 热重载 ----
+    # ---- 设置：默认值与钳制由本插件负责，读写/热重载交给框架 ----
 
-    def _load_settings(self) -> None:
-        path = self._file
-        if path is None:
-            return
-        if not path.exists():
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    json.dumps(DEFAULT_SETTINGS, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                log.info(f"[钓鱼] 已生成默认设置: {path}")
-            except OSError as error:
-                log.warn(f"[钓鱼] 无法写入默认设置 ({error})")
-        merged = dict(DEFAULT_SETTINGS)
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                merged.update(loaded)
-            else:
-                log.warn("[钓鱼] 设置文件不是 JSON 对象，使用默认设置。")
-        except (OSError, ValueError) as error:
-            log.warn(f"[钓鱼] 设置读取失败，使用默认设置 ({error})")
+    @staticmethod
+    def _normalize(merged: dict) -> dict:
         merged["enabled"] = bool(merged.get("enabled", False))
         if merged.get("hand") not in ("main_hand", "off_hand"):
             merged["hand"] = "main_hand"
@@ -250,7 +221,7 @@ class AutoFishing(Plugin):
         for key in ("sound_packet_id", "sound_id"):
             value = merged.get(key)
             if value is None or str(value) == "":
-                merged[key] = None if key == "sound_id" else 0
+                merged[key] = None  # 交给版本表决定 / 自动学习
                 continue
             try:
                 merged[key] = int(value)
@@ -262,30 +233,24 @@ class AutoFishing(Plugin):
             merged["settle_updates"] = 3
         merged["recast_delay"] = max(0.05, merged["recast_delay"])
         merged["max_wait"] = max(5.0, merged["max_wait"])
-        self._settings = merged
-        try:
-            self._mtime = path.stat().st_mtime
-        except OSError:
-            self._mtime = None
+        return merged
+
+    def _load_settings(self) -> None:
+        self._config.load()
+        self._settings = self._config.data
 
     def _maybe_reload(self) -> None:
-        path = self._file
-        if path is None or not path.exists():
+        was_on = self._settings.get("enabled")
+        if not self._config.reload_if_changed():
             return
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return
-        if self._mtime is not None and mtime != self._mtime:
-            was_on = self._settings.get("enabled")
-            self._load_settings()
-            now_on = self._settings.get("enabled")
-            if was_on != now_on:
-                log.info(f"[钓鱼] 设置已更新：{'开启' if now_on else '关闭'}。")
-                if not now_on:
-                    self._reset()
-            else:
-                log.info("[钓鱼] 设置已更新。")
+        self._settings = self._config.data
+        now_on = self._settings.get("enabled")
+        if was_on != now_on:
+            log.info(f"[钓鱼] 设置已更新：{'开启' if now_on else '关闭'}。")
+            if not now_on:
+                self._reset()
+        else:
+            log.info("[钓鱼] 设置已更新。")
 
     # ---- 主循环：只管抛竿、超时与重抛（咬钩判定在事件里） ----
 
@@ -418,7 +383,7 @@ class AutoFishing(Plugin):
 
         ``packet`` 事件对每个入站包都会触发，所以第一步只做一次整数比较。
         """
-        wanted = self._settings["sound_packet_id"]
+        wanted = self._sound_packet_id()
         if not wanted or packet.packet_id != wanted:
             return
         if not self._watching_sound():
@@ -446,6 +411,26 @@ class AutoFishing(Plugin):
             log.info(f"[钓鱼] 已学到咬钩音效 ID={sound_id}，之后按它精确判定。")
         log.debug(f"[钓鱼] 音效信号命中 id={sound_id}。")
         await self._reel(caught=True)
+
+    def _sound_packet_id(self) -> int:
+        """音效包 ID：设置里写死的优先，否则问当前版本的包表。
+
+        版本表里为 0 表示这个版本的 ID 未经核实（例如 1.21.11），此时音效
+        这一路直接关掉——拿推断值去解析只会误判，另外两路信号足够兜住。
+        """
+        configured = self._settings.get("sound_packet_id")
+        if configured:
+            return int(configured)
+        version = getattr(self.bot, "version", None)
+        packets = getattr(version, "packets", None)
+        resolved = int(getattr(packets, "clientbound_sound", 0) or 0)
+        if not resolved and not self._warned_no_sound:
+            self._warned_no_sound = True
+            log.info(
+                "[钓鱼] 当前版本没有已核实的音效包 ID，音效判定已关闭"
+                "（改用速度/下沉两路；可在 fishing.json 里手填 sound_packet_id）。"
+            )
+        return resolved
 
     def _watching_sound(self) -> bool:
         return (

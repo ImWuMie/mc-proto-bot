@@ -420,8 +420,9 @@ class HelloReply(Plugin):
    而甩竿/收杆的音效发在**玩家所在处**，所以「音效位置离浮标 `sound_radius`
    格内」既能认出咬钩，也能排除自己甩竿和别人钓鱼。音效数字 ID 逐版本变动且
    不由服务端下发（`minecraft:sound_event` 是内置注册表），因此这里**不硬编码**：
-   第一次靠位置认出咬钩时把 ID 学下来，之后要求 ID 也匹配。可用 `sound_id`
-   固定，或把 `sound_packet_id` 设为 0 关掉这一路。
+   第一次靠位置认出咬钩时把 ID 学下来，之后要求 ID 也匹配。包 ID 取自所连版本
+   的包表——该版本的 ID 未经核实时（如 1.21.11）这一路直接关闭，而不是拿推断值
+   去解析。也可用 `sound_id` / `sound_packet_id` 手动固定。
 2. **向下速度**——`entity_motion` 报出浮标的向下速度（原版咬钩约 -0.4 格/tick）。
 3. **位置下沉**——浮标从静止水面基准线被拽下超过 `bite_drop`。
 
@@ -508,7 +509,8 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `srv.py` | 零依赖的 `_minecraft._tcp` SRV 查询 |
 | `world.py` / `state.py` | 世界/区块解码、方块状态注册表、实体/物品栏状态 |
 | `modlist.py` | Forge/NeoForge/Fabric 加载器适配、Velocity forwarding |
-| `plugin.py` | 插件框架：目录发现、依赖拓扑排序、异常隔离、热加载/热重载/热关闭 |
+| `plugin.py` | 插件框架：目录发现、依赖拓扑排序、异常隔离、热加载/热重载/热关闭、`expose()` 服务 |
+| `settings.py` | 插件伴生配置：默认值、深合并、mtime 热重载、单键写回 |
 | `session.py` | `BotSession` 会话（重连循环）与 `BotContainer` 容器 |
 | `text.py` | 聊天组件转纯文本（`plain_text`） |
 | `config.py` | 零依赖的 YAML 子集编解码（`config.yaml`） |

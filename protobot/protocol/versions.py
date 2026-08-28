@@ -70,6 +70,9 @@ class PlayPacketIds:
     serverbound_tick_end: int
     serverbound_use_item: int
     serverbound_teleport_confirm: int = 0
+    #: 位置型音效包。0 = 这个版本的 ID 未经核实，依赖它的功能应自行降级，
+    #: 而不是拿一个推断值去解析（解错了会误判）。
+    clientbound_sound: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +210,7 @@ _PLAY_774 = PlayPacketIds(
 )
 
 _PLAY_775_776 = PlayPacketIds(
+    clientbound_sound=0x75,  # 116/117/119 = sound_entity/sound/stop_sound
     clientbound_add_entity=0x01,
     clientbound_custom_payload=0x18,
     clientbound_container_close=0x11,

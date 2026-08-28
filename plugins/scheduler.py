@@ -154,13 +154,7 @@ class Scheduler(Plugin):
 
     async def on_enable(self) -> None:
         if self._file is None:
-            source = (
-                self.manager.source_of(self.name)
-                if self.manager is not None
-                else None
-            )
-            base = source.parent if source is not None else Path("plugins")
-            self._file = base / "scheduler.json"
+            self._file = self.data_path("scheduler.json")
         self._load_tasks()
         self._loop_task = asyncio.create_task(
             self._loop(), name="protobot-scheduler"

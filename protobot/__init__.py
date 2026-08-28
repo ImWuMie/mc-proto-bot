@@ -57,6 +57,7 @@ from .plugin import (
 )
 from .protocol.versions import SUPPORTED_VERSIONS, VersionSpec, get_version
 from .session import BotContainer, BotSession, SessionConfig
+from .settings import PluginSettings, deep_merge
 from .srv import resolve_minecraft_srv
 from .text import plain_text
 from .tui import ProtoBotApp, StdoutProxy, classify_submission, tui_enabled
@@ -112,6 +113,7 @@ __all__ = [
     "Plugin",
     "PluginError",
     "PluginManager",
+    "PluginSettings",
     "PluginWatcher",
     "ProtoBotApp",
     "ProtocolError",
@@ -125,6 +127,7 @@ __all__ = [
     "World",
     "classify_submission",
     "connect",
+    "deep_merge",
     "get_version",
     "make_adapter",
     "plain_text",

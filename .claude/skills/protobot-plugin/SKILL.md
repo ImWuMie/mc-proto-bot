@@ -205,6 +205,52 @@ class Fishing(Plugin):
   normal signature — no `**kwargs` needed. Plugin-to-plugin calls are strict,
   so a wrong keyword there raises.
 
+## Companion files (settings, state)
+
+Do not hand-roll settings loading. `self.data_path("name.json")` resolves a path
+**next to the plugin's own source file**, and
+`self.settings_file(filename, DEFAULTS, label=..., normalize=...)` returns a
+`PluginSettings` that handles the whole lifecycle:
+
+```python
+DEFAULTS = {"enabled": False, "delay": 5.0}
+
+class Thing(Plugin):
+    name = "thing"
+
+    def __init__(self):
+        super().__init__()
+        self._config = None
+        self._settings = dict(DEFAULTS)
+
+    @staticmethod
+    def _normalize(merged: dict) -> dict:      # your clamping/coercion
+        merged["delay"] = max(0.5, float(merged.get("delay", 5.0)))
+        return merged
+
+    async def on_enable(self):
+        self._config = self.settings_file(
+            "thing.json", DEFAULTS, label="Thing", normalize=self._normalize
+        )
+        self._settings = self._config.load()
+
+    def _poll(self):                            # from your own loop
+        if self._config.reload_if_changed():
+            self._settings = self._config.data
+            log.info("[Thing] settings reloaded")
+```
+
+- `load()` writes the defaults on first run, deep-merges user values over them
+  (so a user who sets one key in a section keeps the defaults for the rest),
+  runs your `normalize`, and snapshots the mtime.
+- `reload_if_changed()` returns True when the file changed on disk. Poll it from
+  a loop you already have; there is no need for a task per settings file.
+- `patch({"key": value})` re-reads the file, applies just those keys, writes, and
+  re-snapshots — so a value the user edited meanwhile survives, keys they never
+  set are not expanded into the file, and your own write is not seen as an
+  external edit on the next poll. Use it whenever runtime state has to persist.
+- `deep_merge(base, extra)` is exported if you need it directly.
+
 ## Pre-delivery checklist
 
 - [ ] `name` is non-empty and unique; `dependencies` lists only real plugin names, no cycles

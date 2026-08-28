@@ -456,8 +456,10 @@ signals feed the detector, any one of which reels:
    own cast and other people's fishing. Sound ids shift between versions and
    are not sent by the server (`minecraft:sound_event` is a built-in
    registry), so nothing is hardcoded: the first bite recognised by position
-   **teaches** the plugin the id, which it then requires. Pin it via
-   `sound_id`, or set `sound_packet_id: 0` to switch the path off.
+   **teaches** the plugin the id, which it then requires. The packet id comes
+   from the connected version's table — a version whose id is not verified
+   (1.21.11) leaves this path off rather than parsing on a guess. Pin either
+   with `sound_id` / `sound_packet_id`.
 2. **Downward velocity** — `entity_motion` on the bobber (vanilla's bite is
    about -0.4 blocks/tick).
 3. **Position drop** — the bobber pulled `bite_drop` below its resting
@@ -555,7 +557,8 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `srv.py` | Dependency-free `_minecraft._tcp` SRV lookup |
 | `world.py` / `state.py` | World/chunk decoding, block-state registry, entity/inventory state |
 | `modlist.py` | Forge/NeoForge/Fabric loader adapters, Velocity forwarding |
-| `plugin.py` | Plugin framework: discovery, dependency ordering, exception isolation, hot load/reload/close |
+| `plugin.py` | Plugin framework: discovery, dependency ordering, exception isolation, hot load/reload/close, `expose()` services |
+| `settings.py` | Plugin companion files: defaults, deep merge, mtime hot reload, single-key writes |
 | `session.py` | `BotSession` reconnect loop and `BotContainer` |
 | `text.py` | Chat-component plain-text rendering (`plain_text`) |
 | `config.py` | Dependency-free YAML-subset codec for `config.yaml` |

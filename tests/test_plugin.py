@@ -963,5 +963,39 @@ class WatcherBaselineTest(unittest.IsolatedAsyncioTestCase):
                 await manager.disable_all()
 
 
+class DataPathTest(unittest.IsolatedAsyncioTestCase):
+    """伴生文件解析在插件源码旁边，而不是在当前工作目录。"""
+
+    SOURCE = (
+        "from protobot import Plugin\n\n"
+        "class Companion(Plugin):\n"
+        '    name = "companion"\n'
+    )
+
+    async def test_path_is_next_to_the_plugin_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "myplugins"
+            directory.mkdir()
+            (directory / "companion.py").write_text(self.SOURCE, encoding="utf-8")
+            manager = PluginManager([directory])
+            manager.discover()
+            await manager.enable_all()
+            try:
+                plugin = manager.plugins["companion"]
+                self.assertEqual(
+                    plugin.data_path("x.json"), directory / "x.json"
+                )
+                settings = plugin.settings_file("x.json", {"a": 1})
+                self.assertEqual(settings.path, directory / "x.json")
+                self.assertEqual(settings.data["a"], 1)
+            finally:
+                await manager.disable_all()
+
+    def test_unattached_plugin_falls_back_to_the_current_directory(self) -> None:
+        plugin = Plugin()
+        plugin.name = "loose"
+        self.assertEqual(plugin.data_path("x.json"), Path("x.json"))
+
+
 if __name__ == "__main__":
     unittest.main()

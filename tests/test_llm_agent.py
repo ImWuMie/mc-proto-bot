@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 import tempfile
 import time
 import unittest
@@ -17,6 +19,7 @@ from types import SimpleNamespace
 
 from protobot.events import EventBus
 from protobot.plugin import PluginManager
+from protobot.settings import PluginSettings
 
 PLUGIN_FILE = Path(__file__).resolve().parent.parent / "plugins" / "llm_agent.py"
 
@@ -118,14 +121,26 @@ def make_manager() -> PluginManager:
     return manager
 
 
+def plugin_module(plugin):
+    """插件被 exec 进匿名模块，取它的模块级常量只能这样拿。"""
+    return sys.modules[type(plugin).__module__]
+
+
 def configure(plugin, tmp: str, settings: dict | None = None) -> None:
     """Point the plugin at temp settings and derived dirs (no repo writes)."""
     path = Path(tmp) / "llm_agent.json"
-    plugin._settings_file = path
     if settings is not None:
         path.write_text(
             json.dumps(settings, ensure_ascii=False), encoding="utf-8"
         )
+    plugin._config = PluginSettings(
+        path,
+        plugin_module(plugin).DEFAULT_SETTINGS,
+        label="LLM",
+        normalize=type(plugin)._normalize,
+    )
+    plugin._settings_file = path
+    plugin._load_settings()
     plugin._resolve_dirs()
     plugin._generated_dir = Path(tmp) / "gen"  # 默认 ../plugins_llm 会逃出 tmp
 
@@ -471,18 +486,13 @@ class SettingsTest(unittest.TestCase):
         self.plugin = self.manager.plugins["llm_agent"]
 
     def _load(self, tmp: str, settings: dict | None = None) -> None:
-        self.plugin._settings_file = Path(tmp) / "llm_agent.json"
-        if settings is not None:
-            self.plugin._settings_file.write_text(
-                json.dumps(settings, ensure_ascii=False), encoding="utf-8"
-            )
-        self.plugin._load_settings()
+        configure(self.plugin, tmp, settings)
 
     def test_missing_settings_file_creates_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self._load(tmp)
             saved = json.loads(
-                self.plugin._settings_file.read_text(encoding="utf-8")
+                self.plugin._config.path.read_text(encoding="utf-8")
             )
             self.assertEqual(saved["llm"]["model"], "gpt-4o-mini")
             self.assertEqual(saved["history_limit"], 200)
@@ -509,7 +519,7 @@ class SettingsTest(unittest.TestCase):
     def test_corrupt_settings_fall_back_to_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self._load(tmp)
-            self.plugin._settings_file.write_text("not json", encoding="utf-8")
+            self.plugin._config.path.write_text("not json", encoding="utf-8")
             self._load(tmp)
             self.assertEqual(self.plugin._settings["llm"]["model"], "gpt-4o-mini")
 
@@ -547,8 +557,7 @@ class SettingsReloadTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._init(tmp, settings={"admins": []})
             self.assertEqual(self.plugin._settings["admins"], [])
-            path = self.plugin._settings_file
-            self.plugin._settings_mtime -= 1.0  # 模拟旧快照，避免同秒 mtime 抖动
+            path = self.plugin._config.path
             path.write_text(
                 json.dumps({"admins": ["_ImWuMie"]}, ensure_ascii=False),
                 encoding="utf-8",
@@ -574,8 +583,7 @@ class SettingsReloadTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn("Permission denied for _ImWuMie", result)
             # 管理员名单改成当前玩家后，设置自动重载立即生效
-            path = self.plugin._settings_file
-            self.plugin._settings_mtime -= 1.0
+            path = self.plugin._config.path
             path.write_text(
                 json.dumps({"admins": ["_ImWuMie"]}, ensure_ascii=False),
                 encoding="utf-8",
@@ -1233,16 +1241,13 @@ class AttentionWindowTest(unittest.IsolatedAsyncioTestCase):
 
     def test_settings_clamp_attention_seconds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            self.plugin._settings_file = Path(tmp) / "llm_agent.json"
-            self.plugin._settings_file.write_text(
-                json.dumps({"reply": {"attention_seconds": 9999}}),
-                encoding="utf-8",
+            configure(
+                self.plugin, tmp, {"reply": {"attention_seconds": 9999}}
             )
-            self.plugin._load_settings()
             self.assertEqual(
                 self.plugin._settings["reply"]["attention_seconds"], 300.0
             )
-            self.plugin._settings_file.write_text(
+            self.plugin._config.path.write_text(
                 json.dumps({"reply": {"attention_seconds": -5}}),
                 encoding="utf-8",
             )

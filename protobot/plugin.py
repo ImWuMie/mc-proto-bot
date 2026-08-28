@@ -25,7 +25,7 @@ import inspect
 import sys
 import traceback
 import types
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 from .events import EventHandler
 from .log import error as log_error
 from .log import warn
+from .settings import PluginSettings
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from .client import Bot
@@ -243,6 +244,41 @@ class Plugin:
         if self.manager is None:
             raise PluginError(f"[插件] {self.name}: 插件管理器不可用")
         return await self.manager.call_service(qualified, **kwargs)
+
+    # ---- companion files ----
+
+    def data_path(self, filename: str) -> Path:
+        """A path next to this plugin's own source file.
+
+        Settings, state, and memory belong beside the plugin, not beside the
+        working directory: resolving it from ``manager.source_of(self.name)``
+        means ``protobot run`` started from anywhere still finds the same file.
+        Falls back to the current directory only when the plugin is not
+        attached to a manager (unit tests constructing it directly).
+        """
+        source = (
+            self.manager.source_of(self.name)
+            if self.manager is not None
+            else None
+        )
+        base = source.parent if source is not None else Path()
+        return base / filename
+
+    def settings_file(
+        self,
+        filename: str,
+        defaults: Mapping[str, Any],
+        *,
+        label: str = "",
+        normalize: Callable[[dict], dict] | None = None,
+    ) -> PluginSettings:
+        """A :class:`~protobot.settings.PluginSettings` for a companion file."""
+        return PluginSettings(
+            self.data_path(filename),
+            defaults,
+            label=label or self.name,
+            normalize=normalize,
+        )
 
     # ---- internals (called by PluginManager) ----
 
