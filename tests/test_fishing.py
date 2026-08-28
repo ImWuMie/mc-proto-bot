@@ -81,6 +81,169 @@ def load_plugin(tmp: str, settings: dict | None = None):
     return manager, plugin
 
 
+class ArmingTest(unittest.IsolatedAsyncioTestCase):
+    """落水门控按时间来，不再依赖位置包（那是「一小时只钓上 6 条」的根因）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        _, self.plugin = load_plugin(self._tmp.name, {"enabled": True})
+        self.bot = FakeBot()
+        self.plugin.bot = self.bot
+        self.plugin._bobber_type = 130
+        self.plugin._state = "casting"
+        self.plugin._cast_at = time.monotonic()
+        self.plugin._next_cast_at = time.monotonic() + 999.0
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    async def _claim_and_wait(self) -> None:
+        await self.plugin._on_entity_add(bobber(entity_id=7, y=63.0))
+        self.bot.entities[7] = bobber(entity_id=7, y=63.0)
+        self.plugin._claim_at -= 10.0  # 落水延时已过
+        await self.plugin._step()
+
+    async def test_arms_without_a_single_position_packet(self) -> None:
+        # 水面上的浮标不动，服务端就不发位置包；以前基准线因此永远建立不起来
+        await self._claim_and_wait()
+        self.assertTrue(self.plugin._armed)
+        self.assertEqual(self.plugin._baseline, 63.0)
+
+    async def test_bite_after_arming_reels(self) -> None:
+        await self._claim_and_wait()
+        await self.plugin._on_entity_motion(7, (0.0, -0.3, 0.0), None)
+        self.assertEqual(self.bot.use_calls, ["main_hand"])
+        self.assertEqual(self.plugin._catches, 1)
+
+    async def test_vanilla_bite_velocity_is_inside_the_threshold(self) -> None:
+        # 原版咬钩把 vy 设成 -0.4 × [0.6, 1.0]，最弱的一档也要判出来
+        await self._claim_and_wait()
+        await self.plugin._on_entity_motion(7, (0.0, -0.24, 0.0), None)
+        self.assertEqual(self.plugin._catches, 1)
+
+    async def test_cast_impulse_before_arming_is_ignored(self) -> None:
+        # 朝下抛竿时初速度也是负的，门控没过就不能算咬钩
+        await self.plugin._on_entity_add(bobber(entity_id=7, y=70.0))
+        await self.plugin._on_entity_motion(7, (0.2, -0.6, 0.1), None)
+        self.assertEqual(self.bot.use_calls, [])
+        self.assertEqual(self.plugin._catches, 0)
+
+    async def test_dip_uses_the_armed_baseline(self) -> None:
+        await self._claim_and_wait()
+        await self.plugin._on_entity_move(7, bobber(entity_id=7, y=62.8))
+        self.assertEqual(self.plugin._catches, 1)
+
+    async def test_timeout_reports_what_it_saw(self) -> None:
+        await self._claim_and_wait()
+        await self.plugin._on_entity_motion(7, (0.0, -0.01, 0.0), None)
+        report = self.plugin._diagnosis()
+        self.assertIn("已认领", report)
+        self.assertIn("速度包=1", report)
+
+
+class WaterCheckTest(unittest.IsolatedAsyncioTestCase):
+    """落点不是水就立刻重抛，而不是干等满 max_wait。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        _, self.plugin = load_plugin(self._tmp.name, {"enabled": True})
+        self.bot = FakeBot()
+        self.plugin.bot = self.bot
+        self.plugin._bobber_type = 130
+        self.plugin._state = "waiting"
+        self.plugin._cast_at = time.monotonic()
+        self.plugin._bobber_id = 7
+        self.plugin._claim_at = time.monotonic() - 10.0
+        self.bot.entities[7] = bobber(entity_id=7, x=0.5, y=63.0, z=0.5)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _world(self, fluid: str | None, *, loaded: bool = True) -> None:
+        self.bot.world = SimpleNamespace(
+            chunks={(0, 0): object()} if loaded else {},
+            block_properties=lambda x, y, z: SimpleNamespace(fluid=fluid),
+        )
+
+    async def _look(self, times: int) -> None:
+        for _ in range(times):
+            await self.plugin._step()
+
+    async def test_water_keeps_fishing(self) -> None:
+        self._world("water")
+        await self._look(10)
+        self.assertEqual(self.plugin._state, "waiting")
+
+    async def test_dry_land_recasts_immediately(self) -> None:
+        self._world(None)
+        await self._look(plugin_module(self.plugin).DRY_CONFIRM)
+        self.assertEqual(self.plugin._state, "cooldown")
+        self.assertIsNone(self.plugin._bobber_id)
+
+    async def test_one_dry_read_is_not_enough(self) -> None:
+        # 抛得远时浮标可能还在水面上方飞，看一眼就重抛会误杀好竿
+        self._world(None)
+        await self._look(1)
+        self.assertEqual(self.plugin._state, "waiting")
+
+    async def test_landing_in_water_clears_earlier_dry_reads(self) -> None:
+        self._world(None)
+        await self._look(plugin_module(self.plugin).DRY_CONFIRM - 1)
+        self._world("water")  # 落水了
+        await self._look(10)
+        self.assertEqual(self.plugin._state, "waiting")
+
+    async def test_unloaded_chunk_is_unknown_not_dry(self) -> None:
+        # 没收到区块时所有格都读成空气，不能因此不停重抛
+        self._world(None, loaded=False)
+        await self._look(20)
+        self.assertEqual(self.plugin._state, "waiting")
+
+    async def test_no_world_is_unknown(self) -> None:
+        await self._look(20)  # FakeBot 没有 world 属性
+        self.assertEqual(self.plugin._state, "waiting")
+
+    async def test_check_can_be_turned_off(self) -> None:
+        self.plugin._settings["water_check"] = False
+        self._world(None)
+        await self._look(20)
+        self.assertEqual(self.plugin._state, "waiting")
+
+
+class CandidateClaimTest(unittest.IsolatedAsyncioTestCase):
+    """注册表算出的 type_id 对不上时，用候选兜底并纠正——否则整小时空转。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        _, self.plugin = load_plugin(self._tmp.name, {"enabled": True})
+        self.bot = FakeBot()
+        self.plugin.bot = self.bot
+        self.plugin._bobber_type = 999  # 假装注册表给了个错下标
+        self.plugin._state = "casting"
+        self.plugin._cast_at = time.monotonic()
+        self.plugin._next_cast_at = time.monotonic() + 999.0
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    async def test_mismatched_entity_is_kept_as_a_candidate(self) -> None:
+        await self.plugin._on_entity_add(bobber(entity_id=7, type_id=130))
+        self.assertIsNone(self.plugin._bobber_id)  # 先不认领
+        self.assertIsNotNone(self.plugin._candidate)
+
+    async def test_candidate_is_claimed_after_the_window(self) -> None:
+        await self.plugin._on_entity_add(bobber(entity_id=7, type_id=130))
+        self.plugin._cast_at -= 10.0  # spawn_window 已过
+        await self.plugin._step()
+        self.assertEqual(self.plugin._bobber_id, 7)
+        self.assertEqual(self.plugin._bobber_type, 130)  # 已纠正
+        self.assertEqual(self.plugin._state, "waiting")
+
+    async def test_far_entities_never_become_candidates(self) -> None:
+        await self.plugin._on_entity_add(bobber(entity_id=7, type_id=130, x=500.0))
+        self.assertIsNone(self.plugin._candidate)
+
+
 class SettingsTest(unittest.TestCase):
     def test_template_written_and_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,12 +267,12 @@ class SettingsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _, plugin = load_plugin(
                 tmp,
-                {"hand": "foot", "bite_drop": "abc", "settle_updates": 0,
+                {"hand": "foot", "bite_drop": "abc", "settle_delay": 0.0,
                  "recast_delay": 0.0, "max_wait": 1.0},
             )
             self.assertEqual(plugin._settings["hand"], "main_hand")
             self.assertEqual(plugin._settings["bite_drop"], 0.12)
-            self.assertEqual(plugin._settings["settle_updates"], 1)
+            self.assertEqual(plugin._settings["settle_delay"], 0.2)
             self.assertEqual(plugin._settings["recast_delay"], 0.05)
             self.assertEqual(plugin._settings["max_wait"], 5.0)
 
@@ -236,9 +399,16 @@ class BobberClaimTest(unittest.IsolatedAsyncioTestCase):
     async def test_learned_type_is_used_on_later_casts(self) -> None:
         self._casting(FakeBot())
         self.plugin._bobber_type = 130
-        self.plugin._cast_at -= 10.0  # 时间窗已过，但类型已知就不再受限
         await self.plugin._on_entity_add(bobber(entity_id=9, type_id=130))
         self.assertEqual(self.plugin._bobber_id, 9)
+
+    async def test_spawn_window_bounds_every_claim(self) -> None:
+        # 类型已知也要在窗口内、在身边：几分钟后生成的同类实体不是我的浮标
+        self._casting(FakeBot())
+        self.plugin._bobber_type = 130
+        self.plugin._cast_at -= 10.0
+        await self.plugin._on_entity_add(bobber(entity_id=9, type_id=130))
+        self.assertIsNone(self.plugin._bobber_id)
 
     async def test_entities_added_while_idle_are_ignored(self) -> None:
         self.plugin.bot = FakeBot()
@@ -263,9 +433,10 @@ class BiteDetectionTest(unittest.IsolatedAsyncioTestCase):
         self._tmp.cleanup()
 
     async def _settle(self, y: float = 63.0) -> None:
-        """喂几次几乎不动的位置更新，确立静止基准线。"""
-        for _ in range(self.plugin._settings["settle_updates"] + 1):
-            await self.plugin._on_entity_move(7, bobber(y=y))
+        """让浮标就位：落水延时已过，基准线取当前 Y。"""
+        self.bot.entities[7] = bobber(y=y)
+        self.plugin._claim_at = time.monotonic() - 10.0
+        await self.plugin._step()
 
     async def test_falling_arc_does_not_trigger(self) -> None:
         # 抛物线下落：每次 Y 变化都很大，绝不能被当成咬钩
@@ -618,8 +789,9 @@ class ExposedServiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_status_reports_the_current_stage(self) -> None:
         await self.plugin._service_start()
         self.plugin._state = "waiting"
-        self.plugin._baseline = None
-        self.assertIn("not settled", await self.plugin._service_status())
+        self.plugin._armed = False
+        self.assertIn("not watching yet", await self.plugin._service_status())
+        self.plugin._armed = True
         self.plugin._baseline = 63.0
         self.assertIn("watching the bobber", await self.plugin._service_status())
         self.plugin._state = "cooldown"

@@ -503,24 +503,40 @@ signals feed the detector, any one of which reels:
    from the connected version's table — a version whose id is not verified
    (1.21.11) leaves this path off rather than parsing on a guess. Pin either
    with `sound_id` / `sound_packet_id`.
-2. **Downward velocity** — `entity_motion` on the bobber (vanilla's bite is
-   about -0.4 blocks/tick).
+2. **Downward velocity** — `entity_motion` on the bobber. Vanilla sets the
+   hook's Y velocity to `-0.4 × [0.6, 1.0]` at the moment of the bite and
+   plays the splash in the same instant, so this signal and the sound are two
+   views of one event.
 3. **Position drop** — the bobber pulled `bite_drop` below its resting
    baseline.
 
 The bobber is claimed by looking `minecraft:fishing_bobber` up in the
 server's `minecraft:entity_type` registry, or else by adopting the first
 entity spawned within `spawn_window` seconds of the cast and `spawn_radius`
-blocks of the bot — **remembering its type id** so later casts are exact.
+blocks of the bot — **remembering its type id** so later casts are exact. If
+that id turns out to be wrong (a stray item or orb got adopted, or the
+registry index does not line up), the next cast that fails to claim anything
+adopts its candidate after `spawn_window` and **corrects the id**; without
+that, one bad guess would blind the plugin for the rest of the session.
 
-Signals 2 and 3 only count once the bobber has settled and a baseline exists:
-gravity during flight is downward too, so without that gate every cast would
-read as a bite. The sound path needs no such gate, since it only fires when a
-fish actually bites.
+Signals 2 and 3 arm `settle_delay` seconds after the bobber appears (1.2 s by
+default — a cast is in the air for about one). The gate is needed because a
+downward cast starts with negative velocity too. It is deliberately **not**
+"wait until consecutive position updates stop changing": a bobber resting on
+the water sends no position updates at all, so that baseline often never
+formed, both signals stayed gated off forever, and everything rode on the
+sound path. The sound needs no gate, since it only plays on a real bite.
 
-`max_wait` seconds without a bite (bobber on land, line cut) triggers a
-re-cast, as does the bobber being removed; `recast_delay` is the only gap
-between reeling and casting again.
+`water_check` (on by default) looks at the two blocks under the bobber once it
+has settled and re-casts as soon as they read "not water" five checks in a
+row, instead of waiting out `max_wait` with the line on dry land. An unloaded
+chunk reads as unknown, never as dry.
+
+`max_wait` seconds without a bite triggers a re-cast, as does the bobber being
+removed; the log line says what the cast actually saw (bobber claimed or not,
+how many velocity and position packets arrived, whether it was in water,
+whether the sound path is on), so a bad cast is diagnosable instead of a
+guess. `recast_delay` is the only gap between reeling and casting again.
 
 Settings live in `plugins/fishing.json` (generated on first run, re-read
 within 5 seconds of an edit) and it starts **`enabled: false`** — flip that to
