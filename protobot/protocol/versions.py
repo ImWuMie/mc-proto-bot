@@ -73,6 +73,11 @@ class PlayPacketIds:
     #: 位置型音效包。0 = 这个版本的 ID 未经核实，依赖它的功能应自行降级，
     #: 而不是拿一个推断值去解析（解错了会误判）。
     clientbound_sound: int = 0
+    #: 死亡与重生。同样以 0 表示「本版本未核实」——核心解析会跳过 0，
+    #: 避免把真正的 0x00 包错当成死亡信号。
+    clientbound_set_health: int = 0
+    clientbound_player_combat_kill: int = 0
+    serverbound_client_command: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +216,9 @@ _PLAY_774 = PlayPacketIds(
 
 _PLAY_775_776 = PlayPacketIds(
     clientbound_sound=0x75,  # 116/117/119 = sound_entity/sound/stop_sound
+    clientbound_set_health=0x68,  # 104: Float 血量, VarInt 饱食度, Float 饱和度
+    clientbound_player_combat_kill=0x44,  # 68: VarInt 实体 ID + 死亡消息组件
+    serverbound_client_command=0x0C,  # 12: 单个 VarInt，0 = perform respawn
     clientbound_add_entity=0x01,
     clientbound_custom_payload=0x18,
     clientbound_container_close=0x11,

@@ -25,4 +25,7 @@ plugins/scheduler.json
 # 自动钓鱼插件设置（运行时自动生成）
 plugins/fishing.json
 
+# 自动重生插件设置（运行时自动生成）
+plugins/respawn.json
+
 /run/

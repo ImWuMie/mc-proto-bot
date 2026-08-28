@@ -16,7 +16,13 @@ from contextlib import suppress
 from dataclasses import dataclass
 from types import TracebackType
 
-from .errors import ConnectionClosed, LoginRejected, OnlineModeRequired, ProtocolError
+from .errors import (
+    ConnectionClosed,
+    LoginRejected,
+    OnlineModeRequired,
+    ProtocolError,
+    UnsupportedVersion,
+)
 from .events import EventBus
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
 from .navigation import NavigationPath, NavigationTimeout, Pathfinder
@@ -612,6 +618,25 @@ class Bot:
             PacketWriter().write_short(slot).to_bytes(),
         )
         self.player.selected_hotbar_slot = slot
+
+    async def respawn(self) -> None:
+        """Leave the death screen: Client Status with action 0 (perform respawn).
+
+        The server never respawns a dead player on its own — not even with
+        ``doImmediateRespawn`` on, where the vanilla client just sends this
+        without showing the screen first. Confirming the teleport that follows
+        and re-sending Player Loaded is handled by the position handler, since
+        :meth:`_handle_respawn` clears ``player.loaded``.
+        """
+
+        self._require_play()
+        packet_id = self.version.packets.serverbound_client_command
+        if not packet_id:
+            raise UnsupportedVersion(
+                "serverbound_client_command 的包 ID 在 "
+                f"{self.version.name} 上未经核实，无法请求重生"
+            )
+        await self.send_raw(packet_id, PacketWriter().write_varint(0).to_bytes())
 
     async def send_command(self, command: str) -> None:
         """Send an unsigned command; a leading slash is accepted and removed."""
@@ -1513,6 +1538,13 @@ class Bot:
         elif packet.packet_id == ids.clientbound_respawn:
             self._handle_respawn(packet.payload)
             await self.events.emit("respawn", self.session)
+        elif (
+            ids.clientbound_player_combat_kill
+            and packet.packet_id == ids.clientbound_player_combat_kill
+        ):
+            await self._handle_player_combat_kill(packet.payload)
+        elif ids.clientbound_set_health and packet.packet_id == ids.clientbound_set_health:
+            await self._handle_set_health(packet.payload)
         elif packet.packet_id == ids.clientbound_section_blocks_update:
             await self._handle_section_blocks_update(packet.payload)
         elif packet.packet_id == ids.clientbound_set_entity_data:
@@ -2679,10 +2711,41 @@ class Bot:
         self.player.passenger_ids = ()
         self.player.loaded = False
         self.player.gliding = False
+        self.player.dead = False
         self.physics_state.gliding = False
         self.physics_state.gliding_ticks = 0
         self.world_ready.clear()
         self.loaded.clear()
+
+    async def _handle_set_health(self, payload: bytes) -> None:
+        reader = PacketReader(payload)
+        health = reader.read_float()
+        food = reader.read_varint()
+        saturation = reader.read_float()
+        reader.expect_end()
+        self.player.health = health
+        self.player.food = food
+        self.player.saturation = saturation
+        await self.events.emit("health", health, food, saturation)
+        # 血量归零也是死亡信号，但不如 combat_kill 权威：服务端按 tick 边界
+        # 补发，且插件可以缩放血量。死亡窗口内会反复收到 0，用 dead 去重。
+        if health <= 0.0 and not self.player.dead:
+            self.player.dead = True
+            await self.events.emit("death", None)
+
+    async def _handle_player_combat_kill(self, payload: bytes) -> None:
+        """Combat Death：服务端要求客户端显示死亡界面，即权威的死亡信号。"""
+        reader = PacketReader(payload)
+        entity_id = reader.read_varint()
+        message = read_anonymous_nbt(reader)
+        reader.expect_end()
+        if self.session.entity_id is not None and entity_id != self.session.entity_id:
+            return  # 别人的死亡（旁观视角等）不算自己死了。
+        self.player.health = 0.0
+        if self.player.dead:
+            return
+        self.player.dead = True
+        await self.events.emit("death", message)
 
     def _read_spawn_info(self, reader: PacketReader) -> None:
         dimension_type_id = reader.read_varint()

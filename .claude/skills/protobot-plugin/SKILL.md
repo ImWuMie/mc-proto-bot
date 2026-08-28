@@ -78,6 +78,13 @@ Containers/inventory:
 
 State/misc:
 - `position` (PlayerState) · `abilities` (PlayerAbilities) · `game_mode` (int)
+- `health` (health: float, food: int, saturation: float) — this bot's own health,
+  from `set_health`; `bot.player.health/food/saturation` hold the same values
+- `death` (message) — this bot died. `message` is the death-message component
+  (`plain_text()` it) or None when the signal came from health reaching 0. The
+  core fires it **once per death** (Combat Death and health≤0 are deduped via
+  `bot.player.dead`), and the bot stays on the death screen until someone calls
+  `await bot.respawn()` — see plugins/respawn.py
 - `game_event` (event_id, value) · `attributes` (entity_id, updates)
 - `login` (bot) · `ready` (bot) · `reconfiguration` (bot) · `transfer` (host, port)
 - `error` (BaseException) · `close` (reason: str\|None)
@@ -145,7 +152,11 @@ mod-loader events; ordinary plugins do not need them.
   `set_flying(flag)`, `start_gliding()`
 - Interaction: `click_container(slot, ...)`, `close_container()`, `use_item()`,
   `select_hotbar_slot(slot)`
-- State: `bot.player` (PlayerState: x/y/z, health, yaw/pitch), `bot.world`
+- Respawn: `await self.bot.respawn()` — leave the death screen (Client Status,
+  action 0). Nothing else does this for you; the server never respawns a dead
+  player on its own. Raises `UnsupportedVersion` on versions where that packet
+  id is unverified (protocol 774), so catch it and degrade instead of retrying
+- State: `bot.player` (PlayerState: x/y/z, health, food, dead, yaw/pitch), `bot.world`
   (chunks), `bot.entities`, `bot.containers`, `bot.session`, `bot.username`,
   `bot.uuid`, `bot.closed` (asyncio.Event), `bot.disconnect_reason`
 - Manager: `self.manager` (PluginManager, bound while the plugin is enabled):

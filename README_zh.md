@@ -18,7 +18,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **客户端物理**——20 Hz 确定性物理引擎，精确复刻原版移动逻辑，含船载物理与实体硬碰撞。
 - **导航寻路**——基于解码后世界的 A\* 路径规划与执行，支持自动重规划。
 - **模组加载器握手**——支持 Forge、NeoForge、Fabric 客户端模组声明，以及 Velocity modern forwarding。
-- **事件总线**——可订阅聊天、区块、实体、容器与原始数据包事件。
+- **事件总线**——可订阅聊天、区块、实体、容器、血量/死亡与原始数据包事件。
 - **插件系统与统一 CLI**——`plugins/` 目录自动发现插件，支持前置插件依赖、拓扑排序加载、异常隔离、热加载/热重载/热关闭；`protobot login|run|plugins|setup` 一个命令搞定授权、连服与插件管理，掉线自动重连。
 - **诊断 CLI**——针对本地服务器的在线回归检查与移动轨迹采集。
 
@@ -463,6 +463,49 @@ class HelloReply(Plugin):
 即可（start/stop 仅管理员）。手持鱼竿需要你自己保证：协议栈拿不到物品名称，
 插件无法校验手里到底是不是鱼竿。
 
+### 自动重生插件（respawn）
+
+`plugins/respawn.py` 让 bot 死了自己站起来。死亡后玩家会一直停在死亡界面上，
+**只有客户端主动请求**才会重生——服务端从不自己动手，即便开了
+`doImmediateRespawn` 也只是原版客户端不显示死亡界面而已。没有这一步，死掉的
+bot 就一直躺着：物理不跑、走不动、也不说话。
+
+死亡判定来自核心的 `death` 事件，它合并两路信号，**一次死亡只发一次**：
+
+1. **Combat Death**（协议 775/776 的 0x44 = 68）——这个包的用途就是「让客户端
+   弹出死亡界面」，所以服务端在玩家死亡时必然发它，也带着死亡消息（插件会记
+   下来）。按自己的实体 ID 过滤，旁边别人死了不算。
+2. **血量归零**（`set_health`，0x68 = 104）——兜底。服务端在 tick 边界补发、
+   顺序不受协议保证，而且服务器插件可以缩放血量，所以它不单独作为依据。
+
+重生动作是 Client Status（服务端方向 0x0C，载荷只有一个 VarInt，0 = perform
+respawn），由 `await bot.respawn()` 发出。之后服务端回重生包 + 一次带 teleport
+id 的位置同步；确认传送与补发 Player Loaded 由核心处理（重生处理会清掉
+`player.loaded`）。插件把 `respawn` 事件当作确认，等不到就按 `max_retries` 重试。
+
+设置在 `plugins/respawn.json`（首次运行生成，改动 5 秒内自动重载），**默认开启**：
+
+```json
+{
+  "enabled": true,
+  "delay": 1.0,
+  "retry_delay": 2.0,
+  "max_retries": 2,
+  "announce": "",
+  "return_to_death_point": false,
+  "return_max_distance": 200.0
+}
+```
+
+- `announce` 非空则重生后发这句聊天，留空不说话。
+- `return_to_death_point` 打开后会寻路走回死亡坐标，除非重生点离死亡点超过
+  `return_max_distance` 格。
+- 插件暴露 `respawn.status`、`respawn.now`（跳过延迟立刻重生）与 `respawn.set`
+  （后两个仅管理员），所以在游戏里问「你死了吗」、说「别自动重生了」都能生效；
+  `get_status` 也会一并报血量、饱食度和是否正躺在死亡界面上。
+- 协议 774（1.21.11）上这三个包 ID **未经核实**，`bot.respawn()` 会抛
+  `UnsupportedVersion`，插件提示一次就停手，绝不拿推断值发包。
+
 ### 全屏 TUI 界面（可选）
 
 `protobot run` 支持 Claude Code 风格的全屏界面：上方滚动日志区（会话与
@@ -539,7 +582,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `tui.py` | Textual 全屏 TUI（可选 `tui` extra）与普通日志降级 |
 | `data/` | 内置各版本方块状态表 |
 | `cli.py` | 诊断控制台命令 |
-| `plugins/` | 示例插件（chat_logger、llm_agent、scheduler） |
+| `plugins/` | 示例插件（chat_logger、llm_agent、scheduler、fishing、respawn） |
 | `config.yaml` | 本地配置文件（首次启动向导生成，不入库） |
 
 ## 开发

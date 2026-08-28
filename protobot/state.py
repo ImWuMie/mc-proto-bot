@@ -144,6 +144,12 @@ class PlayerState:
     on_ground: bool = False
     horizontal_collision: bool = False
     loaded: bool = False
+    #: 只有 clientbound_set_health 会更新它；该包未核实的版本上保持初始值。
+    health: float = 20.0
+    food: int = 20
+    saturation: float = 5.0
+    #: 收到死亡信号后为 True，收到重生包后清除。
+    dead: bool = False
     pose: str = "standing"
     crouching: bool = False
     swimming: bool = False

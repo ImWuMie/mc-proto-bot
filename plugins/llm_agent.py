@@ -1497,6 +1497,13 @@ class LLMAgent(Plugin):
         mode_names = {0: "survival", 1: "creative", 2: "adventure", 3: "spectator"}
         mode = mode_names.get(getattr(session, "game_mode", -1), "?")
         lines.append(f"Dimension: {dimension}  Game mode: {mode}")
+        # 血量只有在服务端下发过 set_health 后才准（该包 ID 未核实的版本上保持初值）。
+        health = getattr(player, "health", None)
+        if health is not None:
+            dead = " -- DEAD, waiting to respawn" if getattr(player, "dead", False) else ""
+            lines.append(
+                f"Health: {health:.1f}/20  Food: {getattr(player, 'food', '?')}/20{dead}"
+            )
         world = getattr(bot, "world", None)
         chunk_count = len(getattr(world, "chunks", ())) if world is not None else "?"
         entity_count = len(getattr(bot, "entities", ()))
