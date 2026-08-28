@@ -22,4 +22,7 @@ plugins_llm/
 # 定时任务插件数据（运行时自动生成/修改）
 plugins/scheduler.json
 
+# 自动钓鱼插件设置（运行时自动生成）
+plugins/fishing.json
+
 /run/
