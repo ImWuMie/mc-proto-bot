@@ -1,25 +1,31 @@
 """自动钓鱼插件：抛竿、判定咬钩、收杆，循环往复。
 
-判定思路（本协议栈没有音效包，因此不依赖 ``entity.fishing_bobber.splash``）：
+判定按可靠性排序，三路信号任一命中即收杆：
 
-  1. **认领浮标**——优先从服务端下发的 ``minecraft:entity_type`` 注册表里查
-     ``minecraft:fishing_bobber`` 的 type_id；查不到就把「抛竿后 2 秒内、
-     身边 8 格内新生成的实体」当作浮标，并**记住它的 type_id**，之后每次
-     抛竿都能精确认领。
-  2. **等它静止**——浮标飞行落水期间 Y 一直在变，连续几次更新几乎不动才
-     确立静止水面基准线（否则抛物线会被误判成咬钩）。
-  3. **两路信号**——``entity_motion`` 报出向下速度（原版咬钩约 -0.4 格/tick），
-     或位置从基准线下沉超过阈值；任一命中即视为咬钩，立刻收杆。
-     两路都只在基准线确立之后生效（否则抛物线下落时的重力速度会被误判），
-     且都可单独关闭、阈值可调。
+  1. **咬钩音效**（最准，原版就是靠它提示玩家）——``entity.fishing_bobber.splash``
+     由位置型音效包（协议 775/776 的 0x75 = 117）发出，坐标是**浮标所在处**；
+     甩竿/收杆的音效发在**玩家所在处**，因此「音效位置离浮标 1.5 格内」既能
+     认出咬钩，也能排除自己甩竿和别人钓鱼的动静。音效的数字 ID 逐版本变动
+     且不由服务端下发（``minecraft:sound_event`` 是内置注册表），所以这里
+     **不硬编码**：第一次靠位置认出咬钩时把 ID 学下来，之后要求 ID 也匹配。
+  2. **向下速度**——``entity_motion`` 报出浮标的向下速度（原版咬钩约 -0.4 格/tick）。
+  3. **位置下沉**——浮标从静止水面基准线被拽下超过阈值。
+
+浮标怎么认领：优先从服务端下发的 ``minecraft:entity_type`` 注册表里查
+``minecraft:fishing_bobber`` 的 type_id；查不到就把「抛竿后 2 秒内、身边
+8 格内新生成的实体」当作浮标，并**记住它的 type_id**，之后每次抛竿都精确认领。
+
+速度与下沉两路都必须等浮标落稳、基准线确立后才生效——飞行途中重力速度同样
+是负的、Y 也在持续下降，不做这个门控会一抛竿就误判。音效路不受此限制，它本身
+就只在鱼咬钩时才响。
 
 超时兜底：``max_wait`` 秒没咬钩（浮标落在陆地上、线被打断等）就收杆重抛；
-浮标被移除也会重抛。收杆与重抛之间只隔 ``recast_delay`` 秒（默认 0.4），
-在不显得机械的前提下尽量少空转。
+浮标被移除也会重抛。收杆与重抛之间只隔 ``recast_delay`` 秒（默认 0.4）。
 
 设置文件 ``fishing.json``（与本插件同目录，首次启用自动生成）修改后约 5 秒
-内自动重新加载，**默认 enabled=false**：把它改成 true 才会开始钓。手持鱼竿
-由你自己保证——本协议栈拿不到物品名称，插件无法校验手里是不是鱼竿。
+内自动重新加载，**默认 enabled=false**：把它改成 true 才会开始钓，也可以让
+LLM 调用暴露出来的 ``fishing.start`` / ``fishing.stop`` / ``fishing.status``。
+手持鱼竿由你自己保证——本协议栈拿不到物品名称，插件无法校验手里是不是鱼竿。
 """
 
 from __future__ import annotations
@@ -30,10 +36,14 @@ import time
 from pathlib import Path
 
 from protobot import Plugin, log
+from protobot.protocol import PacketReader
 
 DEFAULT_SETTINGS: dict = {
     "enabled": False,  # 改成 true 才开始自动钓鱼
     "hand": "main_hand",  # 用哪只手甩竿：main_hand / off_hand
+    "sound_packet_id": 117,  # 音效包 ID（协议 775/776 均为 117/0x75）；0 关闭该路
+    "sound_id": None,  # 咬钩音效的数字 ID；null = 自动学习并记住
+    "sound_radius": 1.5,  # 音效位置与浮标的最大距离（格）
     "bite_velocity": -0.15,  # 向下速度阈值（格/tick，原版咬钩约 -0.4）；0 关闭该路
     "bite_drop": 0.12,  # 相对静止基准线的下沉阈值（格）；0 关闭该路
     "settle_updates": 3,  # 连续多少次位置更新几乎不动才算落稳
@@ -70,11 +80,13 @@ class AutoFishing(Plugin):
         self._next_cast_at = 0.0
         self._reeling = False
         self._catches = 0
+        self._learned_sound: int | None = None  # 学到的咬钩音效 ID
         self.subscribe("entity_add", self._on_entity_add)
         self.subscribe("entity_motion", self._on_entity_motion)
         self.subscribe("entity_move", self._on_entity_move)
         self.subscribe("entity_teleport", self._on_entity_teleport)
         self.subscribe("entities_remove", self._on_entities_remove)
+        self.subscribe("packet", self._on_packet)
         self.subscribe_session("session_ready", self._on_session_ready)
         # 暴露给其他插件与 LLM：fishing.start / fishing.stop / fishing.status
         self.expose(
@@ -229,9 +241,19 @@ class AutoFishing(Plugin):
         for key in (
             "bite_velocity", "bite_drop", "settle_epsilon",
             "recast_delay", "max_wait", "spawn_window", "spawn_radius",
+            "sound_radius",
         ):
             try:
                 merged[key] = float(merged.get(key, DEFAULT_SETTINGS[key]))
+            except (TypeError, ValueError):
+                merged[key] = DEFAULT_SETTINGS[key]
+        for key in ("sound_packet_id", "sound_id"):
+            value = merged.get(key)
+            if value is None or str(value) == "":
+                merged[key] = None if key == "sound_id" else 0
+                continue
+            try:
+                merged[key] = int(value)
             except (TypeError, ValueError):
                 merged[key] = DEFAULT_SETTINGS[key]
         try:
@@ -389,7 +411,89 @@ class AutoFishing(Plugin):
                     time.monotonic() + self._settings["recast_delay"]
                 )
 
-    # ---- 咬钩判定（两路信号，任一命中立刻收杆） ----
+    # ---- 咬钩判定：音效（最准） ----
+
+    async def _on_packet(self, packet) -> None:
+        """位置型音效包：坐标落在浮标上就是咬钩。
+
+        ``packet`` 事件对每个入站包都会触发，所以第一步只做一次整数比较。
+        """
+        wanted = self._settings["sound_packet_id"]
+        if not wanted or packet.packet_id != wanted:
+            return
+        if not self._watching_sound():
+            return
+        decoded = self._decode_sound(packet.payload)
+        if decoded is None:
+            return  # 包 ID 配错或布局不符：当作没有音效路，交给另外两路
+        sound_id, x, y, z = decoded
+        position = self._bobber_position()
+        if position is None:
+            return
+        radius = self._settings["sound_radius"]
+        if (
+            abs(x - position[0]) > radius
+            or abs(y - position[1]) > radius
+            or abs(z - position[2]) > radius
+        ):
+            return  # 甩竿/收杆的音效在玩家身上，别人钓鱼的在别处
+        pinned = self._settings["sound_id"]
+        expected = pinned if pinned is not None else self._learned_sound
+        if expected is not None and sound_id != expected:
+            return
+        if expected is None and sound_id is not None:
+            self._learned_sound = sound_id
+            log.info(f"[钓鱼] 已学到咬钩音效 ID={sound_id}，之后按它精确判定。")
+        log.debug(f"[钓鱼] 音效信号命中 id={sound_id}。")
+        await self._reel(caught=True)
+
+    def _watching_sound(self) -> bool:
+        return (
+            self._settings["enabled"]
+            and self._state == "waiting"
+            and not self._reeling
+            and self._bobber_id is not None
+        )
+
+    def _bobber_position(self) -> tuple[float, float, float] | None:
+        bot = self.bot
+        if bot is None or self._bobber_id is None:
+            return None
+        entity = getattr(bot, "entities", {}).get(self._bobber_id)
+        if entity is None:
+            return None
+        return entity.x, entity.y, entity.z
+
+    @staticmethod
+    def _decode_sound(payload: bytes):
+        """解析位置型音效包；布局不符返回 None（宁可不判也不误判）。
+
+        字段顺序：音效 holder（varint，0 = 内联 名称+bool+可选 float）、
+        分类 varint、x/y/z 定点整数（÷8）、音量 float、音调 float、种子 long。
+        """
+        try:
+            reader = PacketReader(payload)
+            raw = reader.read_varint()
+            if raw == 0:
+                reader.read_string()
+                if reader.read_bool():
+                    reader.read_float()
+                sound_id = None
+            else:
+                sound_id = raw - 1
+            reader.read_varint()  # 分类
+            x = reader.read_int() / 8.0
+            y = reader.read_int() / 8.0
+            z = reader.read_int() / 8.0
+            reader.read_float()  # 音量
+            reader.read_float()  # 音调
+            reader.read_long()  # 随机种子
+            reader.expect_end()  # 严格校验：包 ID 配错时几乎必然在这里失败
+        except Exception:
+            return None
+        return sound_id, x, y, z
+
+    # ---- 咬钩判定（速度 / 下沉，均需先落稳） ----
 
     async def _on_entity_motion(self, entity_id, velocity, entity) -> None:
         if not self._watching(entity_id):

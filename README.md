@@ -440,24 +440,33 @@ disabled sample):
 
 ### Auto-fishing plugin (`fishing`)
 
-`plugins/fishing.py` casts, detects the bite, and reels, in a loop. This
-protocol stack decodes no sound packets, so the canonical
-`entity.fishing_bobber.splash` signal is unavailable; detection works off the
-bobber entity instead:
+`plugins/fishing.py` casts, detects the bite, and reels, in a loop. Three
+signals feed the detector, any one of which reels:
 
-1. **Claim the bobber** — preferably by looking `minecraft:fishing_bobber` up
-   in the server's `minecraft:entity_type` registry; otherwise the first
-   entity spawned within `spawn_window` seconds of the cast and
-   `spawn_radius` blocks of the bot is adopted, and **its type id is
-   remembered** so later casts are exact.
-2. **Wait for it to settle** — a resting baseline Y is only established after
-   several near-motionless updates, so the cast arc can't be mistaken for a
-   bite.
-3. **Two signals** — a downward `entity_motion` (vanilla's bite is about
-   -0.4 blocks/tick) or a position drop past `bite_drop` below the baseline.
-   Either one reels immediately. Both are ignored until the baseline exists
-   (gravity during flight is downward too), and each can be tuned or turned
-   off on its own.
+1. **The bite sound** (most accurate — it is what vanilla cues players with).
+   `entity.fishing_bobber.splash` arrives on the positional sound packet
+   (0x75 = 117 on protocols 775/776) at the **bobber's** coordinates, while
+   casting and retrieving play at the **player's**, so "within
+   `sound_radius` of the bobber" both recognises the bite and rules out your
+   own cast and other people's fishing. Sound ids shift between versions and
+   are not sent by the server (`minecraft:sound_event` is a built-in
+   registry), so nothing is hardcoded: the first bite recognised by position
+   **teaches** the plugin the id, which it then requires. Pin it via
+   `sound_id`, or set `sound_packet_id: 0` to switch the path off.
+2. **Downward velocity** — `entity_motion` on the bobber (vanilla's bite is
+   about -0.4 blocks/tick).
+3. **Position drop** — the bobber pulled `bite_drop` below its resting
+   baseline.
+
+The bobber is claimed by looking `minecraft:fishing_bobber` up in the
+server's `minecraft:entity_type` registry, or else by adopting the first
+entity spawned within `spawn_window` seconds of the cast and `spawn_radius`
+blocks of the bot — **remembering its type id** so later casts are exact.
+
+Signals 2 and 3 only count once the bobber has settled and a baseline exists:
+gravity during flight is downward too, so without that gate every cast would
+read as a bite. The sound path needs no such gate, since it only fires when a
+fish actually bites.
 
 `max_wait` seconds without a bite (bobber on land, line cut) triggers a
 re-cast, as does the bobber being removed; `recast_delay` is the only gap

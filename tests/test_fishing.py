@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from protobot.plugin import PluginManager
+from protobot.protocol import PacketWriter
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
 
@@ -387,6 +388,136 @@ class RecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.plugin._bobber_type = 130
         await self.plugin._on_session_ready(self.bot)
         self.assertEqual(self.plugin._bobber_type, 130)
+
+
+def sound_payload(
+    sound_id: int | None = 640,
+    x: float = 0.5,
+    y: float = 63.0,
+    z: float = 0.5,
+    *,
+    category: int = 6,
+    volume: float = 0.25,
+    pitch: float = 1.0,
+    seed: int = 12345,
+) -> bytes:
+    """位置型音效包的载荷（协议 775/776 布局）。
+
+    holder：varint，0 = 内联（名称 + bool + 可选 float），否则 注册表 ID + 1。
+    坐标是 ÷8 定点整数。
+    """
+    writer = PacketWriter()
+    if sound_id is None:
+        writer.write_varint(0)
+        writer.write_string("minecraft:entity.fishing_bobber.splash")
+        writer.write_bool(False)
+    else:
+        writer.write_varint(sound_id + 1)
+    writer.write_varint(category)
+    for value in (x, y, z):
+        writer.write_int(int(value * 8))
+    writer.write_float(volume)
+    writer.write_float(pitch)
+    writer.write_long(seed)
+    return writer.to_bytes()
+
+
+class SoundBiteTest(unittest.IsolatedAsyncioTestCase):
+    """音效判定：坐标落在浮标上才算咬钩，音效 ID 自动学习。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        _, self.plugin = load_plugin(self._tmp.name, {"enabled": True})
+        self.bot = FakeBot()
+        self.plugin.bot = self.bot
+        self.plugin._bobber_id = 7
+        self.plugin._bobber_type = 130
+        self.plugin._state = "waiting"
+        self.plugin._cast_at = time.monotonic()
+        # 浮标停在 (0.5, 63, 0.5)
+        self.bot.entities[7] = bobber(y=63.0)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _packet(self, payload: bytes, packet_id: int = 117):
+        return SimpleNamespace(packet_id=packet_id, payload=payload)
+
+    async def test_splash_at_the_bobber_reels(self) -> None:
+        await self.plugin._on_packet(self._packet(sound_payload()))
+        self.assertEqual(self.bot.use_calls, ["main_hand"])
+        self.assertEqual(self.plugin._catches, 1)
+
+    async def test_sound_id_is_learned_then_enforced(self) -> None:
+        await self.plugin._on_packet(self._packet(sound_payload(640)))
+        self.assertEqual(self.plugin._learned_sound, 640)
+        # 换一条不同 ID 的音效（同样在浮标上）不再触发
+        self.plugin._state = "waiting"
+        self.plugin._reeling = False
+        await self.plugin._on_packet(self._packet(sound_payload(999)))
+        self.assertEqual(len(self.bot.use_calls), 1)
+
+    async def test_pinned_sound_id_rejects_others(self) -> None:
+        self.plugin._settings["sound_id"] = 641
+        await self.plugin._on_packet(self._packet(sound_payload(640)))
+        self.assertEqual(self.bot.use_calls, [])
+        await self.plugin._on_packet(self._packet(sound_payload(641)))
+        self.assertEqual(self.bot.use_calls, ["main_hand"])
+
+    async def test_sound_far_from_the_bobber_is_ignored(self) -> None:
+        # 甩竿/收杆音效发在玩家身上，不在浮标上
+        await self.plugin._on_packet(self._packet(sound_payload(x=40.0)))
+        self.assertEqual(self.bot.use_calls, [])
+        self.assertIsNone(self.plugin._learned_sound)
+
+    async def test_other_packet_ids_are_ignored(self) -> None:
+        await self.plugin._on_packet(self._packet(sound_payload(), packet_id=99))
+        self.assertEqual(self.bot.use_calls, [])
+
+    async def test_zero_packet_id_disables_the_sound_path(self) -> None:
+        self.plugin._settings["sound_packet_id"] = 0
+        await self.plugin._on_packet(self._packet(sound_payload()))
+        self.assertEqual(self.bot.use_calls, [])
+
+    async def test_inline_sound_is_accepted_by_position(self) -> None:
+        # 内联音效没有注册表 ID，只能靠位置判定
+        await self.plugin._on_packet(self._packet(sound_payload(None)))
+        self.assertEqual(self.plugin._catches, 1)
+        self.assertIsNone(self.plugin._learned_sound)  # 没 ID 可学
+
+    async def test_malformed_payload_is_ignored(self) -> None:
+        await self.plugin._on_packet(self._packet(b"\x01\x02"))
+        self.assertEqual(self.bot.use_calls, [])
+
+    async def test_trailing_bytes_are_rejected(self) -> None:
+        # 包 ID 配错时载荷通常长度不符，严格校验能把它挡下来
+        await self.plugin._on_packet(self._packet(sound_payload() + b"\x00"))
+        self.assertEqual(self.bot.use_calls, [])
+
+    async def test_sound_before_the_bobber_exists_is_ignored(self) -> None:
+        self.plugin._bobber_id = None
+        await self.plugin._on_packet(self._packet(sound_payload()))
+        self.assertEqual(self.bot.use_calls, [])
+
+    async def test_sound_works_without_a_settled_baseline(self) -> None:
+        # 音效本身只在咬钩时才响，不需要等基准线
+        self.assertIsNone(self.plugin._baseline)
+        await self.plugin._on_packet(self._packet(sound_payload()))
+        self.assertEqual(self.plugin._catches, 1)
+
+    async def test_disabled_plugin_ignores_sounds(self) -> None:
+        self.plugin._settings["enabled"] = False
+        await self.plugin._on_packet(self._packet(sound_payload()))
+        self.assertEqual(self.bot.use_calls, [])
+
+    async def test_no_double_reel_from_sound_then_dip(self) -> None:
+        await self.plugin._on_packet(self._packet(sound_payload()))
+        await self.plugin._on_entity_motion(7, (0.0, -0.9, 0.0), bobber())
+        self.assertEqual(len(self.bot.use_calls), 1)
+
+    def test_decoder_returns_position_and_id(self) -> None:
+        decoded = self.plugin._decode_sound(sound_payload(640, 1.25, 62.5, -3.0))
+        self.assertEqual(decoded, (640, 1.25, 62.5, -3.0))
 
 
 class ExposedServiceTest(unittest.IsolatedAsyncioTestCase):
