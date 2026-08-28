@@ -6,7 +6,9 @@ position in the middle, ``·``-separated hints and server info on the right).
 The input sends chat messages, ``/``-prefixed server commands, and dot-prefixed
 UI commands (``.run`` starts the bot, ``.stop`` stops it, ``.plugins``,
 ``.help``) with a live suggestion dropdown while typing; ↑/↓ walk the input
-history and Ctrl+C exits.  When the configuration is complete enough to
+history, PageUp/PageDown scroll the log (Ctrl+L returns to the newest line --
+keyboard only, because a terminal multiplexer often does not forward the mouse
+wheel), and Ctrl+C exits.  When the configuration is complete enough to
 connect, the session starts on its own (``autostart``) instead of waiting for
 ``.run``.
 
@@ -171,6 +173,17 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             Binding("ctrl+c", "quit", "退出", show=False, priority=True),
             Binding("up", "history_prev", "上一条", show=False, priority=True),
             Binding("down", "history_next", "下一条", show=False, priority=True),
+            # 键盘翻日志。滚轮要靠终端把鼠标事件转发进来，而 GNU screen 默认
+            # 不转发（tmux 也要 `set -g mouse on`），SSH + screen 下滚轮因此
+            # 完全无效；而 TUI 跑在备用屏缓冲里，终端自己的回滚也翻不到它。
+            # PageUp/PageDown 是纯键盘序列，哪一层都不需要额外配置。
+            Binding("pageup", "log_page_up", "上翻日志", show=False, priority=True),
+            Binding(
+                "pagedown", "log_page_down", "下翻日志", show=False, priority=True
+            ),
+            Binding(
+                "ctrl+l", "log_follow", "回到最新", show=False, priority=True
+            ),
         ]
 
         CSS = """
@@ -283,13 +296,14 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             if self.autostart:
                 self._log_write(
                     "[提示] 配置齐全，正在自动启动 bot"
-                    "（.stop 停止，↑/↓ 翻历史，.help 查看命令，Ctrl+C 退出）。"
+                    "（.stop 停止，↑/↓ 翻历史，PageUp/PageDown 翻日志，"
+                    ".help 查看命令，Ctrl+C 退出）。"
                 )
                 self._command_run()
             else:
                 self._log_write(
                     "[提示] 输入 .run 启动 bot，↑/↓ 翻历史，"
-                    ".help 查看可用命令，Ctrl+C 退出。"
+                    "PageUp/PageDown 翻日志，.help 查看可用命令，Ctrl+C 退出。"
                 )
 
         # ---- session events (connection duration) ----
@@ -359,6 +373,9 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 )
             else:
                 position = ""
+            if self._log_paused():
+                # 暂停跟随时新日志不再自动滚到底，得说清楚，否则看着像卡死了
+                position = "⏸ 日志已暂停 · ctrl+l 回到最新"
             self.status_texts["pos"] = position
             self.query_one("#pos", Static).update(position)
 
@@ -376,6 +393,45 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self.status_texts["server"] = server_text
             self.query_one("#server", Static).update(server_text)
 
+        # ---- 日志滚动：纯键盘，不依赖终端的鼠标转发 ----
+
+        def _log_widget(self) -> "RichLog | None":
+            try:
+                return self.query_one("#log", RichLog)
+            except NoMatches:  # pragma: no cover - teardown race
+                return None
+
+        def _log_paused(self) -> bool:
+            """是否暂停了「新日志自动滚到底」。"""
+            widget = self._log_widget() if self.is_running else None
+            return widget is not None and not widget.auto_scroll
+
+        def action_log_page_up(self) -> None:
+            widget = self._log_widget()
+            if widget is None:
+                return
+            # 暂停跟随：否则下一行日志一到就把视图拽回底部，根本读不了历史
+            widget.auto_scroll = False
+            widget.scroll_page_up(animate=False)
+            self._refresh_status()
+
+        def action_log_page_down(self) -> None:
+            widget = self._log_widget()
+            if widget is None:
+                return
+            widget.scroll_page_down(animate=False)
+            if widget.is_vertical_scroll_end:
+                widget.auto_scroll = True  # 翻回底部就继续跟随
+            self._refresh_status()
+
+        def action_log_follow(self) -> None:
+            widget = self._log_widget()
+            if widget is None:
+                return
+            widget.auto_scroll = True
+            widget.scroll_end(animate=False)
+            self._refresh_status()
+
         # ---- input handling ----
 
         def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -384,6 +440,8 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             if not text:
                 return
             self._remember(text)
+            # 发了东西就该看见结果：顺手取消暂停，回到最新
+            self.action_log_follow()
             if text.startswith("."):
                 self._run_dot_command(text)
                 return
@@ -546,7 +604,8 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 self._log_write(f"  {name:<10s} {description}")
             self._log_write(
                 "[提示] 普通文本 = 聊天消息；/命令 = 服务器命令；"
-                "↑/↓ 翻输入历史；Ctrl+C 退出。"
+                "↑/↓ 翻输入历史；PageUp/PageDown 翻日志，ctrl+l 回到最新；"
+                "Ctrl+C 退出。"
             )
 
 else:  # pragma: no cover - exercised on base installs

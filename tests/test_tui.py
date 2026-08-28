@@ -676,5 +676,112 @@ class InputHistoryTest(unittest.IsolatedAsyncioTestCase):
             task.cancel()
 
 
+@unittest.skipUnless(TEXTUAL, "textual extra not installed")
+class LogScrollTest(unittest.IsolatedAsyncioTestCase):
+    """键盘翻日志：SSH + screen 下滚轮事件根本到不了应用，只能靠按键。"""
+
+    def _make_app(self) -> tuple[ProtoBotApp, asyncio.Task]:
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        app = ProtoBotApp(FakeSession(bot=FakeBot()), manager=None, proxy=StdoutProxy())
+        return app, task
+
+    def _fill(self, app: ProtoBotApp, count: int = 200) -> None:
+        for index in range(count):
+            app._log_write(f"[日志] 第 {index} 行")
+
+    async def test_page_up_scrolls_and_pauses_following(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                self._fill(app)
+                await pilot.pause()
+                widget = app._log_widget()
+                bottom = widget.scroll_offset.y
+                await pilot.press("pageup")
+                self.assertLess(widget.scroll_offset.y, bottom)
+                # 暂停跟随，否则下一行日志一到就把视图拽回底部
+                self.assertFalse(widget.auto_scroll)
+        finally:
+            task.cancel()
+
+    async def test_new_lines_do_not_yank_the_view_back(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                self._fill(app)
+                await pilot.pause()
+                await pilot.press("pageup")
+                widget = app._log_widget()
+                where = widget.scroll_offset.y
+                app._log_write("[日志] 新来的一行")
+                await pilot.pause()
+                self.assertEqual(widget.scroll_offset.y, where)
+        finally:
+            task.cancel()
+
+    async def test_paging_back_to_the_bottom_resumes_following(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                self._fill(app)
+                await pilot.pause()
+                await pilot.press("pageup")
+                self.assertFalse(app._log_widget().auto_scroll)
+                for _ in range(4):
+                    await pilot.press("pagedown")
+                self.assertTrue(app._log_widget().auto_scroll)
+        finally:
+            task.cancel()
+
+    async def test_ctrl_l_returns_to_the_newest_line(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                self._fill(app)
+                await pilot.pause()
+                await pilot.press("pageup")
+                await pilot.press("ctrl+l")
+                widget = app._log_widget()
+                self.assertTrue(widget.auto_scroll)
+                self.assertTrue(widget.is_vertical_scroll_end)
+        finally:
+            task.cancel()
+
+    async def test_status_bar_says_when_following_is_paused(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                self._fill(app)
+                await pilot.pause()
+                await pilot.press("pageup")
+                self.assertIn("日志已暂停", app.status_texts["pos"])
+                await pilot.press("ctrl+l")
+                self.assertNotIn("日志已暂停", app.status_texts["pos"])
+        finally:
+            task.cancel()
+
+    async def test_submitting_input_returns_to_the_newest_line(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                self._fill(app)
+                await pilot.pause()
+                await pilot.press("pageup")
+                await pilot.press("h", "i", "enter")
+                self.assertTrue(app._log_widget().auto_scroll)
+        finally:
+            task.cancel()
+
+    async def test_page_keys_leave_the_input_text_alone(self) -> None:
+        app, task = self._make_app()
+        try:
+            async with app.run_test() as pilot:
+                await pilot.press("h", "i")
+                await pilot.press("pageup", "pagedown", "ctrl+l")
+                self.assertEqual(app.query_one("#cmd").value, "hi")
+        finally:
+            task.cancel()
+
+
 if __name__ == "__main__":
     unittest.main()

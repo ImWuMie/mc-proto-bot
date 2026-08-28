@@ -631,6 +631,17 @@ while typing `.`:
 | `.llm <text>` | hands the text to the LLM agent; its reply prints in the log area instead of going to chat |
 | `.help` | shows available commands |
 | ↑ / ↓ | walks the input history (the line you were typing comes back) |
+| PageUp / PageDown | scrolls the log; paging up pauses auto-follow so new lines stop yanking the view back, paging to the bottom resumes it |
+| Ctrl+L | jumps back to the newest line and resumes following |
+
+- **Scrolling needs the keyboard, not the wheel.** The wheel only works if the
+  terminal forwards mouse events, and a multiplexer usually does not: GNU
+  `screen` drops them unless `mousetrack on` is set, tmux needs
+  `set -g mouse on`, so over SSH inside `screen` the wheel does nothing. The
+  terminal's own scrollback cannot reach the log either, because a full-screen
+  app runs in the alternate screen buffer. PageUp/PageDown are plain key
+  sequences that survive every layer, which is why they are the answer here.
+  Submitting anything in the input box also returns you to the newest line.
 
 - **Autostart** — when the configuration is complete enough to connect
   (offline mode always, online mode once `protobot login` has cached a token
