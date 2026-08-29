@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import math
 import re
@@ -884,6 +885,10 @@ class LLMAgent(Plugin):
         """The bridge thread: build a botpy client and run it (blocking)."""
         import botpy
 
+        # botpy's Client.__init__ calls asyncio.get_event_loop(), which raises
+        # in a non-main thread on Python 3.12 unless the thread has a loop set.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         appid = str(self._settings["qq"].get("appid") or "")
         token = str(self._settings["qq"].get("token") or "")
         intents = botpy.Intents(public_messages=True)
@@ -894,7 +899,18 @@ class LLMAgent(Plugin):
             client.on_c2c_message_create = self._qq_on_c2c
             client.on_group_at_message_create = self._qq_on_group_at
             log.info("[LLM] QQ bridge connected.")
-            client.run(appid=appid, token=token)
+            # botpy's start() takes appid + secret on current releases, while
+            # older ones (and the docs) use token -- the config field is
+            # "token" either way, so pass whichever the installed SDK wants.
+            try:
+                auth_param = (
+                    "secret" if "secret" in inspect.signature(
+                        botpy.Client.start
+                    ).parameters else "token"
+                )
+            except (TypeError, ValueError):
+                auth_param = "token"
+            client.run(appid=appid, **{auth_param: token})
         except Exception as error:
             log.error(f"[LLM] QQ bridge failed: {error!r}")
         finally:

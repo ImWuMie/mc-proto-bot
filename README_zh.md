@@ -411,7 +411,7 @@ class HelloReply(Plugin):
 }
 ```
 
-- **QQ 桥接**（`qq`，默认关闭；需要 `pip install protobot[qq]`）——同一个
+- **QQ 桥接**（`qq`，默认关闭；需要 `pip install protobot[qq]`，portable 已内置）——同一个
   agent 接进 QQ：C2C 私聊与群内 @ 消息像其他触发一样进队列，回复走 QQ 发回，
   而不是发到 Minecraft 聊天。即使没连服务器也能工作。需要 QQ 开放平台的
   appid/token，在 `llm_agent.json` 里配 `enabled`、`appid`、`token`（约 3 秒

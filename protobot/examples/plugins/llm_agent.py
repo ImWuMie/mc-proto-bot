@@ -70,9 +70,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import math
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -215,6 +217,18 @@ DEFAULT_SETTINGS: dict = {
         "timeout": 0.0,  # <=0 = the main timeout
         "max_tokens": 300,  # A **generation** limit (one chat line), not a window
         "temperature": 1.0,
+    },
+    # QQ bot bridge (optional, needs `pip install protobot[qq]`): C2C private
+    # messages and group @-messages reach the same agent. Replies go back
+    # through QQ instead of Minecraft chat, and the agent works even while
+    # disconnected from the server. Requester names are "[QQ] <openid>";
+    # only openids in admin_ids are admins (QQ users are never granted the
+    # MC admin list).
+    "qq": {
+        "enabled": False,
+        "appid": "",  # From the QQ open platform
+        "token": "",  # Bot token
+        "admin_ids": [],  # Openids treated as admins ([] = no QQ admins)
     },
     "reply": {
         "all": False,  # true = answer every chat line; false = only the triggers below
@@ -643,6 +657,7 @@ CONVERSATION_HARD_CAP = 4000
 #: The requester for a console turn. The ``\x00`` is deliberate: Minecraft
 #: names allow only ``[A-Za-z0-9_]``, so no player can take this name and
 #: impersonate the console to gain admin rights.
+_QQ_PREFIX = "[QQ] "  # QQ requester names: prefix + the author's openid
 CONSOLE_NAME = "\x00console"
 #: Whisper system messages: ``[player -> me] text`` (a /msg to the bot)
 WHISPER_PATTERN = re.compile(r"^\[(.+?) -> me\]\s*(.*)$", re.DOTALL)
@@ -749,6 +764,12 @@ class LLMAgent(Plugin):
         self._connected_at: float | None = None  # When this connection came up
         self._sent_recent: list[tuple[float, str]] = []  # Recent sends (time, text)
         self._post_json = _http_post_json  # Tests swap in a fake
+        # QQ bridge state: the botpy client runs in its own daemon thread with
+        # its own loop; messages cross into the agent queue thread-safely.
+        self._qq_thread: threading.Thread | None = None
+        self._qq_client = None
+        self._qq_loop = None
+        self._main_loop: asyncio.AbstractEventLoop | None = None
         self.subscribe("player_chat", self._on_player_chat)
         self.subscribe("system_chat", self._on_system_chat)
         self.subscribe("chat_sent", self._on_chat_sent)
@@ -825,6 +846,139 @@ class LLMAgent(Plugin):
             return f"Timed out after {budget:.0f}s waiting for the agent"
 
 
+    # ---- QQ bridge (optional; needs the qq-botpy extra) ----
+
+    def _qq_enabled(self) -> bool:
+        qq = self._settings.get("qq")
+        return bool(isinstance(qq, dict) and qq.get("enabled"))
+
+    def _start_qq(self) -> None:
+        """Launch the botpy client in a daemon thread if configured.
+
+        botpy's Client.run() blocks on its own event loop, so the bridge lives
+        in a thread and forwards messages into the agent queue with
+        call_soon_threadsafe. qq-botpy is an optional extra: without it the
+        bridge says so and stays off.
+        """
+        if not self._qq_enabled():
+            return
+        qq = self._settings["qq"]
+        if not str(qq.get("appid") or "") or not str(qq.get("token") or ""):
+            log.warn("[LLM] qq.enabled is true but appid/token are missing; QQ bridge off.")
+            return
+        try:
+            import botpy  # noqa: F401
+        except ImportError:
+            log.warn(
+                "[LLM] qq.enabled is true but qq-botpy is not installed "
+                "(pip install protobot[qq]); QQ bridge off."
+            )
+            return
+        self._main_loop = asyncio.get_running_loop()
+        self._qq_thread = threading.Thread(
+            target=self._qq_run, name="protobot-llm-agent-qq", daemon=True
+        )
+        self._qq_thread.start()
+        log.info("[LLM] QQ bridge starting ...")
+
+    def _qq_run(self) -> None:
+        """The bridge thread: build a botpy client and run it (blocking)."""
+        import botpy
+
+        # botpy's Client.__init__ calls asyncio.get_event_loop(), which raises
+        # in a non-main thread on Python 3.12 unless the thread has a loop set.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        appid = str(self._settings["qq"].get("appid") or "")
+        token = str(self._settings["qq"].get("token") or "")
+        intents = botpy.Intents(public_messages=True)
+        try:
+            client = botpy.Client(intents=intents, log_level=30)
+            self._qq_client = client
+            self._qq_loop = client.loop
+            client.on_c2c_message_create = self._qq_on_c2c
+            client.on_group_at_message_create = self._qq_on_group_at
+            log.info("[LLM] QQ bridge connected.")
+            # botpy's start() takes appid + secret on current releases, while
+            # older ones (and the docs) use token -- the config field is
+            # "token" either way, so pass whichever the installed SDK wants.
+            try:
+                auth_param = (
+                    "secret" if "secret" in inspect.signature(
+                        botpy.Client.start
+                    ).parameters else "token"
+                )
+            except (TypeError, ValueError):
+                auth_param = "token"
+            client.run(appid=appid, **{auth_param: token})
+        except Exception as error:
+            log.error(f"[LLM] QQ bridge failed: {error!r}")
+        finally:
+            self._qq_client = None
+            self._qq_loop = None
+
+    def _stop_qq(self) -> None:
+        """Best-effort close: ask the bridge loop to close the client. The
+        thread is a daemon, so even a hung close cannot block shutdown."""
+        client, loop = self._qq_client, self._qq_loop
+        if client is None or loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(client.close(), loop)
+        except Exception as error:
+            log.warn(f"[LLM] QQ bridge close failed: {error!r}")
+
+    def _push_qq_trigger(self, message, *, openid: str, private: bool) -> None:
+        """Forward a QQ message into the agent queue (thread-safe)."""
+        if openid is None:
+            return
+        text = str(message.content or "").strip()
+        if private:
+            text = re.sub(r"<@!?\d+>", "", text).strip()
+        else:
+            text = re.sub(r"<@!?[^>]+>", "", text).strip()
+        if not text:
+            return
+        name = f"[QQ] {openid}"
+        queue = self._queue
+        loop = self._main_loop
+        if queue is None or loop is None:
+            return
+        item = {
+            "name": name,
+            "text": text,
+            "private": private,
+            "follow_up": False,
+            "reminder": False,
+            "console": False,
+            "channel": "qq",
+            "qq_reply": message,
+            "key": (name, text),
+        }
+        loop.call_soon_threadsafe(queue.put_nowait, item)
+
+    async def _qq_on_c2c(self, message) -> None:
+        """C2C private message: anyone who DMs the bot is answered."""
+        try:
+            self._push_qq_trigger(
+                message,
+                openid=getattr(getattr(message, "author", None), "user_openid", None),
+                private=True,
+            )
+        except Exception as error:
+            log.error(f"[LLM] QQ C2C handler failed: {error!r}")
+
+    async def _qq_on_group_at(self, message) -> None:
+        """Group @ message: only messages that mention the bot."""
+        try:
+            self._push_qq_trigger(
+                message,
+                openid=getattr(getattr(message, "author", None), "member_openid", None),
+                private=False,
+            )
+        except Exception as error:
+            log.error(f"[LLM] QQ group handler failed: {error!r}")
+
     # ---- Lifecycle ----
 
     async def on_enable(self) -> None:
@@ -850,6 +1004,7 @@ class LLMAgent(Plugin):
         self._settings_task = asyncio.create_task(
             self._settings_watcher(), name="protobot-llm-agent-settings"
         )
+        self._start_qq()
         log.info(
             f"[LLM] agent enabled (replies to: {mode}; "
             f"admins: {', '.join(admins) if admins else 'unrestricted'}; "
@@ -857,6 +1012,7 @@ class LLMAgent(Plugin):
         )
 
     async def on_disable(self) -> None:
+        self._stop_qq()
         for attribute in ("_worker_task", "_settings_task"):
             task = getattr(self, attribute)
             if task is not None:
@@ -903,6 +1059,14 @@ class LLMAgent(Plugin):
             merged["llm"]["compact_reserve_ratio"] = 0.05
         if not isinstance(merged.get("reply"), dict):
             merged["reply"] = copy.deepcopy(DEFAULT_SETTINGS["reply"])
+        if not isinstance(merged.get("qq"), dict):
+            merged["qq"] = copy.deepcopy(DEFAULT_SETTINGS["qq"])
+        merged["qq"]["enabled"] = bool(merged["qq"].get("enabled", False))
+        merged["qq"]["appid"] = str(merged["qq"].get("appid") or "").strip()
+        merged["qq"]["token"] = str(merged["qq"].get("token") or "").strip()
+        merged["qq"]["admin_ids"] = [
+            str(admin_id) for admin_id in (merged["qq"].get("admin_ids") or [])
+        ]
         if not isinstance(merged.get("speaker"), dict):
             merged["speaker"] = copy.deepcopy(DEFAULT_SETTINGS["speaker"])
         try:
@@ -1222,6 +1386,8 @@ class LLMAgent(Plugin):
                     follow_up=item["follow_up"],
                     reminder=item.get("reminder", False),
                     console=item.get("console", False),
+                    channel=item.get("channel", "minecraft"),
+                    qq_reply=item.get("qq_reply"),
                 )
                 if future is not None and not future.done():
                     future.set_result(reply if reply else "(no reply)")
@@ -1246,6 +1412,8 @@ class LLMAgent(Plugin):
         follow_up: bool = False,
         reminder: bool = False,
         console: bool = False,
+        channel: str = "minecraft",
+        qq_reply=None,
     ) -> str | None:
         # Record who triggered this: write_plugin / set_plugin decide permission
         # from the admins list. A reminder comes from a plugin rather than a
@@ -1265,15 +1433,24 @@ class LLMAgent(Plugin):
                 follow_up=follow_up,
                 reminder=reminder,
                 console=console,
+                channel=channel,
+                qq_reply=qq_reply,
             )
         finally:
             self._requester = None
 
     def _is_admin(self, name: str | None) -> bool:
         """Check the admins list; empty means unrestricted, comparison is
-        case-insensitive."""
+        case-insensitive. A QQ requester ("[QQ] <openid>") is an admin only
+        when its openid is in the qq.admin_ids list -- the MC player names in
+        admins can never match an openid, and an unrestricted admins list must
+        not hand rights to strangers on QQ by accident."""
         if name == CONSOLE_NAME:
             return True  # The console: whoever starts the process owns the config
+        if name and name.startswith(_QQ_PREFIX):
+            qq = self._settings.get("qq")
+            admin_ids = qq.get("admin_ids") if isinstance(qq, dict) else None
+            return str(name[len(_QQ_PREFIX):]) in (admin_ids or [])
         admins = self._settings.get("admins") or []
         if not admins:
             return True
@@ -1424,11 +1601,13 @@ class LLMAgent(Plugin):
         follow_up: bool = False,
         reminder: bool = False,
         console: bool = False,
+        channel: str = "minecraft",
+        qq_reply=None,
     ) -> str | None:
         """Run one turn, returning the final reply text (used by console turns,
         ignored by chat ones)."""
         bot = self.bot
-        if bot is None and not console:
+        if bot is None and not console and channel != "qq":
             log.info("[LLM] not connected to a server, skipping this turn.")
             return None
         settings = self._settings["llm"]
@@ -1482,6 +1661,13 @@ class LLMAgent(Plugin):
                 self._persist_turn(messages[prefix_len:])
                 if console:
                     return content  # Console turn: printed, never said in chat
+                if channel == "qq" and qq_reply is not None:
+                    if content and content.upper() != "NO_REPLY":
+                        try:
+                            await qq_reply.reply(content=content)
+                        except Exception as error:
+                            log.error(f"[LLM] failed to send the QQ reply: {error}")
+                    return content
                 if content and content.upper() != "NO_REPLY":
                     try:
                         await self._send_chat(content)

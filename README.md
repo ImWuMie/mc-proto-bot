@@ -436,7 +436,8 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 }
 ```
 
-- **QQ bridge** (`qq`, off by default; needs `pip install protobot[qq]`) — the
+- **QQ bridge** (`qq`, off by default; needs `pip install protobot[qq]`; the
+  portable builds already include it) — the
   same agent answers QQ messages: C2C private chats and group @-mentions reach
   the queue like any other trigger, and the reply goes back through QQ instead
   of Minecraft chat. The agent keeps working even while disconnected from the
