@@ -687,8 +687,14 @@ def main(argv: list[str] | None = None) -> int:
     """Console-script entry point: ``protobot login|run|plugins|setup``.
 
     argv defaults to ``sys.argv[1:]``; the run_bot.py shim calls
-    ``main(["run", ...])`` directly.
+    ``main(["run", ...])`` directly. Running with no arguments at all means
+    ``run``, so the portable binary launched bare starts the bot (or the
+    first-run wizard) instead of printing usage.
     """
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ["run"]
     parser = _root_parser()
     args = parser.parse_args(argv)
     try:

@@ -817,8 +817,9 @@ What a release ships:
   linux-x86_64) -- the self-contained build: `protobot.exe` / `protobot`
   with its own Python runtime, plus the example plugins and the READMEs.
   Extract it anywhere, run the binary in a terminal -- **nothing to
-  install, no Python required**. The first run walks through the setup
-  wizard and the bot is ready.
+  install, no Python required**. Launched bare it defaults to
+  `protobot run`, so double-clicking starts the bot; the first run walks
+  through the setup wizard first.
 
 `release.py packages` / `release.py portable` build just one of the two.
 `dist/` is gitignored. The GitHub Actions workflow builds on every `v*` tag
