@@ -446,7 +446,11 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
   `enabled`, `appid` and `token` in `llm_agent.json` (reloads within ~3
   seconds). Requester names look like `[QQ] <openid>`; QQ users are **never**
   admins unless their openid is in `admin_ids` (an unrestricted `admins` list
-  does not leak rights to strangers on QQ).
+  does not leak rights to strangers on QQ). The bot also **learns** every
+  user/group that messages it (the openid is logged as "QQ contact
+  learned"), and exposes `send_qq` (admin-only) plus `qq_contacts` so it
+  can reach out proactively -- paste your own openid into `admin_ids`
+  and scheduled tasks can ping you on QQ.
 - **A second model for the small talk** (`speaker`, off by default) — turning it
   on adds a `speak` tool that forwards a player's line, **word for word**, to a
   second model and sends back whatever it answers. That model gets **nothing

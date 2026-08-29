@@ -772,6 +772,12 @@ class LLMAgent(Plugin):
         self._qq_client = None
         self._qq_loop = None
         self._main_loop: asyncio.AbstractEventLoop | None = None
+        # QQ contacts we may push to proactively: openid -> {"kind": "c2c"|"group",
+        # "label": optional nickname}. Learned from inbound messages and persisted
+        # next to the settings file, so the agent can reach a user who messaged
+        # the bot even after a restart.
+        self._qq_contacts: dict[str, dict] = {}
+        self._qq_contacts_file: Path | None = None
         self.subscribe("player_chat", self._on_player_chat)
         self.subscribe("system_chat", self._on_system_chat)
         self.subscribe("chat_sent", self._on_chat_sent)
@@ -795,6 +801,39 @@ class LLMAgent(Plugin):
                 "Run one agent turn for the operator's terminal and return the "
                 "reply as text instead of speaking in chat."
             ),
+        )
+        # Proactive QQ push: the agent (or the console) can send a message to a
+        # user or group that has contacted the bot before. Admin-only, because
+        # only trusted callers may make the bot reach out unsolicited.
+        self.expose(
+            "send_qq",
+            self._service_send_qq,
+            description=(
+                "Send a message to a QQ user or group that has messaged this "
+                "bot before. Admin only."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": (
+                            "The openid or nickname of a known QQ contact "
+                            "(list them with qq_contacts)"
+                        ),
+                    },
+                    "text": {"type": "string", "description": "The message to send"},
+                },
+                "required": ["to", "text"],
+            },
+            llm=True,
+            admin=True,
+        )
+        self.expose(
+            "qq_contacts",
+            self._service_qq_contacts,
+            description="List the QQ users/groups this bot can send messages to.",
+            llm=True,
         )
 
     async def _service_remind(self, text: str = "", source: str = "") -> str:
@@ -915,7 +954,7 @@ class LLMAgent(Plugin):
                         botpy.Client.start
                     ).parameters else "token"
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 auth_param = "token"
             client.run(appid=appid, **{auth_param: token})
         except Exception as error:
@@ -923,6 +962,107 @@ class LLMAgent(Plugin):
         finally:
             self._qq_client = None
             self._qq_loop = None
+
+    def _load_qq_contacts(self) -> None:
+        path = self._qq_contacts_file
+        if path is None:
+            return
+        self._qq_contacts = {}
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(data, dict):
+            self._qq_contacts = {
+                str(k): v for k, v in data.items()
+                if isinstance(v, dict) and v.get("kind") in ("c2c", "group")
+            }
+
+    def _save_qq_contacts(self) -> None:
+        path = self._qq_contacts_file
+        if path is None:
+            return
+        try:
+            path.write_text(
+                json.dumps(self._qq_contacts, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            log.warn(f"[LLM] could not save QQ contacts ({error})")
+
+    def _remember_qq_contact(self, openid: str, kind: str) -> None:
+        """Record a contact we can push to, keyed by openid/group_openid."""
+        if not openid:
+            return
+        is_new = openid not in self._qq_contacts
+        entry = self._qq_contacts.setdefault(openid, {"kind": kind, "label": ""})
+        if entry.get("kind") != kind:
+            entry["kind"] = kind
+        if is_new:
+            # Surface the openid the operator needs for qq.admin_ids / send_qq:
+            # this is the only place a first-time user can discover it.
+            log.info(f"[LLM] QQ contact learned: {kind} {openid}")
+        self._save_qq_contacts()
+
+    def _resolve_qq_contact(self, target: str):
+        """Look a contact up by openid or nickname; (kind, openid) or None."""
+        target = str(target or "").strip()
+        if not target:
+            return None
+        for openid, entry in self._qq_contacts.items():
+            if openid == target or (entry.get("label") and entry["label"] == target):
+                return entry["kind"], openid
+        return None
+
+    async def _qq_api_call(self, coro_factory):
+        """Run a botpy API coroutine on the bridge loop and await its result."""
+        loop = self._qq_loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError("the QQ bridge is not running")
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+        return await asyncio.wrap_future(future)
+
+    async def _service_send_qq(self, to: str = "", text: str = "") -> str:
+        """Send a proactive message to a known QQ contact. Admin only."""
+        text = str(text or "").strip()
+        if not text:
+            return "Missing message text"
+        resolved = self._resolve_qq_contact(to)
+        if resolved is None:
+            return (
+                f"Unknown QQ contact: {to!r}. The bot only knows people who "
+                "messaged it first; check qq_contacts for the list."
+            )
+        kind, openid = resolved
+        client = self._qq_client
+        if client is None:
+            return "The QQ bridge is not connected"
+
+        async def send():
+            api = client.api
+            if kind == "group":
+                return await api.post_group_message(group_openid=openid, content=text)
+            return await api.post_c2c_message(openid=openid, content=text)
+
+        try:
+            await self._qq_api_call(send)
+        except Exception as error:
+            return f"Failed to send the QQ message: {error!r}"
+        return f"Sent to QQ {kind} contact {openid}: {text}"
+
+    async def _service_qq_contacts(self) -> str:
+        """List known QQ contacts (openid + nickname + kind)."""
+        if not self._qq_contacts:
+            return "No QQ contacts yet (nobody has messaged the bot)"
+        lines = []
+        for openid, entry in sorted(self._qq_contacts.items()):
+            label = entry.get("label") or ""
+            lines.append(
+                f"- {openid} ({entry['kind']})" + (f" [{label}]" if label else "")
+            )
+        return chr(10).join(lines)
 
     def _stop_qq(self) -> None:
         """Best-effort close: ask the bridge loop to close the client. The
@@ -984,22 +1124,22 @@ class LLMAgent(Plugin):
     async def _qq_on_c2c(self, message) -> None:
         """C2C private message: anyone who DMs the bot is answered."""
         try:
-            self._push_qq_trigger(
-                message,
-                openid=getattr(getattr(message, "author", None), "user_openid", None),
-                private=True,
-            )
+            openid = getattr(getattr(message, "author", None), "user_openid", None)
+            self._remember_qq_contact(openid, "c2c")
+            self._push_qq_trigger(message, openid=openid, private=True)
         except Exception as error:
             log.error(f"[LLM] QQ C2C handler failed: {error!r}")
 
     async def _qq_on_group_at(self, message) -> None:
         """Group @ message: only messages that mention the bot."""
         try:
-            self._push_qq_trigger(
-                message,
-                openid=getattr(getattr(message, "author", None), "member_openid", None),
-                private=False,
+            openid = getattr(getattr(message, "author", None), "member_openid", None)
+            # The group itself is the pushable contact; the member is only the
+            # requester for permissions.
+            self._remember_qq_contact(
+                getattr(message, "group_openid", None), "group"
             )
+            self._push_qq_trigger(message, openid=openid, private=False)
         except Exception as error:
             log.error(f"[LLM] QQ group handler failed: {error!r}")
 
@@ -1010,6 +1150,7 @@ class LLMAgent(Plugin):
         self._load_settings()
         self._resolve_dirs()
         self._ensure_persona_file()
+        self._load_qq_contacts()
         api_key = str(self._settings["llm"].get("api_key") or "")
         if not api_key:
             log.warn(
@@ -1168,6 +1309,7 @@ class LLMAgent(Plugin):
         self._skills_dir = (
             base / str(self._settings.get("skills_dir") or "../.claude/skills")
         ).resolve()
+        self._qq_contacts_file = (base / "llm_agent_qq_contacts.json").resolve()
 
     def _ensure_persona_file(self) -> None:
         """Write the persona template on first enable, ready to be edited."""

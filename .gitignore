@@ -17,6 +17,7 @@ protobot-live.log
 plugins/llm_agent.json
 plugins/llm_agent_persona.md
 plugins/llm_agent_memory/
+plugins/llm_agent_qq_contacts.json
 plugins_llm/
 
 # 定时任务插件数据（运行时自动生成/修改）
