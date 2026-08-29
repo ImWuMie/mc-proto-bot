@@ -724,10 +724,11 @@ python release.py                    # -> dist/ 下产出全部产物
 - **`protobot-x.y.z.tar.gz` / `.whl`**——pip/uv 包。wheel 自带方块状态表与
   内置示例插件；`protobot setup` 会在配置旁生成一个初始 `plugins/` 目录，
   所以 pip 安装同样拥有完整的插件系统和示例。
-- **`protobot-x.y.z-windows-amd64-portable.zip`**——自包含构建：
-  `protobot.exe` 自带整套 Python 运行时，外加示例插件与说明文档。解压到
-  任意位置，在终端里运行 `protobot.exe` 即可——**什么都不用装，不需要
-  安装 Python**。首次运行会走一遍配置向导，之后 bot 即可启动。
+- **`protobot-x.y.z-<平台>-portable.zip`**（windows-amd64 与
+  linux-x86_64）——自包含构建：`protobot.exe` / `protobot` 自带整套
+  Python 运行时，外加示例插件与说明文档。解压到任意位置，在终端里运行
+  它即可——**什么都不用装，不需要安装 Python**。首次运行会走一遍配置
+  向导，之后 bot 即可启动。
 
 `release.py packages` / `release.py portable` 可以只构建其中一种。`dist/`
 已加入 .gitignore。仓库里的 GitHub Actions 工作流会在推送 `v*` tag 时自动

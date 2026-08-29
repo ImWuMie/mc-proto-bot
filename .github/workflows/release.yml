@@ -20,7 +20,14 @@ jobs:
           files: dist/*
 
   portable:
-    runs-on: windows-latest
+    # The self-contained build is platform-specific (a frozen Python runtime),
+    # so one job per platform; the zip name carries the platform tag.
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+          - os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:

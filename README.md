@@ -813,11 +813,12 @@ What a release ships:
   carries the block-state tables and the bundled example plugins;
   `protobot setup` writes a starter `plugins/` directory next to the config,
   so a pip install gets the plugin system and the same examples.
-- **`protobot-x.y.z-windows-amd64-portable.zip`** -- the self-contained
-  build: `protobot.exe` with its own Python runtime, plus the example
-  plugins and the READMEs. Extract it anywhere, run `protobot.exe` in a
-  terminal -- **nothing to install, no Python required**. The first run
-  walks through the setup wizard and the bot is ready.
+- **`protobot-x.y.z-<platform>-portable.zip`** (windows-amd64 and
+  linux-x86_64) -- the self-contained build: `protobot.exe` / `protobot`
+  with its own Python runtime, plus the example plugins and the READMEs.
+  Extract it anywhere, run the binary in a terminal -- **nothing to
+  install, no Python required**. The first run walks through the setup
+  wizard and the bot is ready.
 
 `release.py packages` / `release.py portable` build just one of the two.
 `dist/` is gitignored. The GitHub Actions workflow builds on every `v*` tag
