@@ -133,13 +133,6 @@ class ArmingTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin._on_entity_move(7, bobber(entity_id=7, y=62.8))
         self.assertEqual(self.plugin._catches, 1)
 
-    async def test_timeout_reports_what_it_saw(self) -> None:
-        await self._claim_and_wait()
-        await self.plugin._on_entity_motion(7, (0.0, -0.01, 0.0), None)
-        report = self.plugin._diagnosis()
-        self.assertIn("已认领", report)
-        self.assertIn("速度包=1", report)
-
 
 class WaterCheckTest(unittest.IsolatedAsyncioTestCase):
     """落点不是水就立刻重抛，而不是干等满 max_wait。"""

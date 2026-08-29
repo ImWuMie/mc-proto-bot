@@ -633,10 +633,7 @@ row, instead of waiting out `max_wait` with the line on dry land. An unloaded
 chunk reads as unknown, never as dry.
 
 `max_wait` seconds without a bite triggers a re-cast, as does the bobber being
-removed; the log line says what the cast actually saw (bobber claimed or not,
-how many velocity and position packets arrived, whether it was in water,
-whether the sound path is on), so a bad cast is diagnosable instead of a
-guess. `recast_delay` is the only gap between reeling and casting again.
+removed. `recast_delay` is the only gap between reeling and casting again.
 
 Settings live in `plugins/fishing.json` (generated on first run, re-read
 within 5 seconds of an edit) and it starts **`enabled: false`** — flip that to

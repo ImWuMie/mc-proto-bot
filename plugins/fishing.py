@@ -28,10 +28,8 @@
 落点检查：``water_check``（默认开）在浮标就位时查一下脚下那两格是不是水，不是
 就立刻重抛，而不是干等满 ``max_wait``。区块还没收到时判为「未知」，不会瞎重抛。
 
-超时兜底：``max_wait`` 秒没咬钩（浮标落在陆地上、线被打断等）就收杆重抛，
-日志会带上这一竿到底看到了什么（是否认领到浮标、收到几个速度/位置包、是否在
-水里、音效路是否开着），便于对症下药；浮标被移除也会重抛。收杆与重抛之间只
-隔 ``recast_delay`` 秒（默认 0.4）。
+超时兜底：``max_wait`` 秒没咬钩（浮标落在陆地上、线被打断等）就收杆重抛；
+浮标被移除也会重抛。收杆与重抛之间只隔 ``recast_delay`` 秒（默认 0.4）。
 
 设置文件 ``fishing.json``（与本插件同目录，首次启用自动生成）修改后约 5 秒
 内自动重新加载，**默认 enabled=false**：把它改成 true 才会开始钓，也可以让
@@ -91,8 +89,6 @@ class AutoFishing(Plugin):
         self._claim_at = 0.0  # 认领到浮标的时刻
         self._candidate: tuple[int, int | None, float] | None = None  # 兜底认领
         self._dry_reads = 0  # 连续读到「不在水里」的次数
-        self._motion_seen = 0  # 诊断：本次抛竿收到过几个速度包
-        self._move_seen = 0  # 诊断：本次抛竿收到过几个位置包
         # 状态机：idle -> casting -> waiting -> (咬钩/超时) -> cooldown -> ...
         self._state = "idle"
         self._cast_at = 0.0
@@ -309,7 +305,7 @@ class AutoFishing(Plugin):
             self._check_water()
         if now - self._cast_at > self._settings["max_wait"]:
             # 浮标可能落在陆地上或线已断：收回来重抛
-            log.info(f"[钓鱼] 久未咬钩，重新抛竿（{self._diagnosis()}）。")
+            log.info("[钓鱼] 久未咬钩，重新抛竿。")
             await self._reel(caught=False)
 
     def _arm(self) -> None:
@@ -327,7 +323,6 @@ class AutoFishing(Plugin):
             self._last_y = position[1]
         elif self._last_y is not None:
             self._baseline = self._last_y
-        log.debug(f"[钓鱼] 浮标已就位，基准 Y={self._baseline}。")
 
     def _check_water(self) -> None:
         """落点不是水就重抛。要连着读到 DRY_CONFIRM 次才动手。
@@ -402,17 +397,6 @@ class AutoFishing(Plugin):
         self._state = "cooldown"
         self._next_cast_at = time.monotonic() + self._settings["recast_delay"]
 
-    def _diagnosis(self) -> str:
-        """超时时说清楚我们到底看到了什么，免得只能靠猜。"""
-        water = self._bobber_in_water()
-        return (
-            f"浮标={'已认领' if self._bobber_id is not None else '未认领'}, "
-            f"速度包={self._motion_seen}, 位置包={self._move_seen}, "
-            f"在水里={'是' if water else ('否' if water is False else '未知')}, "
-            f"音效路={'开' if self._sound_packet_id() else '关'}"
-            + (f", 已学音效 ID={self._learned_sound}" if self._learned_sound else "")
-        )
-
     async def _cast(self) -> None:
         bot = self.bot
         if bot is None:
@@ -429,12 +413,9 @@ class AutoFishing(Plugin):
         self._armed = False
         self._candidate = None
         self._dry_reads = 0
-        self._motion_seen = 0
-        self._move_seen = 0
         self._reeling = False
         self._state = "casting"
         self._cast_at = time.monotonic()
-        log.debug("[钓鱼] 已抛竿。")
 
     async def _reel(self, *, caught: bool) -> None:
         """收杆。``caught`` 区分「钓上来」与「超时/断线重抛」，只影响日志计数。"""
@@ -499,14 +480,12 @@ class AutoFishing(Plugin):
             return
         if self._bobber_type is None:
             self._bobber_type = type_id
-            log.debug(f"[钓鱼] 已认定浮标实体类型 type_id={type_id}。")
         self._claim(entity.entity_id, entity.y)
 
     async def _on_entities_remove(self, entity_ids, removed) -> None:
         if self._bobber_id is not None and self._bobber_id in tuple(entity_ids):
             if self._state == "waiting" and not self._reeling:
                 # 浮标凭空消失（线断/换维度）：不算钓到，重抛
-                log.debug("[钓鱼] 浮标消失，重新抛竿。")
                 self._recast_soon()
 
     # ---- 咬钩判定：音效（最准） ----
@@ -542,7 +521,6 @@ class AutoFishing(Plugin):
         if expected is None and sound_id is not None:
             self._learned_sound = sound_id
             log.info(f"[钓鱼] 已学到咬钩音效 ID={sound_id}，之后按它精确判定。")
-        log.debug(f"[钓鱼] 音效信号命中 id={sound_id}。")
         await self._reel(caught=True)
 
     def _sound_packet_id(self) -> int:
@@ -616,22 +594,18 @@ class AutoFishing(Plugin):
     async def _on_entity_motion(self, entity_id, velocity, entity) -> None:
         if not self._watching(entity_id):
             return
-        self._motion_seen += 1
         if not self._armed:
             return  # 还在飞行途中：抛出去时的初速度同样可能是向下的
         threshold = self._settings["bite_velocity"]
         if threshold < 0 and velocity[1] <= threshold:
-            log.debug(f"[钓鱼] 速度信号命中 vy={velocity[1]:.3f}。")
             await self._reel(caught=True)
 
     async def _on_entity_move(self, entity_id, entity) -> None:
         if entity is not None and self._watching(entity_id):
-            self._move_seen += 1
             await self._check_dip(entity.y)
 
     async def _on_entity_teleport(self, entity_id, entity, relative) -> None:
         if entity is not None and self._watching(entity_id):
-            self._move_seen += 1
             await self._check_dip(entity.y)
 
     def _watching(self, entity_id: int) -> bool:
@@ -653,8 +627,4 @@ class AutoFishing(Plugin):
         if not self._armed or self._baseline is None:
             return
         if drop > 0 and self._baseline - y >= drop:
-            log.debug(
-                f"[钓鱼] 下沉信号命中 {self._baseline - y:.3f} 格 "
-                f"(基准 {self._baseline:.3f} -> {y:.3f})。"
-            )
             await self._reel(caught=True)
