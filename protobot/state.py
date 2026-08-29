@@ -134,7 +134,8 @@ class PlayerListEntry:
     game_mode: int = 0
     latency: int = 0
     listed: bool = True
-    #: 显示名的纯文本（服务器未下发时为空串，回落到 ``name``）。
+    #: Display name as plain text; empty when the server sent none, in which
+    #: case ``label`` falls back to ``name``.
     display_name: str = ""
 
     @property
@@ -167,11 +168,12 @@ class PlayerState:
     on_ground: bool = False
     horizontal_collision: bool = False
     loaded: bool = False
-    #: 只有 clientbound_set_health 会更新它；该包未核实的版本上保持初始值。
+    #: Only clientbound_set_health updates these; on versions where that
+    #: packet id is unverified they keep their initial values.
     health: float = 20.0
     food: int = 20
     saturation: float = 5.0
-    #: 收到死亡信号后为 True，收到重生包后清除。
+    #: True after a death signal, cleared by the respawn packet.
     dead: bool = False
     pose: str = "standing"
     crouching: bool = False

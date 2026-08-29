@@ -9,7 +9,7 @@ from .translations import TRANSLATIONS
 
 __all__ = ["plain_text", "format_translation"]
 
-#: 语言文件里只用 ``%s`` / ``%1$s`` 两种占位符，加上 ``%%`` 转义。
+#: Language files use only ``%s`` and ``%1$s`` placeholders, plus ``%%``.
 _PLACEHOLDER = re.compile(r"%%|%(?:(\d+)\$)?s")
 
 

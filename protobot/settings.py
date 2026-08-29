@@ -54,7 +54,7 @@ class PluginSettings:
         path: Path,
         defaults: Mapping[str, Any],
         *,
-        label: str = "设置",
+        label: str = "settings",
         normalize: Callable[[dict], dict] | None = None,
     ) -> None:
         self.path = Path(path)
@@ -77,15 +77,15 @@ class PluginSettings:
             try:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as error:
-                warn(f"[{self._label}] 读取失败，使用默认值 ({error})")
+                warn(f"[{self._label}] read failed, using defaults ({error})")
                 loaded = None
             if isinstance(loaded, Mapping):
                 raw = loaded
             elif loaded is not None:
-                warn(f"[{self._label}] 文件不是 JSON 对象，使用默认值。")
+                warn(f"[{self._label}] file is not a JSON object, using defaults.")
         else:
             self._write(self._defaults)
-            info(f"[{self._label}] 已生成默认文件: {self.path}")
+            info(f"[{self._label}] wrote a default file: {self.path}")
         self.data = self._merge(raw)
         self._snapshot()
         return self.data
@@ -122,11 +122,11 @@ class PluginSettings:
                 if isinstance(loaded, Mapping):
                     raw = dict(loaded)
             except (OSError, ValueError) as error:
-                return f"读取失败: {error}"
+                return f"read failed: {error}"
         error = self._write(deep_merge(raw, changes))
         if error:
             return error
-        self.load()  # 重新归一化并刷新 mtime：自己写的不算外部改动
+        self.load()  # Re-normalize and refresh mtime: our own write is not a change
         return ""
 
     def _write(self, data: Mapping[str, Any]) -> str:
@@ -136,8 +136,8 @@ class PluginSettings:
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         except OSError as error:
-            warn(f"[{self._label}] 写入失败 ({error})")
-            return f"写入失败: {error}"
+            warn(f"[{self._label}] write failed ({error})")
+            return f"write failed: {error}"
         return ""
 
     def _snapshot(self) -> None:

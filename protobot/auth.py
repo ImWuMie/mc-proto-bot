@@ -660,9 +660,10 @@ async def refresh_login(
         "client_id": client_id,
         "refresh_token": refresh_token,
         "grant_type": "refresh_token",
-        # 两套端点都要求 scope。少了它 login.live.com 会返回 HTTP 400
-        # "The provided request must include a 'scope' input parameter."，
-        # 而且必须与当初签发时用的 scope 一致。
+        # Both endpoint families require scope. Without it login.live.com
+        # answers HTTP 400 "The provided request must include a 'scope'
+        # input parameter.", and it has to match the scope the token was
+        # issued with.
         "scope": _AAD_SCOPE if use_aad else _MSA_SCOPE,
     }
     token_url = _AAD_TOKEN_URL if use_aad else _MSA_TOKEN_URL

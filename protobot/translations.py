@@ -31,7 +31,7 @@ from pathlib import Path
 
 __all__ = ["TRANSLATIONS", "register_translations", "load_translations"]
 
-#: 聊天装饰、私聊、加入/退出、进度、睡觉。
+#: Chat decoration, whispers, join/leave, advancements, sleeping.
 _CHAT: dict[str, str] = {
     "chat.type.text": "<%s> %s",
     "chat.type.emote": "* %s %s",
@@ -78,7 +78,7 @@ _CHAT: dict[str, str] = {
     "death.fell.killer": "%1$s was doomed to fall",
 }
 
-#: 原版死亡消息全集（``death.attack.*``）。
+#: The whole vanilla death-message set (``death.attack.*``).
 _DEATHS: dict[str, str] = {
     "death.attack.anvil": "%1$s was squashed by a falling anvil",
     "death.attack.anvil.player": "%1$s was squashed by a falling anvil while fighting %2$s",
@@ -169,8 +169,9 @@ _DEATHS: dict[str, str] = {
     "death.attack.witherSkull.item": "%1$s was shot by a skull from %2$s using %3$s",
 }
 
-#: 内置翻译表。``register_translations`` / ``load_translations`` 就地扩充它，
-#: 因此运行中的插件与核心解码共用同一份，不需要各自传参。
+#: The built-in table. ``register_translations`` / ``load_translations``
+#: extend it in place, so running plugins and the core decoder share one
+#: table instead of each passing its own.
 TRANSLATIONS: dict[str, str] = {**_CHAT, **_DEATHS}
 
 

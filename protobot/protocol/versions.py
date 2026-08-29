@@ -70,16 +70,16 @@ class PlayPacketIds:
     serverbound_tick_end: int
     serverbound_use_item: int
     serverbound_teleport_confirm: int = 0
-    #: 位置型音效包。0 = 这个版本的 ID 未经核实，依赖它的功能应自行降级，
-    #: 而不是拿一个推断值去解析（解错了会误判）。
+    #: Positioned sound packet. 0 = this release's id is unverified, so
+    #: features that need it must degrade rather than decode on a guess.
     clientbound_sound: int = 0
-    #: 死亡与重生。同样以 0 表示「本版本未核实」——核心解析会跳过 0，
-    #: 避免把真正的 0x00 包错当成死亡信号。
+    #: Death and respawn. Again 0 means unverified for this release, and the
+    #: core skips 0 so a real 0x00 packet is never taken for a death signal.
     clientbound_set_health: int = 0
     clientbound_player_combat_kill: int = 0
     serverbound_client_command: int = 0
-    #: 玩家列表（tab list）增删，用于 player_join / player_leave 事件。
-    #: 同样以 0 表示「本版本未核实」。
+    #: Tab-list add/remove, behind the player_join / player_leave events.
+    #: 0 means unverified for this release, as above.
     clientbound_player_info_update: int = 0
     clientbound_player_info_remove: int = 0
 
@@ -220,11 +220,12 @@ _PLAY_774 = PlayPacketIds(
 
 _PLAY_775_776 = PlayPacketIds(
     clientbound_sound=0x75,  # 116/117/119 = sound_entity/sound/stop_sound
-    clientbound_set_health=0x68,  # 104: Float 血量, VarInt 饱食度, Float 饱和度
-    clientbound_player_combat_kill=0x44,  # 68: VarInt 实体 ID + 死亡消息组件
-    serverbound_client_command=0x0C,  # 12: 单个 VarInt，0 = perform respawn
-    # 69/70：紧跟 combat_kill，再往后是 player_look_at(0x47) 与
-    # player_position(0x48)——两侧都被本表里已核实的 ID 夹住，中间没有空位。
+    clientbound_set_health=0x68,  # 104: Float health, VarInt food, Float saturation
+    clientbound_player_combat_kill=0x44,  # 68: VarInt entity id + death message
+    serverbound_client_command=0x0C,  # 12: one VarInt, 0 = perform respawn
+    # 69/70: right after combat_kill, followed by player_look_at (0x47) and
+    # player_position (0x48) -- both neighbours are verified ids from this
+    # very table, and there is no room left in between.
     clientbound_player_info_remove=0x45,
     clientbound_player_info_update=0x46,
     clientbound_add_entity=0x01,

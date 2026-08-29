@@ -46,11 +46,11 @@ __all__ = ["ProtoBotApp", "StdoutProxy", "classify_submission", "tui_enabled"]
 #: Dot commands offered by the TUI input, with their help text.
 #: Exiting is Ctrl+C (Textual's built-in system binding), not a dot command.
 DOT_COMMANDS: dict[str, str] = {
-    ".run": "启动 bot（连接服务器并开始运行）",
-    ".stop": "停止 bot（保持界面）",
-    ".plugins": "列出已加载插件",
-    ".llm": "把后面的内容交给 LLM 智能体，回复打印在这里",
-    ".help": "显示可用命令",
+    ".run": "start the bot (connect and run)",
+    ".stop": "stop the bot (keep this interface)",
+    ".plugins": "list the loaded plugins",
+    ".llm": "hand the rest of the line to the LLM agent; its reply prints here",
+    ".help": "show the available commands",
 }
 
 
@@ -91,8 +91,9 @@ def tui_enabled(
         return False
     if not _TEXTUAL:
         print(
-            "[提示] 未安装 protobot[tui]，使用普通日志模式"
-            "（pip install -e \".[tui]\" 后在真终端运行可启用 TUI 界面）。"
+            "[note] protobot[tui] is not installed, falling back to plain logs "
+            "(install it with pip install -e \".[tui]\" and run in a real "
+            "terminal for the full-screen interface)."
         )
         return False
     return True
@@ -170,19 +171,21 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         # bound with priority too so they reach the history instead of the
         # Input's own cursor handling.
         BINDINGS = [
-            Binding("ctrl+c", "quit", "退出", show=False, priority=True),
-            Binding("up", "history_prev", "上一条", show=False, priority=True),
-            Binding("down", "history_next", "下一条", show=False, priority=True),
-            # 键盘翻日志。滚轮要靠终端把鼠标事件转发进来，而 GNU screen 默认
-            # 不转发（tmux 也要 `set -g mouse on`），SSH + screen 下滚轮因此
-            # 完全无效；而 TUI 跑在备用屏缓冲里，终端自己的回滚也翻不到它。
-            # PageUp/PageDown 是纯键盘序列，哪一层都不需要额外配置。
-            Binding("pageup", "log_page_up", "上翻日志", show=False, priority=True),
+            Binding("ctrl+c", "quit", "quit", show=False, priority=True),
+            Binding("up", "history_prev", "previous", show=False, priority=True),
+            Binding("down", "history_next", "next", show=False, priority=True),
+            # Paging the log from the keyboard. The wheel needs the terminal to
+            # forward mouse events, which GNU screen does not do by default
+            # (tmux needs `set -g mouse on` too), so under SSH + screen the
+            # wheel does nothing; and the TUI lives in the alternate screen
+            # buffer, so the terminal's own scrollback cannot reach it either.
+            # PageUp/PageDown are plain key sequences that need no setup.
+            Binding("pageup", "log_page_up", "page up", show=False, priority=True),
             Binding(
-                "pagedown", "log_page_down", "下翻日志", show=False, priority=True
+                "pagedown", "log_page_down", "page down", show=False, priority=True
             ),
             Binding(
-                "ctrl+l", "log_follow", "回到最新", show=False, priority=True
+                "ctrl+l", "log_follow", "jump to latest", show=False, priority=True
             ),
         ]
 
@@ -295,15 +298,17 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self._refresh_status()
             if self.autostart:
                 self._log_write(
-                    "[提示] 配置齐全，正在自动启动 bot"
-                    "（.stop 停止，↑/↓ 翻历史，PageUp/PageDown 翻日志，"
-                    ".help 查看命令，Ctrl+C 退出）。"
+                    "[note] credentials are ready, starting the bot "
+                    "(.stop to stop it, up/down for input history, "
+                    "PageUp/PageDown to page the log, .help for commands, "
+                    "Ctrl+C to quit)."
                 )
                 self._command_run()
             else:
                 self._log_write(
-                    "[提示] 输入 .run 启动 bot，↑/↓ 翻历史，"
-                    "PageUp/PageDown 翻日志，.help 查看可用命令，Ctrl+C 退出。"
+                    "[note] type .run to start the bot, up/down for input "
+                    "history, PageUp/PageDown to page the log, .help for "
+                    "commands, Ctrl+C to quit."
                 )
 
         # ---- session events (connection duration) ----
@@ -374,8 +379,9 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             else:
                 position = ""
             if self._log_paused():
-                # 暂停跟随时新日志不再自动滚到底，得说清楚，否则看着像卡死了
-                position = "⏸ 日志已暂停 · ctrl+l 回到最新"
+                # While following is paused new lines no longer scroll into
+                # view, so say so -- otherwise it looks like a freeze
+                position = "|| log paused - ctrl+l for the latest"
             self.status_texts["pos"] = position
             self.query_one("#pos", Static).update(position)
 
@@ -393,7 +399,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             self.status_texts["server"] = server_text
             self.query_one("#server", Static).update(server_text)
 
-        # ---- 日志滚动：纯键盘，不依赖终端的鼠标转发 ----
+        # ---- Log scrolling: keyboard only, no mouse forwarding needed ----
 
         def _log_widget(self) -> "RichLog | None":
             try:
@@ -402,7 +408,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 return None
 
         def _log_paused(self) -> bool:
-            """是否暂停了「新日志自动滚到底」。"""
+            """Whether following the tail of the log is paused."""
             widget = self._log_widget() if self.is_running else None
             return widget is not None and not widget.auto_scroll
 
@@ -410,7 +416,8 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             widget = self._log_widget()
             if widget is None:
                 return
-            # 暂停跟随：否则下一行日志一到就把视图拽回底部，根本读不了历史
+            # Pause following, or the next log line yanks the view back to the
+            # bottom and nothing older can be read
             widget.auto_scroll = False
             widget.scroll_page_up(animate=False)
             self._refresh_status()
@@ -421,7 +428,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 return
             widget.scroll_page_down(animate=False)
             if widget.is_vertical_scroll_end:
-                widget.auto_scroll = True  # 翻回底部就继续跟随
+                widget.auto_scroll = True  # Back at the bottom: follow again
             self._refresh_status()
 
         def action_log_follow(self) -> None:
@@ -440,7 +447,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             if not text:
                 return
             self._remember(text)
-            # 发了东西就该看见结果：顺手取消暂停，回到最新
+            # Anything sent should be visible: resume following the tail
             self.action_log_follow()
             if text.startswith("."):
                 self._run_dot_command(text)
@@ -491,7 +498,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         async def _submit(self, kind: str, payload: str) -> None:
             bot = self.session.bot  # re-read: reconnects replace the bot
             if bot is None:
-                self._log_write("[提示] 尚未连接，消息未发送。")
+                self._log_write("[note] not connected, message not sent.")
                 return
             try:
                 if kind == "command":
@@ -499,7 +506,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 else:
                     await bot.send_message(payload)
             except Exception as error:
-                self._log_write(f"[错误] 发送失败: {error}")
+                self._log_write(f"[error] send failed: {error}")
 
         # ---- dot commands ----
 
@@ -507,7 +514,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             name, _, argument = text.partition(" ")
             if name not in DOT_COMMANDS:
                 self._log_write(
-                    f"[命令] 未知命令 {name}，输入 .help 查看可用命令。"
+                    f"[command] unknown command {name}; type .help for the list."
                 )
                 return
             if name == ".run":
@@ -522,19 +529,20 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 self._command_help()
 
         def _command_llm(self, argument: str) -> None:
-            """把内容交给 llm_agent 插件，回复写回日志区。
+            """Hand the text to the llm_agent plugin and print its reply here.
 
-            插件缺失或未启用时说清楚，而不是静默无反应——``llm_agent`` 是
-            可选插件，用户完全可能没装/禁用了它。
+            Say so plainly when the plugin is missing or disabled instead of
+            doing nothing: ``llm_agent`` is optional, so it may well not be
+            installed or may have been switched off.
             """
             prompt = argument.strip()
             if not prompt:
-                self._log_write("[LLM] 用法: .llm 要说的内容")
+                self._log_write("[LLM] usage: .llm <what to say>")
                 return
             manager = self.manager
             if manager is None or manager.get_service("llm_agent.console") is None:
                 self._log_write(
-                    "[LLM] 未加载 llm_agent 插件（或它已被禁用），无法调用。"
+                    "[LLM] the llm_agent plugin is not loaded (or is disabled)."
                 )
                 return
             self._log_write(f"[LLM] > {prompt}")
@@ -545,20 +553,20 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             try:
                 reply = await manager.call_service("llm_agent.console", text=prompt)
             except Exception as error:
-                self._log_write(f"[LLM] 调用失败: {error}")
+                self._log_write(f"[LLM] call failed: {error}")
                 return
             lines = str(reply).strip().splitlines()
             if not lines:
-                self._log_write("[LLM] （无回复）")
+                self._log_write("[LLM] (no reply)")
                 return
             for line in lines:
                 self._log_write(f"[LLM] {line}")
 
         def _command_run(self) -> None:
             if self.started:
-                self._log_write("[命令] bot 已在运行。")
+                self._log_write("[command] the bot is already running.")
                 return
-            self._log_write("[命令] 正在启动 bot ...")
+            self._log_write("[command] starting the bot ...")
             self.session_task = asyncio.create_task(
                 self._run_session(), name="protobot-session-tui"
             )
@@ -568,7 +576,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
             try:
                 await self.session.run()
                 if self.is_running:  # the app may have closed first
-                    self._log_write("[提示] bot 会话已停止。")
+                    self._log_write("[note] the bot session stopped.")
             except asyncio.CancelledError:
                 raise
             except BaseException as error:
@@ -577,35 +585,35 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
                 # non-zero, so log it here and re-raise rather than swallowing
                 # it and reporting success.
                 if self.is_running:
-                    self._log_write(f"[错误] bot 会话异常退出: {error}")
+                    self._log_write(f"[error] the bot session died: {error}")
                 raise
 
         def _command_stop(self) -> None:
             if not self.started:
-                self._log_write("[命令] bot 未在运行。")
+                self._log_write("[command] the bot is not running.")
                 return
-            self._log_write("[命令] 正在停止 bot ...")
+            self._log_write("[command] stopping the bot ...")
             self.session.request_stop()
 
         def _command_plugins(self) -> None:
             if self.manager is None:
-                self._log_write("[插件] 插件管理器不可用。")
+                self._log_write("[plugin] the plugin manager is unavailable.")
                 return
             plugins = self.manager.load_order()
             if not plugins:
-                self._log_write("[插件] 未发现插件。")
+                self._log_write("[plugin] no plugins found.")
                 return
             names = ", ".join(plugin.name for plugin in plugins)
-            self._log_write(f"[插件] 已加载 {len(plugins)} 个插件: {names}")
+            self._log_write(f"[plugin] {len(plugins)} plugin(s) loaded: {names}")
 
         def _command_help(self) -> None:
-            self._log_write("[命令] 可用命令:")
+            self._log_write("[command] available commands:")
             for name, description in DOT_COMMANDS.items():
                 self._log_write(f"  {name:<10s} {description}")
             self._log_write(
-                "[提示] 普通文本 = 聊天消息；/命令 = 服务器命令；"
-                "↑/↓ 翻输入历史；PageUp/PageDown 翻日志，ctrl+l 回到最新；"
-                "Ctrl+C 退出。"
+                "[note] plain text = chat message; /command = server command; "
+                "up/down for input history; PageUp/PageDown to page the log, "
+                "ctrl+l for the latest; Ctrl+C to quit."
             )
 
 else:  # pragma: no cover - exercised on base installs

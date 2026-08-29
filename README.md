@@ -1,6 +1,6 @@
 # ProtoBot
 
-English | [简体中文](README_zh.md)
+README (English only for now; translations can come back once the project has i18n)
 
 A modern Python 3.12+ Minecraft protocol client supporting both **offline-mode** and **online-mode** (Mojang / Microsoft authenticated) servers.
 
@@ -794,26 +794,15 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 
 ```bash
 uv sync --extra online          # install runtime extras plus the dev tools
-uv run python -m compileall .   # fast syntax check
-uv run pytest                   # unit tests under tests/
+python -m compileall protobot plugins run_bot.py   # fast syntax check
 ```
-
-The suite is written against the standard library's `unittest`, so it also runs
-with nothing installed beyond the package itself:
-
-```bash
-python -m unittest discover -s tests -t .
-```
-
-Tests that cover online-mode authentication skip automatically when the
-optional `cryptography` extra is not present.
 
 ## Notes and limitations
 
 - **Online & offline mode.** Offline mode has zero third-party dependencies. For online-mode servers, install `protobot[online]` (requires `cryptography`).
 - **Chat sending is unsigned.** `send_message()` works on servers that do not enforce secure chat (most plugin servers). A server with `enforce-secure-profile=true` will drop or reject the message — signing requires the account's local chat keypair, which a bot holding only an access token cannot access. Commands are unaffected: `send_command()` uses the plain command packet.
 - Physics prediction mirrors vanilla 26.2 defaults; servers with heavy movement anti-cheat customisation may still issue corrections.
-- `python -m compileall .` is the standing sanity check; unit tests are located under `tests/`.
+- `python -m compileall protobot plugins run_bot.py` is the standing sanity check.
 
 ## License
 

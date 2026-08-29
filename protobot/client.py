@@ -66,7 +66,8 @@ _MOVEMENT_EFFECTS = {
     36: "minecraft:weaving",
 }
 
-# Player Info Update 的动作位（1.21.4+ 共 8 个，正好一个字节的定长位集）。
+# Player Info Update action bits: 1.21.4+ has eight of them, which is
+# exactly one byte of the fixed-size bit set the packet carries.
 _PLAYER_INFO_ADD = 0x01
 _PLAYER_INFO_INIT_CHAT = 0x02
 _PLAYER_INFO_GAME_MODE = 0x04
@@ -76,8 +77,9 @@ _PLAYER_INFO_DISPLAY_NAME = 0x20
 _PLAYER_INFO_LIST_ORDER = 0x40
 _PLAYER_INFO_HAT = 0x80
 
-#: 进入 PLAY 后这么久之内收到的玩家列表算「初始名单」，不当成有人加入。
-#: 原版服务端把在线玩家一次发完，但代理有可能拆成几个包。
+#: A player list arriving within this long of entering PLAY counts as the
+#: initial roster rather than people joining. Vanilla sends everyone who is
+#: online in one packet, but a proxy may split it across several.
 _ROSTER_GRACE = 1.0
 
 _MOVEMENT_ATTRIBUTES_774 = {
@@ -672,8 +674,8 @@ class Bot:
         packet_id = self.version.packets.serverbound_client_command
         if not packet_id:
             raise UnsupportedVersion(
-                "serverbound_client_command 的包 ID 在 "
-                f"{self.version.name} 上未经核实，无法请求重生"
+                "the serverbound_client_command packet id is unverified on "
+                f"{self.version.name}, so a respawn cannot be requested"
             )
         await self.send_raw(packet_id, PacketWriter().write_varint(0).to_bytes())
 
@@ -2731,7 +2733,8 @@ class Bot:
 
     def _handle_play_login(self, payload: bytes) -> None:
         reader = PacketReader(payload)
-        # 新一轮 PLAY：玩家列表从零开始，随后到来的名单算「初始名单」。
+        # A fresh PLAY state: the player list starts empty, and whatever
+        # arrives next is the initial roster.
         self.players.clear()
         self._roster_synced = False
         self._roster_deadline = time.monotonic() + _ROSTER_GRACE
@@ -2783,20 +2786,22 @@ class Bot:
         self.player.food = food
         self.player.saturation = saturation
         await self.events.emit("health", health, food, saturation)
-        # 血量归零也是死亡信号，但不如 combat_kill 权威：服务端按 tick 边界
-        # 补发，且插件可以缩放血量。死亡窗口内会反复收到 0，用 dead 去重。
+        # Health reaching zero is a death signal too, but a weaker one than
+        # combat_kill: the server resends it on tick boundaries and plugins can
+        # scale health. Zero arrives repeatedly, so dead dedupes the event.
         if health <= 0.0 and not self.player.dead:
             self.player.dead = True
             await self.events.emit("death", None)
 
     async def _handle_player_combat_kill(self, payload: bytes) -> None:
-        """Combat Death：服务端要求客户端显示死亡界面，即权威的死亡信号。"""
+        """Combat Death: the server telling the client to show the death
+        screen, which makes it the authoritative death signal."""
         reader = PacketReader(payload)
         entity_id = reader.read_varint()
         message = read_anonymous_nbt(reader)
         reader.expect_end()
         if self.session.entity_id is not None and entity_id != self.session.entity_id:
-            return  # 别人的死亡（旁观视角等）不算自己死了。
+            return  # Someone else died (spectating, etc.), not this bot.
         self.player.health = 0.0
         if self.player.dead:
             return
@@ -2804,13 +2809,16 @@ class Bot:
         await self.events.emit("death", message)
 
     async def _handle_player_info_update(self, payload: bytes) -> None:
-        """玩家列表更新：维护 :attr:`players`，新玩家发出 ``player_join``。
+        """Player list update: maintains :attr:`players` and emits
+        ``player_join`` for anyone new.
 
-        整个包先解析到一边再落库：动作位集是定长的（1.21.4+ 八个动作正好一
-        字节），下一个版本多加一个动作就会变成两字节，届时这里读出来的都是错
-        位数据。要求 ``expect_end()`` 恰好读完，一旦对不上就整包丢弃并发出
-        ``player_list_unparsed``——宁可没有加入/退出事件，也不要拿错位的字节
-        编出人名来。
+        The whole packet is decoded aside before anything is stored. The action
+        bit set is fixed-size (1.21.4+ has eight actions, exactly one byte), so
+        a release that adds a ninth would make it two bytes and every field
+        after it would be read off by one. ``expect_end()`` therefore has to
+        land exactly at the end; when it does not, the packet is discarded and
+        ``player_list_unparsed`` is emitted instead -- better no join/leave
+        events at all than player names invented out of misaligned bytes.
         """
 
         try:
@@ -2836,14 +2844,15 @@ class Bot:
                 entry.listed = listed
             if display_name is not None:
                 entry.display_name = display_name
-        # 刚进服时服务端把全部在线玩家发过来，那不是「有人加入」。
+        # On joining, the server sends everyone who is online; that is a
+        # roster, not people arriving.
         if not self._roster_synced or time.monotonic() < self._roster_deadline:
             self._roster_synced = True
             await self.events.emit("player_list", tuple(self.players.values()))
             return
         for entry in joined:
             if entry.uuid == self.uuid:
-                continue  # 自己出现在列表里不算加入
+                continue  # This bot's own entry is not a join
             await self.events.emit("player_join", entry)
 
     def _decode_player_info(
@@ -2902,7 +2911,7 @@ class Bot:
         return decoded
 
     async def _handle_player_info_remove(self, payload: bytes) -> None:
-        """玩家列表移除：发出 ``player_leave``。"""
+        """Player list removal: emits ``player_leave``."""
 
         try:
             reader = PacketReader(payload)

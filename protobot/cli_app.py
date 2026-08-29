@@ -1,9 +1,10 @@
-"""ProtoBot 统一命令行入口：``protobot login|run|plugins|setup``。
+"""The single ProtoBot command line: ``protobot login|run|plugins|setup``.
 
-首次启动（配置文件不存在）时进入交互式配置向导：登录方式 -> 服务器地址 ->
-协议版本，随后把配置写入本地 ``config.yaml``。授权凭据缓存始终存放在配置
-文件旁边（``auth_cache.json``），因此 ``login`` 与 ``run`` 在任意工作目录
-下都指向同一份。
+On first start (no config file yet) an interactive wizard runs: login method
+-> server address -> protocol version, and the answers are written to a local
+``config.yaml``. The credential cache always lives next to that config file
+(``auth_cache.json``), so ``login`` and ``run`` point at the same one from any
+working directory.
 """
 
 from __future__ import annotations
@@ -48,20 +49,23 @@ __all__ = [
 ]
 
 
-# ======================== 配置加载 ========================
+# ======================== Configuration loading ========================
 
 
 def load_session_config(data: dict) -> SessionConfig:
-    """从 config.yaml 的字典构建 SessionConfig（非法值抛中文 ValueError）。"""
+    """Build a SessionConfig from the config.yaml mapping.
+
+    Invalid values raise ValueError with a message meant for the console.
+    """
     server = data.get("server", {})
     login = data.get("login", {})
     session = data.get("session", {})
     if not isinstance(server, dict) or not server.get("host"):
-        raise ValueError("配置缺少 server.host（服务器地址）")
+        raise ValueError("the config is missing server.host (the server address)")
 
     mode = login.get("mode", "online") if isinstance(login, dict) else "online"
     if mode not in ("online", "offline"):
-        raise ValueError(f"login.mode 必须是 online 或 offline，得到 {mode!r}")
+        raise ValueError(f"login.mode must be online or offline, got {mode!r}")
     offline_username = str(login.get("offline_username", "ProtoBot")) \
         if isinstance(login, dict) else "ProtoBot"
 
@@ -89,7 +93,7 @@ class PluginConfig:
 
 
 def load_plugin_config(data: dict, base_dir: Path) -> PluginConfig:
-    """从 config.yaml 读取 [plugins] 段；相对目录按配置文件所在目录解析。"""
+    """Read the [plugins] section; relative paths resolve next to the config."""
     plugins = data.get("plugins", {})
     if not isinstance(plugins, dict):
         plugins = {}
@@ -107,25 +111,27 @@ def load_plugin_config(data: dict, base_dir: Path) -> PluginConfig:
 
 
 def load_tui_config(data: dict) -> bool:
-    """从 config.yaml 读取 [tui] enabled（缺省 True）。"""
+    """Read [tui] enabled from config.yaml (default True)."""
     tui = data.get("tui", {})
     return bool(tui.get("enabled", True)) if isinstance(tui, dict) else True
 
 
 def load_tui_autostart(data: dict) -> bool:
-    """从 config.yaml 读取 [tui] autostart（缺省 True）。
+    """Read [tui] autostart from config.yaml (default True).
 
-    为真时，只要凭据齐全，TUI 一进界面就自动执行 .run，不必手动敲。
+    When true and the credentials are ready, the TUI runs .run for you as soon
+    as it comes up instead of waiting for it to be typed.
     """
     tui = data.get("tui", {})
     return bool(tui.get("autostart", True)) if isinstance(tui, dict) else True
 
 
 def credentials_ready(cache_file: Path, session_config: SessionConfig) -> bool:
-    """连接所需的凭据是否已就绪（决定 TUI 能否自动启动）。
+    """Whether the credentials needed to connect are ready (gates autostart).
 
-    离线模式永远就绪；正版模式需要本地缓存，且令牌未过期或还能续期——
-    否则 ``get_credentials`` 会抛 SystemExit，不该自动去撞这个错误。
+    Offline mode always is. Online mode needs a local cache whose token is
+    either still valid or refreshable -- otherwise ``get_credentials`` raises
+    SystemExit, and autostart should not walk into that.
     """
     if not session_config.online_mode:
         return True
@@ -136,7 +142,7 @@ def credentials_ready(cache_file: Path, session_config: SessionConfig) -> bool:
     return not profile.expired or bool(profile.refresh_token)
 
 
-# ======================== 凭据缓存（与旧 login.py / run_bot.py 同格式） ========================
+# ================= Credential cache (same format as the old login.py) =================
 
 
 def save_profile(
@@ -160,10 +166,12 @@ def save_profile(
 
 
 def load_profile(cache_file: Path) -> tuple[MinecraftProfile, dict] | None:
-    """读取本地缓存的正版凭据；缺失或损坏时返回 None。
+    """Read the cached online-mode credentials; None when missing or corrupt.
 
-    同时返回续期所需的参数：设备码流程签发的令牌必须回到 Azure AD 端点续期，
-    授权码流程签发的必须回到 MSA 端点，两者不能混用。
+    Also returns what a refresh needs: a token issued through the device-code
+    flow has to be refreshed against the Azure AD endpoints and one issued
+    through the authorization-code flow against the MSA endpoints. The two
+    cannot be mixed.
     """
     if not cache_file.exists():
         return None
@@ -177,7 +185,7 @@ def load_profile(cache_file: Path) -> tuple[MinecraftProfile, dict] | None:
             expires_at=float(data.get("expires_at", 0.0)),
         )
     except (OSError, ValueError, KeyError) as error:
-        info(f"[提示] 本地凭据缓存损坏，将重新发起登录 ({error})")
+        info(f"[note] the credential cache is corrupt, signing in again ({error})")
         return None
 
     refresh_options: dict = {}
@@ -189,10 +197,11 @@ def load_profile(cache_file: Path) -> tuple[MinecraftProfile, dict] | None:
 async def get_credentials(
     cache_file: Path, *, online_mode: bool, offline_username: str
 ) -> tuple[str, str | None, uuid.UUID | None]:
-    """获取连接凭据（正版或离线）。
+    """Get the credentials to connect with (online or offline).
 
-    正版模式下优先复用本地缓存；令牌过期时用 refresh token 自动续期。
-    续期不可用时提示重新运行 ``protobot login``。
+    Online mode reuses the local cache when it can and refreshes an expired
+    token with its refresh token. When no refresh is possible it asks for
+    ``protobot login`` to be run again.
     """
     if not online_mode:
         return offline_username, None, None
@@ -200,117 +209,122 @@ async def get_credentials(
     loaded = load_profile(cache_file)
     if loaded is None:
         raise SystemExit(
-            "[错误] 未找到正版凭据缓存。请先运行 protobot login 完成一次微软账号授权。"
+            "[error] no credential cache found. Run protobot login once to "
+            "authorize your Microsoft account."
         )
     profile, refresh_options = loaded
 
     if not profile.expired:
-        info(f"[凭据] 已从本地缓存读取正版账号: {profile.name}")
+        info(f"[auth] using the cached online account: {profile.name}")
         return profile.name, profile.access_token, profile.id
 
     if not profile.refresh_token:
         raise SystemExit(
-            "[错误] 缓存令牌已过期且没有续期令牌，请重新运行 protobot login 授权。"
+            "[error] the cached token expired and there is no refresh token; "
+            "run protobot login again."
         )
 
-    info(f"[凭据] 缓存令牌已过期，正在为 {profile.name} 自动续期...")
+    info(f"[auth] the cached token expired, refreshing it for {profile.name} ...")
     try:
         profile = await refresh_login(profile.refresh_token, **refresh_options)
     except Exception as error:
         raise SystemExit(
-            f"[错误] 自动续期失败，请重新运行 protobot login 授权。原因: {error}"
+            f"[error] the refresh failed, run protobot login again. Reason: {error}"
         ) from error
 
     save_profile(cache_file, profile, refresh_options)
-    info(f"[凭据] 续期成功: {profile.name}")
+    info(f"[auth] refreshed: {profile.name}")
     return profile.name, profile.access_token, profile.id
 
 
-# ======================== 登录交互（自 login.py 迁入） ========================
+# ==================== Sign-in prompts (moved from login.py) ====================
 
 
 def _open_browser(url: str) -> None:
     try:
         if webbrowser.open(url):
-            print("    （已尝试自动打开浏览器）")
+            print("    (a browser was opened for you)")
     except Exception:
         pass
 
 
 def show_device_code(user_code: str, verification_uri: str) -> None:
-    print(f"\n[1] 请在浏览器中打开（验证码已预填）：\n\n    {verification_uri}\n")
+    print(f"\n[1] Open this in a browser (the code is prefilled):\n\n    {verification_uri}\n")
     _open_browser(verification_uri)
-    print(f"[2] 验证码： {user_code}")
-    print("    如果页面没有预填，手动输入上面这串即可。\n")
-    print("[3] 登录后请**一路点到最后的确认页**，不要提前关闭窗口。")
-    print("    完成后本脚本会自动继续，无需回到这里操作。\n")
-    print("[..] 正在等待你在浏览器中完成授权（最多 15 分钟）...")
+    print(f"[2] Code: {user_code}")
+    print("    Type it in yourself if the page did not prefill it.\n")
+    print("[3] Click all the way through to the final confirmation page;")
+    print("    do not close the window early. This script then continues on")
+    print("    its own -- nothing to do back here.\n")
+    print("[..] waiting for you to finish in the browser (up to 15 minutes) ...")
 
 
 def prompt_for_code(url: str) -> str:
-    print("\n[1] 请在浏览器中打开下面的链接并登录：\n")
+    print("\n[1] Open this link in a browser and sign in:\n")
     print(f"    {url}\n")
     _open_browser(url)
-    print("[2] 登录完成后，微软会显示一个提示页，大意是：")
-    print('    「你已进入一个通常不会显示的页面。Microsoft 绝不会要求你复制或分享此 URL」')
-    print("    这是反钓鱼提示。你要粘贴到的是本机上的这个脚本，令牌不会外传。\n")
-    print("[3] 请把浏览器地址栏里**整条**地址复制下来，它形如：")
+    print("[2] Microsoft then shows a warning page along the lines of:")
+    print('    "You\'ve reached a page you normally would not see. Microsoft'
+          ' will never ask you to copy or share this URL."')
+    print("    That is an anti-phishing notice. You are pasting into this")
+    print("    script on your own machine; the token does not leave it.\n")
+    print("[3] Copy the **whole** address from the browser bar. It looks like:")
     print("    https://login.live.com/oauth20_desktop.srf?code=M.C5xx...&lc=2052\n")
-    return input("[4] 粘贴回跳地址（或只粘贴 code 部分）后回车： ")
+    return input("[4] Paste the redirect address (or just the code) and press Enter: ")
 
 
-# ======================== 首次启动配置向导 ========================
+# ======================== First-run configuration wizard ========================
 
 
 def _parse_address(value: str) -> tuple[str, int]:
-    """解析 ``host`` 或 ``host:port``（不支持 IPv6 字面量）。"""
+    """Parse ``host`` or ``host:port`` (IPv6 literals are not supported)."""
     if ":" in value:
         host, _, port_text = value.rpartition(":")
         if not host:
-            raise ValueError("缺少主机名")
+            raise ValueError("the host name is missing")
         try:
             port = int(port_text)
         except ValueError:
-            raise ValueError(f"端口无效: {port_text!r}") from None
+            raise ValueError(f"invalid port: {port_text!r}") from None
     else:
         host, port = value, 25565
     if not 1 <= port <= 65535:
-        raise ValueError(f"端口必须在 1-65535 之间，得到 {port}")
+        raise ValueError(f"port must be between 1 and 65535, got {port}")
     return host, port
 
 
 def run_setup(config_path: Path) -> int:
-    """交互式配置向导：登录方式 -> 服务器 -> 版本，写入 config.yaml。"""
+    """Interactive wizard: login method -> server -> version, into config.yaml."""
     print("=" * 60)
-    print("        ProtoBot 首次配置向导")
+    print("        ProtoBot first-run setup")
     print("=" * 60)
-    print("（按 Enter 接受默认值；随时 Ctrl+C 退出）\n")
+    print("(press Enter to accept a default; Ctrl+C quits at any point)\n")
 
-    # [1/3] 登录方式
+    # [1/3] Login method
     while True:
         choice = input(
-            "[1/3] 选择登录方式: [1] 离线登录  [2] 正版登录 (默认 2): "
+            "[1/3] Login method: [1] offline  [2] online/Microsoft (default 2): "
         ).strip() or "2"
         if choice == "1":
             mode = "offline"
         elif choice == "2":
             mode = "online"
         else:
-            print("    无效输入，请输入 1 或 2。")
+            print("    Please enter 1 or 2.")
             continue
         break
     offline_username = "ProtoBot"
     if mode == "offline":
-        name = input("[ ] 离线用户名 (默认 ProtoBot): ").strip() or "ProtoBot"
+        name = input("[ ] Offline username (default ProtoBot): ").strip() or "ProtoBot"
         offline_username = name[:16] or "ProtoBot"
 
-    # [2/3] 服务器地址
+    # [2/3] Server address
     while True:
         address = input(
-            "[2/3] 服务器地址 host[:port] (默认端口 25565): "
+            "[2/3] Server address host[:port] (port defaults to 25565): "
         ).strip()
         if not address:
-            print("    地址不能为空。")
+            print("    The address cannot be empty.")
             continue
         try:
             host, port = _parse_address(address)
@@ -319,14 +333,14 @@ def run_setup(config_path: Path) -> int:
             continue
         break
 
-    # [3/3] 协议版本
+    # [3/3] Protocol version
     versions = list(SUPPORTED_VERSIONS)
-    print("[3/3] 选择协议版本:")
+    print("[3/3] Protocol version:")
     for index, version in enumerate(versions, start=1):
-        marker = " (默认)" if version == "26.2" else ""
+        marker = " (default)" if version == "26.2" else ""
         print(f"    [{index}] {version}{marker}")
     while True:
-        choice = input("[ ] 请输入序号 (默认 26.2): ").strip() or "26.2"
+        choice = input("[ ] Number or version (default 26.2): ").strip() or "26.2"
         if choice.isdigit():
             index = int(choice)
             if 1 <= index <= len(versions):
@@ -335,7 +349,7 @@ def run_setup(config_path: Path) -> int:
         if choice in versions:
             version = choice
             break
-        print(f"    无效输入，请输入 1-{len(versions)} 或版本号。")
+        print(f"    Please enter 1-{len(versions)} or a version number.")
 
     data = {
         "server": {"host": host, "port": port, "version": version},
@@ -351,40 +365,40 @@ def run_setup(config_path: Path) -> int:
     save_config(config_path, data)
 
     print("\n" + "=" * 60)
-    print("【配置完成！】")
-    print(f"登录方式: {'正版登录' if mode == 'online' else '离线登录'}")
-    print(f"服务器: {host}:{port}  版本: {version}")
-    print(f"配置文件已保存到: {config_path}")
+    print("[done] setup complete")
+    print(f"Login: {'online (Microsoft)' if mode == 'online' else 'offline'}")
+    print(f"Server: {host}:{port}  Version: {version}")
+    print(f"Config written to: {config_path}")
     print("=" * 60)
-    print("下一步:")
+    print("Next:")
     if mode == "online":
-        print("  1. 运行 protobot login 完成一次微软账号授权")
-    print("  2. 运行 protobot run（或在 PyCharm 中右键运行 run_bot.py）连服")
+        print("  1. run protobot login once to authorize your Microsoft account")
+    print("  2. run protobot run (or right-click run_bot.py in PyCharm)")
     return 0
 
 
-# ======================== 子命令 ========================
+# ======================== Subcommands ========================
 
 
 async def run_login(args: argparse.Namespace) -> int:
     print("=" * 60)
-    print("      ProtoBot 微软正版账号授权向导")
+    print("      ProtoBot Microsoft account sign-in")
     print("=" * 60)
 
     if args.auth_code:
-        print("[方式] 授权码流程（需复制粘贴地址）")
+        print("[flow] authorization code (you paste the redirect address)")
         profile = await authorization_code_login(prompt_callback=prompt_for_code)
         client_id = None
         azure_ad = False
     elif args.azure_client_id:
-        print("[方式] 设备码流程（使用你的 Azure 应用）")
+        print("[flow] device code (with your own Azure application)")
         profile = await device_code_login(
             args.azure_client_id, prompt_callback=show_device_code
         )
         client_id = args.azure_client_id
         azure_ad = True
     else:
-        print("[方式] 设备码流程（输验证码，无需注册）")
+        print("[flow] device code (enter a code, no registration needed)")
         profile = await device_code_login(prompt_callback=show_device_code)
         client_id = None
         azure_ad = False
@@ -393,16 +407,16 @@ async def run_login(args: argparse.Namespace) -> int:
     save_profile(cache_file, profile, {"azure_ad": azure_ad, "client_id": client_id})
 
     print("\n" + "=" * 60)
-    print("【登录成功！】")
-    print(f"玩家昵称: {profile.name}")
-    print(f"玩家 UUID: {profile.id}")
-    print(f"凭据已自动保存到: {cache_file.name}")
+    print("[done] signed in")
+    print(f"Name: {profile.name}")
+    print(f"UUID: {profile.id}")
+    print(f"Credentials saved to: {cache_file.name}")
     if profile.refresh_token:
-        print("已保存续期令牌，后续连接会自动刷新，无需重复授权。")
+        print("A refresh token was saved, so later connections renew on their own.")
     else:
-        print("提示: 本次未获得续期令牌，令牌过期后需要重新运行本命令。")
-    print("注意: 该文件包含账号访问令牌，请勿分享或提交到版本库。")
-    print("现在你可以运行 protobot run（或在 PyCharm 中右键运行 run_bot.py）连服了！")
+        print("Note: no refresh token this time; rerun this command once it expires.")
+    print("Careful: that file holds an account access token. Do not share or commit it.")
+    print("You can now run protobot run (or right-click run_bot.py in PyCharm).")
     print("=" * 60)
     return 0
 
@@ -412,17 +426,17 @@ async def run_bot_session(args: argparse.Namespace) -> int:
     try:
         data = load_config(config_path)
     except OSError:
-        print(f"[错误] 找不到配置文件: {config_path}。可用 --config 指定路径。")
+        print(f"[error] no config file at {config_path}. Pass --config to point elsewhere.")
         return 2
     except ValueError as error:
-        print(f"[错误] {error}")
+        print(f"[error] {error}")
         return 2
 
     try:
         session_config = load_session_config(data)
         plugin_config = load_plugin_config(data, config_path.parent)
     except ValueError as error:
-        print(f"[错误] {error}")
+        print(f"[error] {error}")
         return 2
 
     manager = PluginManager(
@@ -435,12 +449,12 @@ async def run_bot_session(args: argparse.Namespace) -> int:
         return 1
     if manager.load_order():
         print(
-            f"[插件] 已加载 {len(manager.load_order())} 个插件: "
+            f"[plugin] {len(manager.load_order())} plugin(s) loaded: "
             + ", ".join(plugin.name for plugin in manager.load_order())
         )
 
     print("=" * 60)
-    print("           ProtoBot 机器人启动器")
+    print("           ProtoBot launcher")
     print("=" * 60)
 
     cache_file = config_path.with_name("auth_cache.json")
@@ -458,17 +472,18 @@ async def run_bot_session(args: argparse.Namespace) -> int:
     watcher_task: asyncio.Task | None = None
     try:
         if tui_enabled(load_tui_config(data)):
-            # 单事件循环：Textual App 与 session 任务共存。Textual 运行期会
-            # 捕获 stdout（print 会丢失），因此 protobot.log 的 sink 直连
-            # 代理队列进入日志区；配置齐全时界面一起来就自动 .run，UI 退出
-            # （Ctrl+C）→ request_stop + 等待会话优雅结束。
+            # One event loop: the Textual app and the session tasks share it.
+            # Textual swallows stdout while it runs (print would vanish), so
+            # protobot.log's sink feeds the proxy queue and lands in the log
+            # pane. With credentials ready the UI runs .run as it comes up, and
+            # leaving it (Ctrl+C) means request_stop plus a graceful shutdown.
             proxy = StdoutProxy()
             ready = credentials_ready(cache_file, session_config)
             autostart = load_tui_autostart(data) and ready
             if not ready:
                 print(
-                    "[提示] 未找到可用的正版凭据，bot 不会自动启动。"
-                    "请先运行 protobot login，或在界面里输入 .run 重试。"
+                    "[note] no usable online credentials, so the bot will not "
+                    "start on its own. Run protobot login, or type .run here."
                 )
             app = ProtoBotApp(session, manager, proxy, autostart=autostart)
             await manager.enable_all()
@@ -480,14 +495,15 @@ async def run_bot_session(args: argparse.Namespace) -> int:
                 session.request_stop()
                 if app.session_task is not None:
                     await app.session_task
-                set_sink(None)  # 恢复 print 路由
+                set_sink(None)  # Back to plain print
                 await _stop_watcher(watcher, watcher_task)
                 watcher_task = None
                 await manager.disable_all()
         else:
             container = BotContainer(plugin_manager=manager)
             container.add_session("default", session)
-            # 容器自己负责 enable_all/disable_all，监视器只需覆盖运行期间
+            # The container does enable_all/disable_all itself; the watcher only
+            # has to cover the time in between
             watcher_task = _start_watcher(watcher)
             await container.run()
     finally:
@@ -496,23 +512,25 @@ async def run_bot_session(args: argparse.Namespace) -> int:
 
 
 def _start_watcher(watcher: PluginWatcher | None) -> asyncio.Task | None:
-    """插件热更新监视：必须在 enable_all 之后才启动。
+    """Start watching plugin files -- only ever after enable_all.
 
-    否则监视器可能在 enable_all 之前就热加载某个插件，enable_all 再对同一
-    实例调一次 on_enable——插件里 on_enable 创建的任务会多出一份，而
-    on_disable 只取消它自己记住的那一个。
+    Otherwise the watcher can hot-load a plugin before enable_all runs, and
+    enable_all then calls on_enable on that same instance a second time: every
+    task on_enable started exists twice, while on_disable cancels only the one
+    it remembers.
     """
     if watcher is None:
         return None
     task = asyncio.create_task(watcher.run(), name="protobot-plugin-watcher")
-    print("[插件] 热更新监视已启动（编辑插件目录下的文件即生效）。")
+    print("[plugin] watching for changes (editing a file in the plugin directory applies it).")
     return task
 
 
 async def _stop_watcher(
     watcher: PluginWatcher | None, task: asyncio.Task | None
 ) -> None:
-    """停掉监视器；必须早于 disable_all，否则关闭期间的改动会又启用插件。"""
+    """Stop the watcher -- before disable_all, or an edit during shutdown
+    would enable a plugin again."""
     if watcher is None or task is None:
         return
     watcher.request_stop()
@@ -526,7 +544,7 @@ def list_plugins(args: argparse.Namespace) -> int:
         try:
             data = load_config(config_path)
         except ValueError as error:
-            print(f"[错误] {error}")
+            print(f"[error] {error}")
             return 2
     plugin_config = load_plugin_config(data, config_path.parent)
 
@@ -540,66 +558,72 @@ def list_plugins(args: argparse.Namespace) -> int:
         return 1
 
     if not manager.plugins:
-        print("[插件] 未发现插件。")
+        print("[plugin] no plugins found.")
         return 0
 
     config_disabled = set(plugin_config.disabled)
-    print("[插件] 已发现插件:")
+    print("[plugin] plugins found:")
     for name in sorted(manager.plugins):
         plugin = manager.plugins[name]
         source = manager.source_of(name)
         if name in config_disabled:
-            status = "禁用（配置）"
+            status = "disabled (config)"
         elif name in manager.disabled_names():
-            status = "禁用（依赖被禁用）"
+            status = "disabled (dependency)"
         else:
-            status = "启用"
-        deps = ", ".join(plugin.dependencies) or "无"
-        print(f"  {name:<24s} 依赖: {deps:<28s} {status}  ({source})")
+            status = "enabled"
+        deps = ", ".join(plugin.dependencies) or "-"
+        print(f"  {name:<24s} needs: {deps:<28s} {status}  ({source})")
     order = [plugin.name for plugin in manager.load_order()]
-    print(f"[插件] 加载顺序: {' -> '.join(order) if order else '(无)'}")
+    print(f"[plugin] load order: {' -> '.join(order) if order else '(none)'}")
     return 0
 
 
-# ======================== 入口 ========================
+# ======================== Entry point ========================
 
 
 def _root_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="protobot", description="ProtoBot 机器人命令行工具"
+        prog="protobot", description="ProtoBot command-line tool"
     )
     sub = parser.add_subparsers(
         dest="command", required=True, metavar="{login,run,plugins,setup}"
     )
 
-    login_parser = sub.add_parser("login", help="微软正版账号授权并保存凭据")
+    login_parser = sub.add_parser(
+        "login", help="authorize a Microsoft account and cache the credentials"
+    )
     login_parser.add_argument(
         "--config", type=Path, default=DEFAULT_CONFIG,
-        help="配置文件路径（用于推导凭据缓存位置，默认 config.yaml）",
+        help="config file path (also fixes where the credential cache lives; default config.yaml)",
     )
     login_parser.add_argument(
-        "--auth-code", action="store_true", help="改用授权码流程（需复制粘贴地址）"
+        "--auth-code",
+        action="store_true",
+        help="use the authorization-code flow (paste the redirect address)",
     )
     login_parser.add_argument(
-        "--azure-client-id", default="", help="使用自己的 Azure 应用 ID 走设备码"
+        "--azure-client-id",
+        default="",
+        help="device-code flow with your own Azure application id",
     )
 
-    run_parser = sub.add_parser("run", help="连接服务器并运行插件")
+    run_parser = sub.add_parser("run", help="connect to the server and run plugins")
     run_parser.add_argument(
         "--config", type=Path, default=DEFAULT_CONFIG,
-        help="配置文件路径（默认 config.yaml）",
+        help="config file path (default config.yaml)",
     )
 
-    plugins_parser = sub.add_parser("plugins", help="列出已发现的插件")
+    plugins_parser = sub.add_parser("plugins", help="list the discovered plugins")
     plugins_parser.add_argument(
         "--config", type=Path, default=DEFAULT_CONFIG,
-        help="配置文件路径（默认 config.yaml）",
+        help="config file path (default config.yaml)",
     )
 
-    setup_parser = sub.add_parser("setup", help="重新进入交互式配置向导")
+    setup_parser = sub.add_parser("setup", help="run the interactive setup again")
     setup_parser.add_argument(
         "--config", type=Path, default=DEFAULT_CONFIG,
-        help="配置文件路径（默认 config.yaml）",
+        help="config file path (default config.yaml)",
     )
     return parser
 
@@ -608,7 +632,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "setup":
         return run_setup(args.config)
     if not args.config.exists():
-        print("[提示] 未找到配置文件，进入首次配置向导...\n")
+        print("[note] no config file found, starting first-run setup ...\n")
         code = run_setup(args.config)
         if code != 0:
             return code
@@ -620,16 +644,17 @@ async def _dispatch(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Console-script 入口：``protobot login|run|plugins|setup``。
+    """Console-script entry point: ``protobot login|run|plugins|setup``.
 
-    argv 缺省为 ``sys.argv[1:]``；run_bot.py 薄壳直接调用 ``main(["run", ...])``。
+    argv defaults to ``sys.argv[1:]``; the run_bot.py shim calls
+    ``main(["run", ...])`` directly.
     """
     parser = _root_parser()
     args = parser.parse_args(argv)
     try:
         return asyncio.run(_dispatch(args))
     except KeyboardInterrupt:
-        print("\n[退出] 已中断。")
+        print("\n[exit] interrupted.")
         return 130
 
 

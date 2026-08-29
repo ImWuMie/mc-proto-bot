@@ -117,7 +117,7 @@ mod-loader events; ordinary plugins do not need them.
 ## Hard rules (each one prevents a real bug)
 
 1. **Handler exceptions are already isolated**: `subscribe`/`subscribe_session`
-   wrap every handler; an exception only prints `[插件] <name> 处理事件时出错`
+   wrap every handler; an exception only prints `[plugin] <name> raised while handling an event`
    plus a traceback and **cannot** drop the connection. Do not swallow
    exceptions or add your own try/except inside handlers — it hides problems.
 2. **Re-read `self.bot` on every call**: a reconnect spawns a fresh Bot object
@@ -146,11 +146,11 @@ mod-loader events; ordinary plugins do not need them.
 6. **Zero third-party dependencies**: plugins may import only the stdlib and
    `protobot`; plugin files cannot import each other (the plugin directory is
    not on sys.path). Keep files UTF-8 with Chinese comments and Chinese console
-   output in the existing `[标签]` style. **Log via `protobot.log`, not
+   output in the existing `[tag]` style. **Log via `protobot.log`, not
    `print()`**: while the TUI runs, Textual captures stdout and plain prints
-   are lost — `from protobot import log; log.info("[聊天]", text)` routes to
+   are lost — `from protobot import log; log.info("[chat]", text)` routes to
    the TUI log area (and falls back to print outside the TUI). `warn` /
-   `error` / `debug` add `[警告]` / `[错误]` / `[调试]` prefixes; call
+   `error` / `debug` add `[warn]` / `[error]` / `[debug]` prefixes; call
    signatures match `print` (positional args, `sep`, `end`).
 7. **Chat-sending limits**: `send_message()` is capped at 256 characters and is
    unsigned (dropped by enforce-secure-profile servers); `send_command()` is
@@ -290,5 +290,5 @@ class Thing(Plugin):
 - [ ] Handlers guard against `self.bot` being None, or only touch it after `on_bot_ready`
 - [ ] No third-party imports, no cross-plugin imports
 - [ ] Any long-lived task is cancelled in `on_disable`
-- [ ] `uv run pytest tests/test_plugin.py` passes; new behavior has a regression
-  test (see the temp-dir + FakeBot pattern in tests/test_plugin.py)
+- [ ] `python -m compileall plugins` is clean (the project ships no test suite;
+  verify by running the bot)

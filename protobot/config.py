@@ -51,22 +51,22 @@ def _parse(text: str, filename: str) -> dict:
             continue
         leading = raw[: len(raw) - len(raw.lstrip(" \t"))]
         if "\t" in leading:
-            raise ValueError(f"{filename} 第 {lineno} 行: 不允许使用制表符缩进")
+            raise ValueError(f"{filename} line {lineno}: tab indentation is not allowed")
         indent = len(leading)
         match = _LINE_PATTERN.match(stripped)
         if match is None:
-            raise ValueError(f"{filename} 第 {lineno} 行: 无法解析 `{stripped}`")
+            raise ValueError(f"{filename} line {lineno}: cannot parse `{stripped}`")
         key = match.group(1)
         rest = _strip_comment(match.group(2)).strip()
         while stack and stack[-1][0] >= indent:
             stack.pop()
         if not stack:
-            raise ValueError(f"{filename} 第 {lineno} 行: 缩进错误")
+            raise ValueError(f"{filename} line {lineno}: bad indentation")
         container_indent, container, key_indent = stack[-1]
         if key_indent is not None and indent != key_indent:
-            raise ValueError(f"{filename} 第 {lineno} 行: 缩进错误（键 `{key}`）")
+            raise ValueError(f"{filename} line {lineno}: bad indentation for key `{key}`")
         if key in container:
-            raise ValueError(f"{filename} 第 {lineno} 行: 重复的键 `{key}`")
+            raise ValueError(f"{filename} line {lineno}: duplicate key `{key}`")
         if rest == "":
             nested: dict = {}
             container[key] = nested
@@ -87,7 +87,7 @@ def _parse_scalar(value: str, filename: str, lineno: int):
     if value.startswith('"') or value.startswith("'"):
         quote = value[0]
         if not value.endswith(quote) or len(value) < 2:
-            raise ValueError(f"{filename} 第 {lineno} 行: 引号未闭合 `{value}`")
+            raise ValueError(f"{filename} line {lineno}: unterminated quote `{value}`")
         body = value[1:-1]
         if quote == '"':
             body = (
@@ -140,7 +140,7 @@ def _split_list(body: str) -> list[str]:
         else:
             current.append(char)
     if quote is not None:
-        raise ValueError("列表元素中的引号未闭合")
+        raise ValueError("unterminated quote in a list item")
     if current or items:
         items.append("".join(current).strip())
     return [item for item in items if item]

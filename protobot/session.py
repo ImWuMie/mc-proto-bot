@@ -44,21 +44,21 @@ class SessionConfig:
 
     def __post_init__(self) -> None:
         if not 1 <= self.port <= 65535:
-            raise ValueError(f"端口必须在 1-65535 之间，得到 {self.port}")
+            raise ValueError(f"port must be between 1 and 65535, got {self.port}")
         if self.reconnect_delay <= 0:
             raise ValueError(
-                f"重连间隔必须大于 0 秒，得到 {self.reconnect_delay}"
+                f"reconnect delay must be greater than 0 seconds, got {self.reconnect_delay}"
             )
         if self.connect_timeout <= 0:
             raise ValueError(
-                f"连接超时必须大于 0 秒，得到 {self.connect_timeout}"
+                f"connect timeout must be greater than 0 seconds, got {self.connect_timeout}"
             )
         if (
             self.reconnect_max_attempts is not None
             and self.reconnect_max_attempts < 0
         ):
             raise ValueError(
-                "重连次数上限不能为负数，得到 "
+                "the reconnect attempt limit cannot be negative, got "
                 f"{self.reconnect_max_attempts}"
             )
 
@@ -161,15 +161,15 @@ class BotSession:
         while not self._stop.is_set():
             await self.events.emit("session_connecting", attempt)
             info(
-                f"[连接] 正在连接服务器 {self.config.host}:{self.config.port} "
-                f"(版本: {self.config.version}) ..."
+                f"[connect] connecting to {self.config.host}:{self.config.port} "
+                f"(version {self.config.version}) ..."
             )
             try:
                 # Re-resolved EVERY attempt: a cached token can expire while
                 # disconnected between retries.
                 username, access_token, profile_uuid = await self._credentials()
-                mode = "正版验证 (Online Mode)" if access_token else "离线模式 (Offline Mode)"
-                info(f"[模式] {mode}")
+                mode = "online mode (authenticated)" if access_token else "offline mode"
+                info(f"[mode] {mode}")
                 bot = await self._connector(
                     self.config, username, access_token, profile_uuid
                 )
@@ -178,7 +178,7 @@ class BotSession:
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # Exception only, never BaseException
-                log_error(f"第 {attempt} 次连接失败: {error}")
+                log_error(f"connection attempt {attempt} failed: {error}")
                 if not await self._maybe_reconnect(attempt):
                     break
                 attempt += 1
@@ -189,18 +189,18 @@ class BotSession:
                 await self._plugins.bind_all(bot)
             await self.events.emit("session_ready", bot)
             info(
-                f"[成功] 机器人已进入游戏！\n"
-                f"       玩家名: {bot.username}\n"
-                f"       出生位置: X={bot.player.x:.2f}, "
+                f"[ready] the bot is in the game\n"
+                f"        name: {bot.username}\n"
+                f"        spawn: X={bot.player.x:.2f}, "
                 f"Y={bot.player.y:.2f}, Z={bot.player.z:.2f}"
             )
 
-            info("[等待] 正在加载世界区块...")
+            info("[wait] loading world chunks ...")
             try:
                 await bot.wait_world(timeout=self._wait_world_timeout)
-                info(f"[世界] 已加载 {len(bot.world.chunks)} 个区块！")
+                info(f"[world] {len(bot.world.chunks)} chunk(s) loaded")
             except Exception:
-                info("[世界] 等待区块超时，继续保持在线...")
+                info("[world] timed out waiting for chunks, staying online ...")
 
             try:
                 await self._tick_loop(bot)
@@ -224,10 +224,10 @@ class BotSession:
             return False
         max_attempts = self.config.reconnect_max_attempts
         if max_attempts is not None and attempt >= max_attempts:
-            info(f"[提示] 已达重连次数上限 ({max_attempts})，停止重试。")
+            info(f"[note] reconnect attempt limit reached ({max_attempts}), giving up.")
             return False
         delay = self.config.reconnect_delay
-        info(f"[重连] {delay:.0f} 秒后重试...")
+        info(f"[reconnect] retrying in {delay:.0f}s ...")
         await self._sleep_or_stop(delay)
         return True
 
@@ -239,7 +239,7 @@ class BotSession:
             pass  # delay elapsed; retry
 
     async def _tick_loop(self, bot: Bot) -> None:
-        info("\n[运行中] 机器人正在运行 (按 Ctrl + C 可退出)...")
+        info("\n[running] the bot is running (Ctrl+C to quit) ...")
         tick_count = 0
         while not bot.closed.is_set() and not self._stop.is_set():
             await bot.tick(MovementInput())
@@ -248,11 +248,11 @@ class BotSession:
             # if tick_count % self._heartbeat_ticks == 0:
             #     pos = bot.player
             #     info(
-            #         f"[心跳] 当前坐标: X={pos.x:.1f}, Y={pos.y:.1f}, "
-            #         f"Z={pos.z:.1f} | 在线中"
+            #         f"[heartbeat] position X={pos.x:.1f}, Y={pos.y:.1f}, "
+            #         f"Z={pos.z:.1f} | online"
             #     )
         if self._stop.is_set():
-            info("[退出] 正在正常退出并关闭连接...")
+            info("[exit] shutting down and closing the connection ...")
 
 
 class BotContainer:
@@ -270,7 +270,7 @@ class BotContainer:
 
     def add_session(self, name: str, session: BotSession) -> BotSession:
         if name in self.sessions:
-            raise ValueError(f"会话重名: {name}")
+            raise ValueError(f"duplicate session name: {name}")
         self.sessions[name] = session
         return session
 

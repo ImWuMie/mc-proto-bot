@@ -1,11 +1,12 @@
-"""PyCharm 右键运行入口：等价于 ``protobot run``。"""
+"""Right-click-run entry point for PyCharm; same as ``protobot run``."""
 
 from pathlib import Path
 
 from protobot.cli_app import main
 
 if __name__ == "__main__":
-    # 显式指定配置文件，保证在 PyCharm 里任意工作目录下都能找到 config.yaml
+    # Name the config file explicitly so PyCharm finds config.yaml whatever
+    # working directory it starts in
     raise SystemExit(
         main(["run", "--config", str(Path(__file__).with_name("config.yaml"))])
     )

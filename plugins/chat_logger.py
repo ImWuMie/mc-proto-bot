@@ -1,6 +1,6 @@
-"""控制台聊天记录插件：打印系统消息与玩家消息。
+"""Console chat log plugin: prints system messages and player messages.
 
-事件签名（协议 774-776）：
+Event signatures (protocol 774-776):
   system_chat(component, overlay)
   player_chat(sender_uuid, name, message, chat_type_id, target_name)
 """

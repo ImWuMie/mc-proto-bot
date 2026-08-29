@@ -1,29 +1,36 @@
-"""自动重生插件：死了就自己站起来，不用人盯着。
+"""Auto-respawn plugin: get back on our feet without anyone watching.
 
-死亡信号来自核心的 ``death`` 事件，它由两路合并而成（``protobot.client``
-已按「一次死亡只发一次」去重）：
+The death signal is the core's ``death`` event, which merges two sources
+(``protobot.client`` already dedupes them to one event per death):
 
-  1. **Combat Death**（协议 775/776 的 0x44 = 68）——这个包的用途就是
-     「让客户端弹出死亡界面」，是服务端在玩家死亡时必然发出的通知，也是
-     本插件依赖的主信号。它带着死亡消息组件，会一并记下来。
-  2. **血量归零**（``set_health`` 0x68 = 104 里 health ≤ 0）——次要信号。
-     服务端在 tick 边界补发，顺序不受协议保证，而且服务器插件可以缩放血量，
-     所以它只当兜底，不作为唯一依据。
+  1. **Combat Death** (0x44 = 68 on protocol 775/776) -- this packet exists to
+     make the client show the death screen, so the server always sends it when
+     the player dies. It is the signal this plugin relies on, and it carries
+     the death-message component, which is recorded along the way.
+  2. **Health reaching zero** (``set_health`` 0x68 = 104 with health <= 0) --
+     the weaker signal. The server resends it on tick boundaries, ordering is
+     not guaranteed by the protocol, and server plugins can scale health, so
+     it is only a fallback rather than something to act on alone.
 
-重生动作是 **Client Status**（服务端方向 0x0C = 12，载荷只有一个 VarInt，
-0 = perform respawn）。服务端从不自己让玩家重生：即便开了 ``doImmediateRespawn``
-也只是原版客户端不显示死亡界面、直接把这个包发出去而已。所以不发它，bot 就会
-一直躺在死亡界面里，位置不动、物理不跑。
+Respawning is **Client Status** (serverbound 0x0C = 12, payload is a single
+VarInt, 0 = perform respawn). The server never respawns a player by itself:
+even with ``doImmediateRespawn`` all that changes is that the vanilla client
+skips the death screen and sends this packet immediately. Without it the bot
+lies on the death screen forever -- no movement, no physics.
 
-发出请求后服务端回 ``respawn`` 包，紧接一次带 teleport id 的位置同步；确认传送
-与补发 Player Loaded 都由核心处理（``_handle_respawn`` 会清掉 ``player.loaded``，
-下一个位置包便会重新确认并补发），这里只等 ``respawn`` 事件当作确认。
+After the request the server sends the respawn packet plus a position sync
+carrying a teleport id. Confirming that teleport and re-sending Player Loaded
+is the core's job (``_handle_respawn`` clears ``player.loaded``, so the next
+position packet confirms and re-sends), and this plugin only waits for the
+``respawn`` event as its acknowledgement.
 
-包 ID 未经核实的版本（如 1.21.11 / 协议 774）上 ``bot.respawn()`` 会抛
-``UnsupportedVersion``——插件提示一次就退出，绝不拿推断值乱发包。
+On releases where the packet ids are unverified (1.21.11 / protocol 774)
+``bot.respawn()`` raises ``UnsupportedVersion`` -- the plugin says so once and
+stops, rather than sending packets built on a guess.
 
-设置文件 ``respawn.json``（与本插件同目录，首次启用自动生成）改动后约 5 秒生效。
-默认只做重生本身；``return_to_death_point`` 打开后还会寻路走回死亡坐标。
+Settings live in ``respawn.json`` next to this file (written on first enable);
+edits apply within about 5 seconds. By default it only respawns; with
+``return_to_death_point`` on it also walks back to where it died.
 """
 
 from __future__ import annotations
@@ -36,19 +43,20 @@ from protobot import Plugin, PluginSettings, log, plain_text
 from protobot.errors import UnsupportedVersion
 
 DEFAULT_SETTINGS: dict = {
-    "enabled": True,  # 改成 false 可只保留 respawn.status / respawn.now
-    "delay": 1.0,  # 死亡到发出重生请求的间隔（秒）
-    "retry_delay": 2.0,  # 多久没等到重生确认就重试（秒）
-    "max_retries": 2,  # 最多重试几次（0 = 只发一次）
-    "announce": "",  # 非空则重生后发这句聊天；留空不发
-    "return_to_death_point": False,  # 重生后寻路走回死亡坐标
-    "return_max_distance": 200.0,  # 超过这个直线距离就不走回去（格）
+    "enabled": True,  # false keeps only respawn.status / respawn.now
+    "delay": 1.0,  # Seconds between the death and the respawn request
+    "retry_delay": 2.0,  # Retry after this long without an acknowledgement
+    "max_retries": 2,  # How many retries (0 = ask once)
+    "announce": "",  # Non-empty: say this in chat after respawning
+    "return_to_death_point": False,  # Walk back to where we died
+    "return_max_distance": 200.0,  # Do not walk back further than this (blocks)
 }
 
-#: 设置文件的轮询间隔（秒）。重生本身走事件，不靠轮询。
+#: Settings poll interval (seconds). Respawning itself is event-driven.
 RELOAD_INTERVAL = 5.0
 
-#: 走回死亡点前等世界解码的上限（秒）。等不到就放弃，不能挂死在这里。
+#: How long to wait for the world before walking back (seconds); give up
+#: afterwards rather than hanging here.
 WORLD_TIMEOUT = 30.0
 
 
@@ -69,7 +77,7 @@ class AutoRespawn(Plugin):
         self._warned_unsupported = False
         self.subscribe("death", self._on_death)
         self.subscribe("respawn", self._on_respawn)
-        # 暴露给其他插件与 LLM：respawn.status / respawn.now / respawn.set
+        # Exposed to other plugins and the LLM: status / now / set
         self.expose(
             "status",
             self._service_status,
@@ -126,21 +134,21 @@ class AutoRespawn(Plugin):
             admin=True,
         )
 
-    # ---- 生命周期 ----
+    # ---- Lifecycle ----
 
     async def on_enable(self) -> None:
         if self._config is None:
             self._config = self.settings_file(
                 "respawn.json", DEFAULT_SETTINGS,
-                label="自动重生", normalize=self._normalize,
+                label="respawn", normalize=self._normalize,
             )
         self._config.load()
         self._settings = self._config.data
         self._reload_task = asyncio.create_task(
             self._reload_loop(), name="protobot-respawn-settings"
         )
-        state = "已启用" if self._settings["enabled"] else "已加载但未启用"
-        log.info(f"[重生] {state}（设置：{self._config.path}）。")
+        state = "enabled" if self._settings["enabled"] else "loaded but off"
+        log.info(f"[respawn] {state} (settings: {self._config.path}).")
 
     async def on_disable(self) -> None:
         for task in (self._reload_task, self._respawn_task):
@@ -153,20 +161,20 @@ class AutoRespawn(Plugin):
                 pass
         self._reload_task = None
         self._respawn_task = None
-        log.info(f"[重生] 已关闭（本进程共处理 {self._deaths} 次死亡）。")
+        log.info(f"[respawn] stopped ({self._deaths} death(s) handled this run).")
 
     async def on_bot_ready(self) -> None:
-        """新连接：作废上一条连接遗留的重生流程。"""
+        """A new connection: drop any respawn flow left over from the old one."""
 
         task = self._respawn_task
         if task is not None and not task.done():
             task.cancel()
         self._respawn_task = None
         self._respawned.clear()
-        # 热重载或重连时可能正躺在死亡界面上，这种情况直接补一次重生。
+        # A hot reload or reconnect can land on the death screen; respawn now.
         bot = self.bot
         if bot is not None and bot.player.dead and self._settings["enabled"]:
-            log.info("[重生] 连接就绪时仍处于死亡状态，补发重生请求。")
+            log.info("[respawn] still dead when the connection came up, asking again.")
             self._start_respawn()
 
     async def _reload_loop(self) -> None:
@@ -179,14 +187,14 @@ class AutoRespawn(Plugin):
                     now_on = self._settings.get("enabled")
                     if was_on != now_on:
                         log.info(
-                            f"[重生] 设置已更新：{'开启' if now_on else '关闭'}自动重生。"
+                            f"[respawn] settings updated: auto-respawn {'on' if now_on else 'off'}."
                         )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                log.error(f"[重生] 读取设置出错: {error!r}")
+                log.error(f"[respawn] failed to read the settings: {error!r}")
 
-    # ---- 事件 ----
+    # ---- Events ----
 
     async def _on_death(self, message) -> None:
         self._deaths += 1
@@ -198,23 +206,23 @@ class AutoRespawn(Plugin):
         where = ""
         if self._last_death is not None:
             x, y, z = self._last_death
-            where = f"，死于 {x:.1f} {y:.1f} {z:.1f}"
-        reason = f"：{self._last_message}" if self._last_message else ""
-        log.info(f"[重生] 检测到死亡{where}{reason}")
+            where = f" at {x:.1f} {y:.1f} {z:.1f}"
+        reason = f": {self._last_message}" if self._last_message else ""
+        log.info(f"[respawn] death detected{where}{reason}")
         if not self._settings["enabled"]:
-            log.info("[重生] 自动重生已关闭，留在死亡界面。")
+            log.info("[respawn] auto-respawn is off, staying on the death screen.")
             return
         self._start_respawn()
 
     async def _on_respawn(self, session) -> None:
         self._respawned.set()
 
-    # ---- 重生流程 ----
+    # ---- The respawn flow ----
 
     def _start_respawn(self, *, delay: float | None = None) -> None:
         task = self._respawn_task
         if task is not None and not task.done():
-            return  # 同一次死亡不重复排程
+            return  # One death, one flow
         self._respawned.clear()
         if delay is None:
             delay = float(self._settings["delay"])
@@ -230,10 +238,10 @@ class AutoRespawn(Plugin):
         for attempt in range(1, attempts + 1):
             bot = self.bot
             if bot is None:
-                log.warn("[重生] 尚未连接，本次重生请求作废。")
+                log.warn("[respawn] not connected, dropping this respawn request.")
                 return
             if not bot.player.dead:
-                # 手动重生过了，或者服务器已经把我们拉起来了。
+                # Someone respawned manually, or the server did it for us.
                 await self._after_respawn()
                 return
             try:
@@ -241,30 +249,30 @@ class AutoRespawn(Plugin):
             except UnsupportedVersion as error:
                 if not self._warned_unsupported:
                     self._warned_unsupported = True
-                    log.warn(f"[重生] {error}；这个版本上自动重生不可用。")
+                    log.warn(f"[respawn] {error}; auto-respawn is unavailable on this release.")
                 return
             except Exception as error:
-                log.error(f"[重生] 发送重生请求失败: {error!r}")
-                return  # 连接本身有问题，重试也没有意义
+                log.error(f"[respawn] failed to send the respawn request: {error!r}")
+                return  # The connection itself is broken; retrying is pointless
             try:
                 await asyncio.wait_for(self._respawned.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 if attempt < attempts:
-                    log.warn(f"[重生] 第 {attempt} 次请求没等到重生确认，重试。")
+                    log.warn(f"[respawn] request {attempt} was not acknowledged, retrying.")
                 continue
             await self._after_respawn()
             return
-        log.warn(f"[重生] {attempts} 次请求都没等到重生确认，放弃。")
+        log.warn(f"[respawn] {attempts} request(s) went unacknowledged, giving up.")
 
     async def _after_respawn(self) -> None:
-        log.info(f"[重生] 已重生（本进程第 {self._deaths} 次）。")
+        log.info(f"[respawn] respawned (death {self._deaths} this run).")
         bot = self.bot
         announce = str(self._settings["announce"]).strip()
         if announce and bot is not None:
             try:
                 await bot.send_message(announce)
             except Exception as error:
-                log.warn(f"[重生] 重生播报发送失败: {error!r}")
+                log.warn(f"[respawn] failed to announce the respawn: {error!r}")
         if not self._settings["return_to_death_point"]:
             return
         if bot is None or self._last_death is None:
@@ -274,21 +282,21 @@ class AutoRespawn(Plugin):
         limit = float(self._settings["return_max_distance"])
         if distance > limit:
             log.info(
-                f"[重生] 死亡点在 {distance:.0f} 格外（上限 {limit:.0f} 格），不走回去。"
+                f"[respawn] the death point is {distance:.0f} blocks away (limit {limit:.0f}), staying put."
             )
             return
-        log.info(f"[重生] 正在走回死亡点 {x:.1f} {z:.1f}（{distance:.0f} 格）。")
+        log.info(f"[respawn] walking back to {x:.1f} {z:.1f} ({distance:.0f} blocks).")
         try:
             await bot.wait_world(timeout=WORLD_TIMEOUT)
             await bot.navigate_to(x, z, sprint=True)
         except TimeoutError:
-            log.warn("[重生] 等世界解码超时，放弃走回死亡点。")
+            log.warn("[respawn] timed out waiting for the world, not walking back.")
         except Exception as error:
-            log.warn(f"[重生] 走回死亡点失败: {error!r}")
+            log.warn(f"[respawn] failed to walk back: {error!r}")
         else:
-            log.info("[重生] 已回到死亡点附近。")
+            log.info("[respawn] back near the death point.")
 
-    # ---- 暴露给其他插件 / LLM 的能力 ----
+    # ---- Capabilities exposed to other plugins and the LLM ----
 
     async def _service_status(self) -> str:
         parts = [
@@ -323,7 +331,7 @@ class AutoRespawn(Plugin):
             return "Not dead, so there is nothing to respawn from"
         task = self._respawn_task
         if task is not None and not task.done():
-            task.cancel()  # 取消还在等 delay 的那次，立刻重发
+            task.cancel()  # Cancel the one still waiting out the delay and ask now
             self._respawn_task = None
         self._start_respawn(delay=0.0)
         return "Respawn requested"
@@ -342,12 +350,12 @@ class AutoRespawn(Plugin):
         error = self._config.patch(patch)
         self._settings = self._config.data
         if error:
-            self._settings.update(patch)  # 至少让本进程内生效
+            self._settings.update(patch)  # At least apply it in this process
             return f"Applied in memory but could not be saved: {error}"
         described = ", ".join(f"{key}={patch[key]!r}" for key in sorted(patch))
         return f"Auto-respawn updated: {described}"
 
-    # ---- 设置校验 ----
+    # ---- Settings validation ----
 
     @staticmethod
     def _normalize(merged: dict) -> dict:

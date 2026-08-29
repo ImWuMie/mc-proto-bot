@@ -1,43 +1,50 @@
-"""定时任务插件：按间隔、每天固定时间、游戏事件或状态条件触发。
+"""Scheduled tasks: on an interval, at a daily time, on a game event, or
+when a state condition becomes true.
 
-任务存于本插件同目录的 ``scheduler.json``（首次启用自动生成，示例任务
-默认禁用）：
+Tasks live in ``scheduler.json`` next to this file (written on first enable,
+with one disabled sample):
 
 .. code-block:: json
 
     {
       "tasks": [
-        {"name": "整点报时", "time": "18:00", "action": "chat",
-         "text": "晚上好！", "enabled": true},
-        {"name": "清理提醒", "interval": 1800.0, "action": "command",
-         "text": "say 该清理掉落物啦", "enabled": true},
-        {"name": "迎新", "event": "player_join", "action": "chat",
-         "text": "欢迎 {player}！", "enabled": true},
-        {"name": "叫我", "event": "player_chat", "match": "开门",
-         "action": "command", "text": "say 来了来了", "enabled": true},
-        {"name": "血量告警", "condition": "health < 8", "action": "remind",
-         "text": "血量只剩 {health} 了，想想办法", "enabled": true}
+        {"name": "evening", "time": "18:00", "action": "chat",
+         "text": "good evening!", "enabled": true},
+        {"name": "cleanup", "interval": 1800.0, "action": "command",
+         "text": "say time to clear the drops", "enabled": true},
+        {"name": "greet", "event": "player_join", "action": "chat",
+         "text": "welcome, {player}!", "enabled": true},
+        {"name": "open up", "event": "player_chat", "match": "open the door",
+         "action": "command", "text": "say coming", "enabled": true},
+        {"name": "low health", "condition": "health < 8", "action": "remind",
+         "text": "only {health} health left, do something", "enabled": true}
       ]
     }
 
-触发方式四选一（可组合）：``interval``（秒，≥5，循环执行）、``time``
-（"HH:MM" 本地时间，每天一次）、``event``（游戏事件，见 ``TRIGGER_EVENTS``）
-与 ``condition``（状态条件，见 ``CONDITION_VARS``）。**condition 单独出现时
-是触发器**（条件由假变真的那一刻执行一次），**与其他触发方式同时出现时是
-开关**（到点/事件发生时条件不成立就跳过）。``cooldown`` 是同一任务两次执行
-的最小间隔（秒），``match`` 只在事件内容包含该子串时才触发——聊天类事件
-（``player_chat`` / ``system_chat``）必须给 ``match``，否则每句话都会触发。
+Four ways to trigger, combinable: ``interval`` (seconds, >= 5, repeating),
+``time`` ("HH:MM" local, once a day), ``event`` (a game event, see
+``TRIGGER_EVENTS``), and ``condition`` (a state expression, see
+``CONDITION_VARS``). **A condition on its own is a trigger** -- it runs the
+task the moment the expression flips from false to true -- while **next to
+any other trigger it is a gate** instead: a false condition skips that run.
+``cooldown`` is the least time between two runs of one task, and ``match``
+only triggers when the event text contains that substring -- the chat events
+(``player_chat`` / ``system_chat``) require it, or every single line would
+run the task.
 
-``action`` 为 ``chat``（发聊天）、``command``（执行服务器命令）或 ``remind``
-（把内容交给 LLM 智能体，由它决定说什么、做什么）；``enabled`` 为 false 时
-暂停。``text`` 里的 ``{player}`` / ``{message}`` / ``{health}`` 等占位符会在
-执行前替换成触发上下文与当前状态（未知占位符原样保留）。
+``action`` is ``chat`` (say it), ``command`` (run it as a server command), or
+``remind`` (hand the text to the LLM agent and let it decide what to say or
+do); ``enabled: false`` pauses a task. Placeholders in ``text`` such as
+``{player}`` / ``{message}`` / ``{health}`` are filled in from the trigger
+context and the current state as the task runs (unknown ones are left alone).
 
-运行时每 5 秒检查一次 JSON 的修改时间，改动自动重新加载。任务也可以通过
-暴露出去的 ``scheduler.list`` / ``add`` / ``set`` / ``remove`` / ``run`` /
-``status`` 由其他插件或 LLM 直接维护——增删改经由本插件自己的校验，写回后
-立即生效，因此校验规则只有这一份（``_normalize``）。未连接服务器时任务顺延，
-不消耗本次调度。
+The JSON's modification time is checked every 5 seconds, so edits reload on
+their own. Tasks can also be maintained by other plugins or the LLM through
+the exposed ``scheduler.list`` / ``add`` / ``set`` / ``remove`` / ``run`` /
+``status``: those go through this plugin's own validation and take effect as
+soon as they are written, so the rules live in exactly one place
+(``_normalize``). While disconnected, due tasks are postponed rather than
+consuming their slot.
 """
 
 from __future__ import annotations
@@ -50,38 +57,42 @@ from pathlib import Path
 
 from protobot import Plugin, log, plain_text
 
-# 小时/分钟必须在合法范围内：只查位数会放过 "25:00" 这类越界时刻。
+# Hours and minutes have to be in range: digit-counting alone would accept
+# out-of-range times like "25:00".
 TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 
-#: interval 下限（秒），防止刷屏
+#: Lower bound for interval (seconds), so a task cannot spam
 MIN_INTERVAL = 5.0
 
-#: 支持的动作 -> 日志里的说法
+#: Supported actions -> how the log describes them
 ACTIONS: dict[str, str] = {
-    "chat": "发送聊天",
-    "command": "执行命令",
-    "remind": "提醒 LLM",
+    "chat": "sent a chat message",
+    "command": "ran a command",
+    "remind": "reminded the LLM agent",
 }
 
-#: 可作为 ``event`` 的核心事件 -> 日志里的说法。这些都是 bot 事件，插件在
-#: ``__init__`` 里一次性订阅，任务改动无需重新绑定。
+#: Core events usable as ``event`` -> what they mean. These are all bot
+#: events, subscribed once in ``__init__``, so editing tasks never has to
+#: rebind anything.
 TRIGGER_EVENTS: dict[str, str] = {
-    "player_chat": "有人说话",
-    "system_chat": "服务器广播",
-    "player_join": "玩家加入",
-    "player_leave": "玩家退出",
-    "death": "死亡",
-    "respawn": "重生",
+    "player_chat": "someone said something",
+    "system_chat": "the server broadcast something",
+    "player_join": "a player joined",
+    "player_leave": "a player left",
+    "death": "this bot died",
+    "respawn": "this bot respawned",
 }
 
-#: 聊天类事件：必须给 ``match``，否则每一句话都触发一次（发言即刷屏）。
+#: Chat events: ``match`` is required, or every line typed runs the task.
 CHAT_EVENTS = ("player_chat", "system_chat")
 
-#: 自己刚说过的话记这么久（秒），用来挡住「自己的输出又触发自己」的死循环。
-#: 服务器回显是立刻的，所以窗口取短一点：太长会让别人说同样的话也被忽略。
+#: How long (seconds) our own lines are remembered, to break the loop where a
+#: task's output triggers the task again. The server echo is immediate, so the
+#: window is short: a long one would also ignore someone else saying the same.
 ECHO_MEMORY = 10.0
 
-#: 条件里可用的变量 -> 说明（也会写进给 LLM 的参数描述）
+#: Variables usable in a condition -> their description (which also goes into
+#: the parameter schema the LLM sees)
 CONDITION_VARS: dict[str, str] = {
     "health": "health 0-20",
     "food": "food 0-20",
@@ -95,25 +106,27 @@ CONDITION_VARS: dict[str, str] = {
     "minute": "local minute 0-59",
 }
 
-#: 条件子句：``变量 运算符 值``，用 " and " 连接多个（不支持 or——拆成两个任务）
+#: A condition clause: ``variable operator value``, joined by " and " (no or --
+#: use two tasks for that)
 CLAUSE_PATTERN = re.compile(r"^([a-z_]+)\s*(<=|>=|==|!=|<|>)\s*(\S+)$")
 
-#: text 里的占位符：只替换已知键，其余原样保留（命令里的花括号不会被吃掉）
+#: Placeholders in text: only known keys are replaced, so braces in a command
+#: survive untouched
 PLACEHOLDER_PATTERN = re.compile(r"\{([a-z_]+)\}")
 
 DEFAULT_TASKS: dict = {
     "tasks": [
         {
-            "name": "示例广播",
+            "name": "sample broadcast",
             "interval": 3600.0,
             "action": "chat",
-            "text": "示例任务：每小时发送一次。编辑 scheduler.json 修改我。",
+            "text": "sample task: sent once an hour. Edit scheduler.json to change me.",
             "enabled": False,
         }
     ]
 }
 
-#: 暴露给 LLM 的参数表：add/set 用完整字段，remove/run 只要名字。
+#: Parameter schemas for the LLM: add/set take every field, remove/run a name.
 TASK_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -181,11 +194,12 @@ NAME_SCHEMA: dict = {
 def parse_condition(
     text: str,
 ) -> tuple[tuple[tuple[str, str, float], ...] | None, str]:
-    """把 ``"health < 8 and dead == false"`` 解析成子句，或返回错误原因。
+    """Parse ``"health < 8 and dead == false"`` into clauses, or say why not.
 
-    故意不用 ``eval``：任务文件与 LLM 都能写这里的字符串，所以只认「变量
-    运算符 数值/true/false」这一种形式，变量名还要在 :data:`CONDITION_VARS`
-    里。写错的条件在 add/set 的那一刻就被拒绝，而不是到了执行时才炸。
+    Deliberately not ``eval``: both the task file and the LLM write these
+    strings, so the only accepted shape is ``variable operator number/bool``
+    with a variable from :data:`CONDITION_VARS`. A broken condition is rejected
+    the moment it is added rather than blowing up when the task fires.
     """
 
     clauses: list[tuple[str, str, float]] = []
@@ -236,15 +250,16 @@ class Scheduler(Plugin):
         super().__init__()
         self._file: Path | None = None
         self._tasks: list[dict] = []
-        self._next_run: dict[str, float] = {}  # 任务名 -> 下次运行的单调秒
-        self._last_run: dict[str, float] = {}  # 任务名 -> 上次执行的单调秒（冷却）
-        self._condition_state: dict[str, bool] = {}  # 任务名 -> 上次条件求值
-        self._condition_text: dict[str, str] = {}  # 任务名 -> 上次加载时的条件
+        self._next_run: dict[str, float] = {}  # name -> next run (monotonic)
+        self._last_run: dict[str, float] = {}  # name -> last run (for cooldown)
+        self._condition_state: dict[str, bool] = {}  # name -> last evaluation
+        self._condition_text: dict[str, str] = {}  # name -> condition as loaded
         self._mtime: float | None = None
         self._loop_task: asyncio.Task | None = None
         self._tick_count = 0
-        # 事件触发：一次性订阅全部可用事件，任务表怎么改都不用重新绑定。
-        self._sent: list[tuple[float, str]] = []  # 自己说过的话（防自触发）
+        # Event triggers: subscribe to every usable event once, so editing the
+        # task list never has to rebind anything.
+        self._sent: list[tuple[float, str]] = []  # Our own lines (loop guard)
         self.subscribe("player_chat", self._on_player_chat)
         self.subscribe("system_chat", self._on_system_chat)
         self.subscribe("chat_sent", self._on_chat_sent)
@@ -252,7 +267,7 @@ class Scheduler(Plugin):
         self.subscribe("player_leave", self._on_player_leave)
         self.subscribe("death", self._on_death)
         self.subscribe("respawn", self._on_respawn)
-        # 暴露给其他插件与 LLM：scheduler.list / add / set / remove / run
+        # Exposed to other plugins and the LLM: list / add / set / remove / run
         self.expose(
             "list",
             self._service_list,
@@ -312,7 +327,7 @@ class Scheduler(Plugin):
             llm=True,
         )
 
-    # ---- 生命周期 ----
+    # ---- Lifecycle ----
 
     async def on_enable(self) -> None:
         if self._file is None:
@@ -321,7 +336,7 @@ class Scheduler(Plugin):
         self._loop_task = asyncio.create_task(
             self._loop(), name="protobot-scheduler"
         )
-        log.info(f"[定时] 已启用，共 {len(self._tasks)} 个任务。")
+        log.info(f"[scheduler] enabled with {len(self._tasks)} task(s).")
 
     async def on_disable(self) -> None:
         task = self._loop_task
@@ -332,9 +347,9 @@ class Scheduler(Plugin):
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
-        log.info("[定时] 已关闭。")
+        log.info("[scheduler] stopped.")
 
-    # ---- 加载与校验 ----
+    # ---- Loading and validation ----
 
     def _load_tasks(self) -> None:
         path = self._file
@@ -347,21 +362,21 @@ class Scheduler(Plugin):
                     json.dumps(DEFAULT_TASKS, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-                log.info(f"[定时] 已生成默认任务文件: {path}（示例任务默认禁用）")
+                log.info(f"[scheduler] wrote a default task file: {path} (the sample is disabled)")
             except OSError as error:
-                log.warn(f"[定时] 无法写入默认任务文件 ({error})")
+                log.warn(f"[scheduler] could not write the default task file ({error})")
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             raw = data.get("tasks") if isinstance(data, dict) else None
         except (OSError, ValueError) as error:
-            log.warn(f"[定时] 任务文件读取失败，使用空任务列表 ({error})")
+            log.warn(f"[scheduler] could not read the task file, running with none ({error})")
             raw = None
         valid: list[dict] = []
         for task in raw or []:
             parsed = self._validate(task)
             if parsed is not None:
                 valid.append(parsed)
-        # 保留已有任务的计时；新增任务从下次周期开始
+        # Keep the timing of tasks that still exist; new ones start next cycle
         self._next_run = {
             task["name"]: self._next_run[task["name"]]
             for task in valid
@@ -371,8 +386,9 @@ class Scheduler(Plugin):
         self._last_run = {
             name: at for name, at in self._last_run.items() if name in names
         }
-        # 条件的边沿状态也只对还存在的任务保留：改过条件的任务重新求值，
-        # 否则「上次为真」会把新条件的第一次上升沿吃掉。
+        # Edge state survives only for tasks that still exist, and only while
+        # their condition is unchanged: otherwise a stale "was true" would eat
+        # the first rising edge of the new condition.
         self._condition_state = {
             task["name"]: self._condition_state[task["name"]]
             for task in valid
@@ -387,20 +403,21 @@ class Scheduler(Plugin):
             self._mtime = path.stat().st_mtime
         except OSError:
             self._mtime = None
-        log.info(f"[定时] 已加载 {len(valid)} 个任务。")
+        log.info(f"[scheduler] loaded {len(valid)} task(s).")
 
     def _validate(self, task) -> dict | None:
-        """文件加载路径：非法任务打日志并跳过。"""
+        """The file-loading path: log an invalid task and skip it."""
         parsed, error = self._normalize(task)
         if parsed is None:
-            log.warn(f"[定时] 跳过非法任务：{error}")
+            log.warn(f"[scheduler] skipping an invalid task: {error}")
         return parsed
 
     def _normalize(self, task) -> tuple[dict | None, str]:
-        """校验并归一化一个任务，返回 ``(任务, 错误信息)``。
+        """Validate and normalize one task, returning ``(task, error)``.
 
-        文件加载与暴露出去的 add/set 走同一份规则——两处各写一遍曾经
-        造成同一个字段一边报错、一边静默钳制。
+        File loading and the exposed add/set share this one set of rules --
+        writing them twice once meant the same field was rejected on one path
+        and silently clamped on the other.
         """
         if not isinstance(task, dict):
             return None, "task must be an object"
@@ -449,8 +466,9 @@ class Scheduler(Plugin):
                 "chat events need match: the text to look for (without it every "
                 "single chat line would run the task)"
             )
-        # 自己的输出又命中自己的 match，就会一直触发下去。这种任务在建立的
-        # 那一刻就能看出来，不必等到刷屏被服务器禁言才发现。
+        # A task whose own output matches its own trigger fires forever. That is
+        # visible the moment it is created, so there is no reason to find out by
+        # being muted for spam.
         if (
             event in CHAT_EVENTS
             and action in ("chat", "command")
@@ -497,10 +515,11 @@ class Scheduler(Plugin):
         state = "" if task.get("enabled", True) else " (disabled)"
         return f"{task.get('action', 'chat')} {schedule}{state}"
 
-    # ---- 条件与占位符 ----
+    # ---- Conditions and placeholders ----
 
     def _snapshot(self) -> dict[str, float]:
-        """条件里可用的变量当前值（bool 也用 0/1 表示，比较起来一致）。"""
+        """Current values for the condition variables (bools as 0/1, so every
+        comparison works the same way)."""
 
         bot = self.bot
         now = time.localtime()
@@ -534,7 +553,7 @@ class Scheduler(Plugin):
         if not condition:
             return True
         clauses, _ = parse_condition(condition)
-        if clauses is None:  # 已经过 _normalize，理论上到不了这里
+        if clauses is None:  # Already validated by _normalize; unreachable
             return False
         values = self._snapshot()
         for variable, operator, wanted in clauses:
@@ -543,7 +562,8 @@ class Scheduler(Plugin):
         return True
 
     def _context(self, context: dict[str, str] | None = None) -> dict[str, str]:
-        """占位符替换表：当前状态 + 触发上下文（后者优先）。"""
+        """Placeholder values: the current state plus the trigger context,
+        which wins."""
 
         values = self._snapshot()
         text: dict[str, str] = {
@@ -587,10 +607,10 @@ class Scheduler(Plugin):
         ).lower()
         return str(wanted).lower() in haystack
 
-    # ---- 事件触发 ----
+    # ---- Event triggers ----
 
     async def _on_chat_sent(self, message) -> None:
-        """记下自己（或任何插件）说过的话，用来识别服务器回显。"""
+        """Remember what we (or any plugin) said, to recognise the echo."""
 
         text = str(message or "").strip()
         if text:
@@ -609,7 +629,7 @@ class Scheduler(Plugin):
         text = plain_text(message) if message is not None else ""
         bot = self.bot
         if bot is not None and speaker == getattr(bot, "username", None):
-            return  # 服务器把自己说的话广播回来，不能拿它触发自己
+            return  # Our own line coming back from the server
         if self._is_echo(text):
             return
         await self._fire_event("player_chat", {"player": speaker, "message": text})
@@ -617,7 +637,7 @@ class Scheduler(Plugin):
     async def _on_system_chat(self, component, overlay) -> None:
         text = plain_text(component)
         if self._is_echo(text):
-            return  # 命令/聊天的服务器回显
+            return  # The server echoing a command or a chat line of ours
         await self._fire_event("system_chat", {"message": text})
 
     async def _on_player_join(self, entry) -> None:
@@ -653,24 +673,24 @@ class Scheduler(Plugin):
             await self._launch(task, {"trigger": event, **context}, now)
 
     async def _launch(self, task: dict, context: dict[str, str], now: float) -> None:
-        """执行一个任务并统一记日志（定时、事件、条件三条路共用）。"""
+        """Run one task and log it the same way, whichever path triggered it."""
 
         name = task["name"]
         self._last_run[name] = now
         try:
             error = await self._perform(task, context)
             if error:
-                log.warn(f"[定时] 任务 {name}: {error}")
+                log.warn(f"[scheduler] task {name}: {error}")
             else:
-                log.info(f"[定时] 任务 {name}: 已{ACTIONS[task['action']]}。")
+                log.info(f"[scheduler] task {name}: {ACTIONS[task['action']]}.")
         except Exception as error:
-            log.error(f"[定时] 任务 {name} 执行失败: {error}")
+            log.error(f"[scheduler] task {name} failed: {error}")
 
 
-    # ---- 暴露给其他插件 / LLM 的能力 ----
+    # ---- Capabilities exposed to other plugins and the LLM ----
 
     def _read_tasks(self) -> tuple[list[dict] | None, str]:
-        """读回文件里的原始任务列表（保留未知字段，不做归一化）。"""
+        """Read the raw task list back (unknown fields kept, no normalizing)."""
         path = self._file
         if path is None:
             return None, "Scheduler file is not resolved yet"
@@ -696,7 +716,8 @@ class Scheduler(Plugin):
             )
         except OSError as error:
             return f"Failed to write scheduler.json: {error}"
-        # 立刻重载：既让改动即时生效，也刷新 mtime（自己写的不算外部改动）
+        # Reload at once: the change takes effect immediately and mtime is
+        # refreshed, so our own write is not seen as an external edit
         self._load_tasks()
         return ""
 
@@ -798,11 +819,11 @@ class Scheduler(Plugin):
             error = await self._perform(task)
             if error:
                 return error
-            log.info(f"[定时] 任务 {name}: 手动执行一次。")
+            log.info(f"[scheduler] task {name}: run once by hand.")
             return f"Task {name} executed once"
         return f"Task not found: {name}"
 
-    # ---- 主循环 ----
+    # ---- Main loop ----
 
     async def _loop(self) -> None:
         while True:
@@ -813,7 +834,7 @@ class Scheduler(Plugin):
             await self._run_due()
 
     def _maybe_reload(self) -> None:
-        """JSON 被外部修改（如 llm_agent 的 schedule_* 工具）后自动重载。"""
+        """Reload after an outside edit to the JSON (an LLM tool, an editor)."""
         path = self._file
         if path is None or not path.exists():
             return
@@ -822,19 +843,19 @@ class Scheduler(Plugin):
         except OSError:
             return
         if self._mtime is not None and mtime != self._mtime:
-            log.info("[定时] 任务文件已修改，重新加载。")
+            log.info("[scheduler] the task file changed, reloading.")
             self._load_tasks()
 
     async def _run_due(self) -> None:
         bot = self.bot
         if bot is None:
-            return  # 尚未连接：到期任务顺延，不消耗本次调度
+            return  # Not connected: due tasks are postponed, not consumed
         now = time.monotonic()
         for task in self._tasks:
             if not task["enabled"]:
                 continue
             if task["event"]:
-                continue  # 事件任务由事件回调触发，不参与定时
+                continue  # Event tasks fire from their handler, not the timer
             if task["interval"] is None and not task["time"]:
                 await self._check_condition(task, now)
                 continue
@@ -853,7 +874,8 @@ class Scheduler(Plugin):
                 self._next_run[name] = now + task["interval"]
             else:
                 self._next_run[name] = now + self._seconds_until(task["time"])
-            # 带条件的定时任务：条件是开关，不成立就跳过这一次（照常排下一次）
+            # A timed task with a condition: the condition gates it, so a false
+            # one skips this run (the next one is scheduled as usual)
             if not self._condition_true(task["condition"]):
                 continue
             if not self._cooldown_ok(task, now):
@@ -861,10 +883,11 @@ class Scheduler(Plugin):
             await self._launch(task, {"trigger": "schedule"}, now)
 
     async def _check_condition(self, task: dict, now: float) -> None:
-        """只有条件的任务：在条件由假变真的那一刻执行一次。
+        """A condition-only task: runs once as the condition becomes true.
 
-        用上升沿而不是「条件为真就执行」——后者会在血量低的整段时间里每秒
-        触发一次。冷却期内被挡掉的上升沿不会补发，得等条件再落回去。
+        The rising edge, not "run while true" -- the latter would fire every
+        second for as long as health stayed low. An edge blocked by the cooldown
+        is not replayed; the condition has to go false and true again.
         """
 
         name = task["name"]
@@ -878,25 +901,27 @@ class Scheduler(Plugin):
         await self._launch(task, {"trigger": "condition"}, now)
 
     async def _perform(self, task: dict, context: dict[str, str] | None = None) -> str:
-        """执行一个任务；返回空字符串表示成功，否则是给调用方看的原因。
+        """Run one task; empty string means success, anything else is the reason
+        to show the caller.
 
-        ``remind`` 不自己发话，而是把内容交给 LLM 智能体去决定怎么处理——
-        通过暴露出来的 ``llm_agent.remind``，所以这里不需要知道它的内部，
-        没装那个插件时也只是拿到一句「未加载」。
+        ``remind`` does not speak by itself: it hands the text to the LLM agent
+        through the exposed ``llm_agent.remind`` and lets the agent decide what
+        to do. Nothing here needs to know how that works, and with the plugin
+        absent the answer is simply "not loaded".
         """
         action = task["action"]
         text = self._expand(task["text"], self._context(context))
         if action == "remind":
             manager = self.manager
             if manager is None or manager.get_service("llm_agent.remind") is None:
-                return "LLM 智能体未加载，提醒已跳过"
+                return "the LLM agent is not loaded, reminder skipped"
             result = await manager.call_service(
                 "llm_agent.remind", text=text, source=task["name"]
             )
             return "" if "queued" in str(result) else str(result)
         bot = self.bot
         if bot is None:
-            return "尚未连接服务器"
+            return "not connected to a server"
         if action == "command":
             await bot.send_command(text)
         else:
@@ -904,7 +929,7 @@ class Scheduler(Plugin):
         return ""
 
     def _seconds_until(self, spec: str) -> float:
-        """到下一个 ``HH:MM`` 本地时刻的秒数（已过则算到明天）。"""
+        """Seconds until the next local ``HH:MM`` (tomorrow if it passed)."""
         now = time.localtime()
         hour, minute = spec.split(":")
         target = time.mktime(

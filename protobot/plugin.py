@@ -214,7 +214,7 @@ class Plugin:
 
         def register(candidate: Callable[..., Any]) -> Callable[..., Any]:
             if not name:
-                raise PluginError(f"[插件] {self.name}: 暴露的函数缺少名称")
+                raise PluginError(f"[plugin] {self.name}: an exposed function needs a name")
             self._exposed.append(
                 ExposedFunction(
                     plugin=self.name,
@@ -242,7 +242,7 @@ class Plugin:
         callers should be ready for it rather than caching the handler.
         """
         if self.manager is None:
-            raise PluginError(f"[插件] {self.name}: 插件管理器不可用")
+            raise PluginError(f"[plugin] {self.name}: the plugin manager is unavailable")
         return await self.manager.call_service(qualified, **kwargs)
 
     # ---- companion files ----
@@ -316,7 +316,7 @@ class Plugin:
             except asyncio.CancelledError:
                 raise  # never swallow cancellation
             except Exception as error:  # Exception only, never BaseException
-                log_error(f"[插件] {plugin_name} 处理事件时出错: {error!r}")
+                log_error(f"[plugin] {plugin_name} raised while handling an event: {error!r}")
                 traceback.print_exc()
 
         return wrapped
@@ -340,7 +340,7 @@ def resolve_load_order(plugins: dict[str, Plugin], disabled: set[str]) -> list[P
                 continue
             if any(dep in disabled for dep in plugin.dependencies):
                 disabled.add(name)
-                warn(f"[插件] {name} 依赖的插件已被禁用，将一并禁用。")
+                warn(f"[plugin] {name} depends on a disabled plugin, disabling it too.")
                 changed = True
 
     # Validation: enabled plugins may only depend on existing, enabled plugins.
@@ -350,7 +350,7 @@ def resolve_load_order(plugins: dict[str, Plugin], disabled: set[str]) -> list[P
         for dep in plugin.dependencies:
             if dep not in plugins or dep in disabled:
                 raise PluginError(
-                    f"[插件] {name} 依赖的插件 {dep} 不存在或已被禁用"
+                    f"[plugin] {name} requires {dep}, which is missing or disabled"
                 )
 
     # Kahn topological sort over "depends on" edges (dependency -> dependent).
@@ -374,7 +374,7 @@ def resolve_load_order(plugins: dict[str, Plugin], disabled: set[str]) -> list[P
 
     if len(order) < len(indegree):
         cycle = _extract_cycle(plugins, set(indegree) - set(order))
-        raise PluginError(f"[插件] 依赖循环: {' -> '.join(cycle)}")
+        raise PluginError(f"[plugin] dependency cycle: {' -> '.join(cycle)}")
 
     return [plugins[name] for name in order]
 
@@ -455,7 +455,7 @@ class PluginManager:
                 for plugin in self._instantiate_file(file):
                     if plugin.name in self._plugins:
                         raise PluginError(
-                            f"[插件] 插件重名: {plugin.name} "
+                            f"[plugin] duplicate plugin name: {plugin.name} "
                             f"({self._sources[plugin.name]}, {file})"
                         )
                     self._plugins[plugin.name] = plugin
@@ -472,7 +472,7 @@ class PluginManager:
             source = file.read_text(encoding="utf-8")
         except OSError as error:
             del sys.modules[module_name]
-            raise PluginError(f"[插件] 加载失败: {file}: {error}") from error
+            raise PluginError(f"[plugin] failed to load {file}: {error}") from error
         # Compile from the freshly read source.  The importlib machinery's
         # bytecode cache matches on (mtime-second, size), so an edit saved
         # within the same second with an unchanged file size would silently
@@ -482,7 +482,7 @@ class PluginManager:
             exec(code, module.__dict__)
         except Exception as error:
             del sys.modules[module_name]
-            raise PluginError(f"[插件] 加载失败: {file}: {error}") from error
+            raise PluginError(f"[plugin] failed to load {file}: {error}") from error
         return module
 
     def _instantiate_file(self, file: Path) -> list[Plugin]:
@@ -499,10 +499,10 @@ class PluginManager:
             plugin = obj()
             if not plugin.name:
                 raise PluginError(
-                    f"[插件] {file}: 插件类 {obj.__name__} 缺少 name"
+                    f"[plugin] {file}: plugin class {obj.__name__} has no name"
                 )
             if plugin.name in seen:
-                raise PluginError(f"[插件] 插件重名: {plugin.name} ({file})")
+                raise PluginError(f"[plugin] duplicate plugin name: {plugin.name} ({file})")
             seen.add(plugin.name)
             plugins.append(plugin)
         return plugins
@@ -574,7 +574,7 @@ class PluginManager:
         """
         service = self._services.get(qualified)
         if service is None:
-            raise PluginError(f"[插件] 未找到暴露的函数: {qualified}")
+            raise PluginError(f"[plugin] no such exposed function: {qualified}")
         result = service.handler(**kwargs)
         if inspect.isawaitable(result):
             return await result
@@ -585,8 +585,8 @@ class PluginManager:
             existing = self._services.get(service.qualified)
             if existing is not None:
                 warn(
-                    f"[插件] {plugin.name} 重复暴露 {service.qualified}，"
-                    "忽略后一个。"
+                    f"[plugin] {plugin.name} exposes {service.qualified} twice, "
+                    "ignoring the second one."
                 )
                 continue
             self._services[service.qualified] = service
@@ -653,7 +653,7 @@ class PluginManager:
         for plugin in new_plugins:
             if plugin.name in self._plugins:
                 raise PluginError(
-                    f"[插件] 插件重名: {plugin.name} "
+                    f"[plugin] duplicate plugin name: {plugin.name} "
                     f"({self._sources[plugin.name]}, {file})"
                 )
         candidates = dict(self._plugins)
@@ -680,7 +680,7 @@ class PluginManager:
         for plugin in new_plugins:
             if plugin.name in self._plugins and plugin.name not in old_names:
                 raise PluginError(
-                    f"[插件] 插件重名: {plugin.name} "
+                    f"[plugin] duplicate plugin name: {plugin.name} "
                     f"({self._sources[plugin.name]}, {file})"
                 )
         new_by_name = {plugin.name: plugin for plugin in new_plugins}
@@ -718,12 +718,12 @@ class PluginManager:
                 if other_name in to_close:
                     continue
                 if any(dep in to_close for dep in other.dependencies):
-                    warn(f"[插件] {other_name} 依赖的插件已关闭，将一并关闭。")
+                    warn(f"[plugin] {other_name} depends on a closed plugin, closing it too.")
                     to_close.add(other_name)
                     changed = True
         for closing in to_close:
             self._plugins.pop(closing, None)
-            # 来源记录保留在 _sources：set_enabled(True) 需要它来重新加载。
+            # The source stays in _sources: set_enabled(True) needs it to reload.
             for names in self._files.values():
                 if closing in names:
                     names.remove(closing)
@@ -739,8 +739,8 @@ class PluginManager:
         for name in names:
             if await self.hot_close(name) is not None:
                 closed.append(name)
-        # 文件已不在（或被主动卸载）：从加载记录里去掉，否则监视器每轮都会
-        # 把它当成「刚被删除」再关一次。
+        # The file is gone (or was unloaded on purpose): drop it from the load
+        # records, or the watcher treats it as freshly deleted on every pass.
         self._mtimes.pop(file, None)
         self._files.pop(file, None)
         return closed
@@ -765,7 +765,7 @@ class PluginManager:
                 source = self._sources.get(name)
                 if source is None:
                     return None
-                await self.hot_load_file(source)  # 已被 hot_close 卸载过
+                await self.hot_load_file(source)  # hot_close had unloaded it
                 return self._plugins.get(name)
         else:
             if plugin is None:
@@ -781,8 +781,9 @@ class PluginManager:
     async def _enable_one(self, plugin: Plugin) -> None:
         plugin.bot = self._current_bot
         plugin.session = self._current_session
-        plugin.manager = self  # 先于 on_enable：钩子里可操作管理器
-        # 暴露的函数先发布：依赖已按拓扑序启用，on_enable 里就能互相调用。
+        plugin.manager = self  # Before on_enable, so the hook can use it
+        # Exposures are published first: dependencies are already enabled in
+        # topological order, so on_enable can call them right away.
         self._publish_services(plugin)
         if self._current_bot is not None:
             plugin._bind(self._current_bot)
@@ -790,17 +791,19 @@ class PluginManager:
             plugin._bind_session(self._current_session)
         await self._safe_hook(plugin, "on_enable", plugin.on_enable())
         if self._current_bot is not None:
-            # 中途启用（热加载/热重载/set_enabled）时也要给一次 on_bot_ready：
-            # 它承诺「每只 bot 一次」，否则插件里按连接初始化的代码要等到
-            # 下次重连才跑，而代码本身完全正确，极难排查。
+            # A plugin enabled mid-session (hot load/reload, set_enabled) gets
+            # its on_bot_ready here too: the hook promises once per bot, and
+            # without this, per-connection setup would silently wait for the
+            # next reconnect even though the plugin code is perfectly correct.
             await self._safe_hook(
                 plugin, "on_bot_ready", plugin.on_bot_ready()
             )
 
     async def _disable_one(self, plugin: Plugin) -> None:
-        # 先摘掉入口再跑钩子：on_disable 里几乎都要 await（取消任务），
-        # 期间事件循环会继续派发事件、别的插件也可能调用它的服务，
-        # 而这个实例已经在退场——旧实例会做出「已经停了」之后的动作。
+        # Unhook first, then run the hook: on_disable almost always awaits
+        # (cancelling tasks), and meanwhile the event loop keeps dispatching
+        # events and other plugins may still call its services -- while this
+        # instance is already on its way out.
         self._withdraw_services(plugin)
         if self._current_bot is not None:
             plugin._unbind(self._current_bot)
@@ -836,7 +839,7 @@ class PluginManager:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            log_error(f"[插件] {plugin.name} 生命周期钩子出错 ({hook}): {error!r}")
+            log_error(f"[plugin] {plugin.name} raised in a lifecycle hook ({hook}): {error!r}")
             traceback.print_exc()
 
 
@@ -867,7 +870,7 @@ class PluginWatcher:
             try:
                 await self.check_once()
             except Exception as error:
-                log_error(f"[插件] 热更新失败: {error!r}")
+                log_error(f"[plugin] hot update failed: {error!r}")
                 traceback.print_exc()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)

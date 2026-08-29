@@ -9,8 +9,8 @@ captures and swallows while its message loop is running.
 Usage:
 
     from protobot import log
-    log.info("[聊天]", text)          # like print("[聊天]", text)
-    log.warn("配置项缺失:", key)
+    log.info("[chat]", text)          # like print("[chat]", text)
+    log.warn("missing setting:", key)
 """
 
 from __future__ import annotations
@@ -43,12 +43,12 @@ def info(*args: Any, sep: str = " ", end: str = "\n") -> None:
 
 
 def warn(*args: Any, sep: str = " ", end: str = "\n") -> None:
-    _emit("[警告]", *args, sep=sep, end=end)
+    _emit("[warn]", *args, sep=sep, end=end)
 
 
 def error(*args: Any, sep: str = " ", end: str = "\n") -> None:
-    _emit("[错误]", *args, sep=sep, end=end)
+    _emit("[error]", *args, sep=sep, end=end)
 
 
 def debug(*args: Any, sep: str = " ", end: str = "\n") -> None:
-    _emit("[调试]", *args, sep=sep, end=end)
+    _emit("[debug]", *args, sep=sep, end=end)

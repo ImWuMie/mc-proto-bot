@@ -1,40 +1,58 @@
-"""自动钓鱼插件：抛竿、判定咬钩、收杆，循环往复。
+"""Auto-fishing: cast, detect the bite, reel, repeat.
 
-判定按可靠性排序，三路信号任一命中即收杆：
+Three signals feed the detector, in order of reliability; any one of them
+reels the line in:
 
-  1. **咬钩音效**（最准，原版就是靠它提示玩家）——``entity.fishing_bobber.splash``
-     由位置型音效包（协议 775/776 的 0x75 = 117）发出，坐标是**浮标所在处**；
-     甩竿/收杆的音效发在**玩家所在处**，因此「音效位置离浮标 1.5 格内」既能
-     认出咬钩，也能排除自己甩竿和别人钓鱼的动静。音效的数字 ID 逐版本变动
-     且不由服务端下发（``minecraft:sound_event`` 是内置注册表），所以这里
-     **不硬编码**：第一次靠位置认出咬钩时把 ID 学下来，之后要求 ID 也匹配。
-  2. **向下速度**——``entity_motion`` 报出浮标的向下速度。原版咬钩那一刻把
-     浮标的 Y 速度设成 ``-0.4 × [0.6, 1.0]``（即 -0.24 ~ -0.4 格/tick）并同时
-     播放溅水音效，所以这一路和音效路本是同一个瞬间的两种表现。
-  3. **位置下沉**——浮标从静止水面基准线被拽下超过阈值。
+  1. **The bite sound** (the most reliable, and what vanilla itself cues the
+     player with) -- ``entity.fishing_bobber.splash`` arrives in a positioned
+     sound packet (0x75 = 117 on protocol 775/776) whose coordinates are **the
+     bobber's**, while casting and reeling play **at the player**. So "the
+     sound happened within 1.5 blocks of the bobber" both recognises a bite
+     and rules out our own cast and other people fishing nearby. The numeric
+     sound id changes between releases and the server never sends it
+     (``minecraft:sound_event`` is a built-in registry), so nothing is
+     **hardcoded**: the id is learned the first time position alone identifies
+     a bite, and required to match from then on.
+  2. **Downward velocity** -- ``entity_motion`` reports the bobber sinking. At
+     the bite vanilla sets its Y velocity to ``-0.4 x [0.6, 1.0]`` (-0.24 to
+     -0.4 blocks/tick) and plays the splash in the same instant, so this and
+     the sound are two views of one moment.
+  3. **Position dropping** -- the bobber is pulled below its resting baseline
+     by more than a threshold.
 
-浮标怎么认领：优先从服务端下发的 ``minecraft:entity_type`` 注册表里查
-``minecraft:fishing_bobber`` 的 type_id；查不到就把「抛竿后 2 秒内、身边
-8 格内新生成的实体」当作浮标，并**记住它的 type_id**，之后每次抛竿都精确认领。
-注册表算出来的下标万一对不上（版本或服务端差异），``spawn_window`` 过后会用
-这个候选兜底并把 type_id 纠正过来——否则一次算错就再也认不出浮标，整小时空转。
+Claiming the bobber: the ``minecraft:entity_type`` registry the server sends is
+asked for ``minecraft:fishing_bobber`` first. Failing that, an entity spawning
+within 2 seconds of the cast and within 8 blocks is taken to be the bobber and
+**its type_id is remembered**, so later casts claim it exactly. When the index
+computed from the registry does not match (a release or server difference),
+that candidate takes over once ``spawn_window`` passes and corrects the
+type_id -- otherwise one bad guess would mean never recognising a bobber again
+and spinning for an hour.
 
-速度与下沉两路要等 ``settle_delay``（默认 1.2 秒，抛出去到落水就这么点时间）
-之后才生效：抛竿的初速度本身可能就是向下的，不做门控会一抛竿就误判。**不能**
-改用「连续几次位置更新几乎不动」来判断落稳——浮标停在水面上时服务端根本不再
-发位置包，那样基准线常常永远建立不起来，速度与下沉两路被永久门控住，只能靠
-音效路，音效再有一点问题就整小时钓不上鱼。音效路不需要门控，它只在鱼真咬钩时响。
+The velocity and drop signals only arm after ``settle_delay`` (1.2s by default,
+which is about how long a cast takes to hit the water): the initial velocity of
+a cast can itself be downward, and without the gate every cast would look like
+a bite. What must **not** be used instead is "several position updates barely
+moved": a bobber resting on the water stops producing position packets at all,
+so the baseline would often never be established, both signals would stay
+gated forever, and everything would hang on the sound path -- one problem there
+and an hour passes with nothing caught. The sound needs no gate; it only plays
+when a fish really bites.
 
-落点检查：``water_check``（默认开）在浮标就位时查一下脚下那两格是不是水，不是
-就立刻重抛，而不是干等满 ``max_wait``。区块还没收到时判为「未知」，不会瞎重抛。
+Where it landed: ``water_check`` (on by default) checks the two blocks under
+the bobber once it is in place and recasts immediately when they are not water,
+rather than waiting out ``max_wait``. A chunk that has not arrived reads as
+"unknown", so nothing recasts on missing data.
 
-超时兜底：``max_wait`` 秒没咬钩（浮标落在陆地上、线被打断等）就收杆重抛；
-浮标被移除也会重抛。收杆与重抛之间只隔 ``recast_delay`` 秒（默认 0.4）。
+The backstop: ``max_wait`` seconds without a bite (the bobber landed on ground,
+the line was cut) reels in and casts again, as does the bobber being removed.
+Only ``recast_delay`` seconds (0.4 by default) separate reeling from casting.
 
-设置文件 ``fishing.json``（与本插件同目录，首次启用自动生成）修改后约 5 秒
-内自动重新加载，**默认 enabled=false**：把它改成 true 才会开始钓，也可以让
-LLM 调用暴露出来的 ``fishing.start`` / ``fishing.stop`` / ``fishing.status``。
-手持鱼竿由你自己保证——本协议栈拿不到物品名称，插件无法校验手里是不是鱼竿。
+Settings live in ``fishing.json`` next to this file (written on first enable)
+and reload within about 5 seconds of an edit. It starts **enabled=false**: flip
+that to true to fish, or let the LLM call the exposed ``fishing.start`` /
+``fishing.stop`` / ``fishing.status``. Holding a rod is on you -- this protocol
+stack cannot read item names, so the plugin cannot check what is in hand.
 """
 
 from __future__ import annotations
@@ -48,26 +66,29 @@ from protobot import Plugin, PluginSettings, log
 from protobot.protocol import PacketReader
 
 DEFAULT_SETTINGS: dict = {
-    "enabled": False,  # 改成 true 才开始自动钓鱼
-    "hand": "main_hand",  # 用哪只手甩竿：main_hand / off_hand
-    "sound_packet_id": None,  # 音效包 ID；null = 按连接的协议版本自动取（26.x 为 117）
-    "sound_id": None,  # 咬钩音效的数字 ID；null = 自动学习并记住
-    "sound_radius": 1.5,  # 音效位置与浮标的最大距离（格）
-    "bite_velocity": -0.15,  # 向下速度阈值（格/tick，原版咬钩为 -0.24 ~ -0.4）；0 关闭该路
-    "bite_drop": 0.12,  # 相对静止基准线的下沉阈值（格）；0 关闭该路
-    "settle_delay": 1.2,  # 浮标生成后多少秒才开始看速度/下沉（等它飞完落水）
-    "water_check": True,  # 落点不是水就立刻重抛，不白等 max_wait
-    "recast_delay": 0.4,  # 收杆到重抛的间隔（秒）
-    "max_wait": 45.0,  # 抛竿后多久没咬钩就重抛（秒）
-    "spawn_window": 2.0,  # 认领浮标：抛竿后多少秒内生成的实体才算
-    "spawn_radius": 8.0,  # 认领浮标：距自己多少格内
+    "enabled": False,  # true starts fishing
+    "hand": "main_hand",  # Which hand casts: main_hand / off_hand
+    "sound_packet_id": None,  # Sound packet id; null = from the version table
+    "sound_id": None,  # Numeric bite-sound id; null = learn and remember it
+    "sound_radius": 1.5,  # Greatest distance between sound and bobber (blocks)
+    "bite_velocity": -0.15,  # Downward threshold (blocks/tick; vanilla bites at
+    #                          -0.24 to -0.4); 0 disables this signal
+    "bite_drop": 0.12,  # Drop below the resting baseline (blocks); 0 disables
+    "settle_delay": 1.2,  # Seconds before watching velocity/drop (time to land)
+    "water_check": True,  # Recast at once when it did not land in water
+    "recast_delay": 0.4,  # Seconds between reeling and casting again
+    "max_wait": 45.0,  # Recast after this long without a bite (seconds)
+    "spawn_window": 2.0,  # Claiming: how soon after the cast an entity counts
+    "spawn_radius": 8.0,  # Claiming: how close to us it has to spawn (blocks)
 }
 
-#: 主循环步长（秒）。判定走事件、不靠轮询，这里只管超时与重抛。
+#: Main-loop step (seconds). Detection is event-driven; this only handles
+#: timeouts and recasting.
 TICK = 0.1
 
-#: 连续读到「浮标不在水里」多少次才重抛（× TICK 秒）。抛得远时浮标可能
-#: 还在水面上方飞，只看一眼会把好竿误杀。
+#: How many consecutive "not in water" reads (x TICK seconds) trigger a
+#: recast. A long cast may still be in the air above the water, and one look
+#: would throw away a perfectly good cast.
 DRY_CONFIRM = 5
 
 
@@ -80,23 +101,24 @@ class AutoFishing(Plugin):
         self._settings: dict = AutoFishing._normalize(dict(DEFAULT_SETTINGS))
         self._loop_task: asyncio.Task | None = None
         self._tick_count = 0
-        # 浮标追踪
+        # Bobber tracking
         self._bobber_id: int | None = None
-        self._bobber_type: int | None = None  # 认领成功后学到的 type_id
-        self._baseline: float | None = None  # 静止水面基准 Y
+        self._bobber_type: int | None = None  # type_id learned on a claim
+        self._baseline: float | None = None  # Resting water-line Y
         self._last_y: float | None = None
-        self._armed = False  # 落水延时已过：速度/下沉两路开始生效
-        self._claim_at = 0.0  # 认领到浮标的时刻
-        self._candidate: tuple[int, int | None, float] | None = None  # 兜底认领
-        self._dry_reads = 0  # 连续读到「不在水里」的次数
-        # 状态机：idle -> casting -> waiting -> (咬钩/超时) -> cooldown -> ...
+        self._armed = False  # Settle delay passed: velocity/drop now count
+        self._claim_at = 0.0  # When the bobber was claimed
+        self._candidate: tuple[int, int | None, float] | None = None  # Fallback
+        self._dry_reads = 0  # Consecutive "not in water" reads
+        # State machine: idle -> casting -> waiting -> (bite/timeout) ->
+        # cooldown -> ...
         self._state = "idle"
         self._cast_at = 0.0
         self._next_cast_at = 0.0
         self._reeling = False
         self._catches = 0
-        self._learned_sound: int | None = None  # 学到的咬钩音效 ID
-        self._warned_no_sound = False  # 版本没有已核实的音效包 ID 时只提示一次
+        self._learned_sound: int | None = None  # Learned bite-sound id
+        self._warned_no_sound = False  # Say it once when the id is unverified
         self.subscribe("entity_add", self._on_entity_add)
         self.subscribe("entity_motion", self._on_entity_motion)
         self.subscribe("entity_move", self._on_entity_move)
@@ -104,7 +126,7 @@ class AutoFishing(Plugin):
         self.subscribe("entities_remove", self._on_entities_remove)
         self.subscribe("packet", self._on_packet)
         self.subscribe_session("session_ready", self._on_session_ready)
-        # 暴露给其他插件与 LLM：fishing.start / fishing.stop / fishing.status
+        # Exposed to other plugins and the LLM: start / stop / status
         self.expose(
             "start",
             self._service_start,
@@ -132,7 +154,7 @@ class AutoFishing(Plugin):
             llm=True,
         )
 
-    # ---- 暴露给其他插件 / LLM 的能力 ----
+    # ---- Capabilities exposed to other plugins and the LLM ----
 
     async def _service_start(self) -> str:
         if self._settings["enabled"]:
@@ -165,38 +187,39 @@ class AutoFishing(Plugin):
         )
 
     def _set_enabled(self, enabled: bool) -> None:
-        """改开关并只把这一个键写回 fishing.json。
+        """Flip the switch, writing back only that one key of fishing.json.
 
-        只 patch 一个键，不整份回写：否则会覆盖用户在这期间改过的其他值，
-        还会把一个只写了一行的文件展开成全部默认项。
+        Patching one key rather than rewriting the file avoids overwriting
+        anything else edited in the meantime, and avoids expanding a file that
+        holds a single line into every default.
         """
         if not enabled:
             self._reset()
         error = self._config.patch({"enabled": enabled})
         self._settings = self._config.data
         if error:
-            log.warn(f"[钓鱼] 开关状态写回失败 ({error})")
-            self._settings["enabled"] = enabled  # 至少让本进程内生效
-        log.info(f"[钓鱼] {'开始' if enabled else '停止'}自动钓鱼。")
+            log.warn(f"[fishing] could not write the switch back ({error})")
+            self._settings["enabled"] = enabled  # At least apply it in-process
+        log.info(f"[fishing] {'started' if enabled else 'stopped'}.")
 
-    # ---- 生命周期 ----
+    # ---- Lifecycle ----
 
     async def on_enable(self) -> None:
         if self._config is None:
             self._config = self.settings_file(
                 "fishing.json", DEFAULT_SETTINGS,
-                label="钓鱼", normalize=self._normalize,
+                label="fishing", normalize=self._normalize,
             )
         self._load_settings()
         self._loop_task = asyncio.create_task(
             self._loop(), name="protobot-fishing"
         )
         if self._settings["enabled"]:
-            log.info("[钓鱼] 已启用，等待连接后开始自动抛竿。")
+            log.info("[fishing] enabled; casting starts once connected.")
         else:
             log.info(
-                f"[钓鱼] 插件已加载但未开启：把 {self._config.path} 里的 "
-                'enabled 改成 true 即可（约 5 秒生效）。'
+                f"[fishing] loaded but off: set enabled to true in "
+                f"{self._config.path} (applies within about 5 seconds)."
             )
 
     async def on_disable(self) -> None:
@@ -208,10 +231,10 @@ class AutoFishing(Plugin):
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
-        log.info(f"[钓鱼] 已关闭（本次共 {self._catches} 条）。")
+        log.info(f"[fishing] stopped ({self._catches} caught this run).")
 
     async def _on_session_ready(self, bot) -> None:
-        self._reset()  # 重连后旧浮标已不存在
+        self._reset()  # After a reconnect the old bobber is gone
 
     def _reset(self) -> None:
         self._bobber_id = None
@@ -222,7 +245,8 @@ class AutoFishing(Plugin):
         self._state = "idle"
         self._reeling = False
 
-    # ---- 设置：默认值与钳制由本插件负责，读写/热重载交给框架 ----
+    # ---- Settings: defaults and clamping here, I/O and reloading in the
+    # framework ----
 
     @staticmethod
     def _normalize(merged: dict) -> dict:
@@ -241,7 +265,7 @@ class AutoFishing(Plugin):
         for key in ("sound_packet_id", "sound_id"):
             value = merged.get(key)
             if value is None or str(value) == "":
-                merged[key] = None  # 交给版本表决定 / 自动学习
+                merged[key] = None  # Leave it to the version table / learning
                 continue
             try:
                 merged[key] = int(value)
@@ -264,13 +288,13 @@ class AutoFishing(Plugin):
         self._settings = self._config.data
         now_on = self._settings.get("enabled")
         if was_on != now_on:
-            log.info(f"[钓鱼] 设置已更新：{'开启' if now_on else '关闭'}。")
+            log.info(f"[fishing] settings updated: {'on' if now_on else 'off'}.")
             if not now_on:
                 self._reset()
         else:
-            log.info("[钓鱼] 设置已更新。")
+            log.info("[fishing] settings updated.")
 
-    # ---- 主循环：只管抛竿、超时与重抛（咬钩判定在事件里） ----
+    # ---- Main loop: casting, timeouts, recasting (bites arrive as events) ----
 
     async def _loop(self) -> None:
         while True:
@@ -283,7 +307,7 @@ class AutoFishing(Plugin):
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                log.error(f"[钓鱼] 循环出错: {error!r}")
+                log.error(f"[fishing] loop error: {error!r}")
 
     async def _step(self) -> None:
         if not self._settings["enabled"] or self.bot is None:
@@ -294,8 +318,9 @@ class AutoFishing(Plugin):
                 await self._cast()
             return
         if self._state == "casting":
-            # 注册表给的 type_id 可能对不上（版本/服务端差异），那就用
-            # 「刚抛竿 + 就在身边」的候选兜底，并把 type_id 纠正过来。
+            # The registry's type_id can be wrong (release or server
+            # differences), so fall back to the "just cast, right here"
+            # candidate and correct the type_id from it.
             if now - self._cast_at > self._settings["spawn_window"]:
                 self._claim_candidate()
         if self._state == "waiting" and not self._armed:
@@ -304,17 +329,20 @@ class AutoFishing(Plugin):
         if self._state == "waiting" and self._armed:
             self._check_water()
         if now - self._cast_at > self._settings["max_wait"]:
-            # 浮标可能落在陆地上或线已断：收回来重抛
-            log.info("[钓鱼] 久未咬钩，重新抛竿。")
+            # The bobber may be on land, or the line is gone: reel and recast
+            log.info("[fishing] no bite for a while, casting again.")
             await self._reel(caught=False)
 
     def _arm(self) -> None:
-        """落水延时已过：把当前 Y 定为基准，速度/下沉两路开始生效。
+        """The settle delay has passed: take the current Y as the baseline and
+        let the velocity and drop signals count.
 
-        以前这里要求「连续几次位置更新几乎不动」才算落稳，但浮标在水面上
-        基本不动，服务端**就不再发位置包**，于是基准线常常永远建立不起来，
-        速度与下沉两路被永久门控住——咬钩自然判不出来。改按时间：抛出去到
-        落水就一秒出头，等这么久之后浮标要么在水里、要么这一竿本来就废了。
+        This used to require "several position updates barely moved", but a
+        bobber resting on water hardly moves, so the server **stops sending
+        position packets** -- the baseline was often never established, both
+        signals stayed gated forever, and bites went undetected. Time is the
+        better test: a cast takes about a second to land, and after that the
+        bobber is either in the water or this cast was wasted anyway.
         """
         self._armed = True
         position = self._bobber_position()
@@ -325,10 +353,11 @@ class AutoFishing(Plugin):
             self._baseline = self._last_y
 
     def _check_water(self) -> None:
-        """落点不是水就重抛。要连着读到 DRY_CONFIRM 次才动手。
+        """Recast when it did not land in water -- after DRY_CONFIRM reads.
 
-        只看一眼是不够的：抛得远时浮标可能还在水面上方飞着，那一眼读到的是
-        空气。连读几次（每次隔一个 TICK）既能等它落定，也不会误杀好竿。
+        One look is not enough: a long cast may still be in the air above the
+        water, and that look reads air. A few reads a TICK apart give it time to
+        settle without throwing away a good cast.
         """
         if not self._settings["water_check"]:
             return
@@ -338,14 +367,15 @@ class AutoFishing(Plugin):
             self._dry_reads = 0
             return
         if self._dry_reads >= DRY_CONFIRM:
-            log.info("[钓鱼] 浮标没落在水里，立刻重抛。")
+            log.info("[fishing] the bobber is not in water, recasting.")
             self._recast_soon()
 
     def _bobber_in_water(self) -> bool | None:
-        """浮标是否在水里。区块没加载或读不到方块时返回 None（不知道）。
+        """Whether the bobber is in water; None when we cannot tell.
 
-        未加载的区块所有格都读成 0 号状态（空气），不做这个区分就会把
-        「还没收到区块」当成「不是水」，于是不停重抛。
+        Every block of an unloaded chunk reads as state 0 (air), so without
+        this distinction "the chunk has not arrived" would look like "not
+        water" and the plugin would recast forever.
         """
         position = self._bobber_position()
         world = getattr(self.bot, "world", None)
@@ -366,15 +396,16 @@ class AutoFishing(Plugin):
         return False
 
     def _claim_candidate(self) -> None:
-        """spawn_window 过了还没认领到浮标：用候选兜底，并纠正 type_id。"""
+        """No bobber claimed before spawn_window ran out: take the candidate and
+        correct the type_id from it."""
         candidate = self._candidate
         if candidate is None:
             return
         entity_id, type_id, _ = candidate
         if type_id is not None and type_id != self._bobber_type:
             log.info(
-                f"[钓鱼] 注册表给的浮标 type_id={self._bobber_type} 没对上，"
-                f"改用实际生成的 type_id={type_id}。"
+                f"[fishing] the registry's bobber type_id={self._bobber_type} "
+                f"did not match; using the spawned type_id={type_id}."
             )
             self._bobber_type = type_id
         self._claim(entity_id, self._last_y)
@@ -404,7 +435,7 @@ class AutoFishing(Plugin):
         try:
             await bot.use_item(hand=self._settings["hand"])
         except Exception as error:
-            log.error(f"[钓鱼] 抛竿失败: {error}")
+            log.error(f"[fishing] casting failed: {error}")
             self._next_cast_at = time.monotonic() + 2.0
             return
         self._bobber_id = None
@@ -418,7 +449,8 @@ class AutoFishing(Plugin):
         self._cast_at = time.monotonic()
 
     async def _reel(self, *, caught: bool) -> None:
-        """收杆。``caught`` 区分「钓上来」与「超时/断线重抛」，只影响日志计数。"""
+        """Reel in. ``caught`` separates a catch from a timeout or a lost line;
+        it only affects the log and the counter."""
         bot = self.bot
         if bot is None or self._reeling:
             return
@@ -426,11 +458,11 @@ class AutoFishing(Plugin):
         try:
             await bot.use_item(hand=self._settings["hand"])
         except Exception as error:
-            log.error(f"[钓鱼] 收杆失败: {error}")
+            log.error(f"[fishing] reeling failed: {error}")
         if caught:
             self._catches += 1
             waited = time.monotonic() - self._cast_at
-            log.info(f"[钓鱼] 咬钩，已收杆（第 {self._catches} 条，等待 {waited:.1f}s）。")
+            log.info(f"[fishing] bite, reeled in (catch {self._catches}, waited {waited:.1f}s).")
         self._bobber_id = None
         self._baseline = None
         self._last_y = None
@@ -439,10 +471,11 @@ class AutoFishing(Plugin):
         self._state = "cooldown"
         self._next_cast_at = time.monotonic() + self._settings["recast_delay"]
 
-    # ---- 认领浮标 ----
+    # ---- Claiming the bobber ----
 
     def _registry_bobber_type(self) -> int | None:
-        """从服务端注册表查 fishing_bobber 的 type_id（协议 id 即条目下标）。"""
+        """Look fishing_bobber up in the server registry (the protocol id is
+        the entry index)."""
         registries = getattr(self.bot, "registries", None)
         if registries is None:
             return None
@@ -473,7 +506,8 @@ class AutoFishing(Plugin):
         if self._bobber_type is None:
             self._bobber_type = self._registry_bobber_type()
         if self._bobber_type is not None and type_id != self._bobber_type:
-            # 类型对不上就先记成候选：注册表下标算错时靠它兜底（见 _claim_candidate）
+            # Wrong type: keep it as the candidate, which covers a bad registry
+            # index (see _claim_candidate)
             if self._candidate is None:
                 self._candidate = (entity.entity_id, type_id, entity.y)
                 self._last_y = entity.y
@@ -485,15 +519,16 @@ class AutoFishing(Plugin):
     async def _on_entities_remove(self, entity_ids, removed) -> None:
         if self._bobber_id is not None and self._bobber_id in tuple(entity_ids):
             if self._state == "waiting" and not self._reeling:
-                # 浮标凭空消失（线断/换维度）：不算钓到，重抛
+                # The bobber vanished (line cut, dimension change): not a catch
                 self._recast_soon()
 
-    # ---- 咬钩判定：音效（最准） ----
+    # ---- Bite detection: the sound (most reliable) ----
 
     async def _on_packet(self, packet) -> None:
-        """位置型音效包：坐标落在浮标上就是咬钩。
+        """A positioned sound at the bobber is a bite.
 
-        ``packet`` 事件对每个入站包都会触发，所以第一步只做一次整数比较。
+        The ``packet`` event fires for every inbound packet, so the first step
+        is a single integer comparison.
         """
         wanted = self._sound_packet_id()
         if not wanted or packet.packet_id != wanted:
@@ -502,7 +537,7 @@ class AutoFishing(Plugin):
             return
         decoded = self._decode_sound(packet.payload)
         if decoded is None:
-            return  # 包 ID 配错或布局不符：当作没有音效路，交给另外两路
+            return  # Wrong id or layout: treat the sound path as absent
         sound_id, x, y, z = decoded
         position = self._bobber_position()
         if position is None:
@@ -513,21 +548,22 @@ class AutoFishing(Plugin):
             or abs(y - position[1]) > radius
             or abs(z - position[2]) > radius
         ):
-            return  # 甩竿/收杆的音效在玩家身上，别人钓鱼的在别处
+            return  # Our cast/reel plays at the player; other people elsewhere
         pinned = self._settings["sound_id"]
         expected = pinned if pinned is not None else self._learned_sound
         if expected is not None and sound_id != expected:
             return
         if expected is None and sound_id is not None:
             self._learned_sound = sound_id
-            log.info(f"[钓鱼] 已学到咬钩音效 ID={sound_id}，之后按它精确判定。")
+            log.info(f"[fishing] learned the bite-sound id={sound_id}; requiring it now.")
         await self._reel(caught=True)
 
     def _sound_packet_id(self) -> int:
-        """音效包 ID：设置里写死的优先，否则问当前版本的包表。
+        """The sound packet id: the setting wins, otherwise the version table.
 
-        版本表里为 0 表示这个版本的 ID 未经核实（例如 1.21.11），此时音效
-        这一路直接关掉——拿推断值去解析只会误判，另外两路信号足够兜住。
+        0 in the table means this release's id is unverified (1.21.11, say), and
+        then the sound path is simply off -- decoding on a guess would only
+        misfire, and the other two signals cover it.
         """
         configured = self._settings.get("sound_packet_id")
         if configured:
@@ -538,8 +574,9 @@ class AutoFishing(Plugin):
         if not resolved and not self._warned_no_sound:
             self._warned_no_sound = True
             log.info(
-                "[钓鱼] 当前版本没有已核实的音效包 ID，音效判定已关闭"
-                "（改用速度/下沉两路；可在 fishing.json 里手填 sound_packet_id）。"
+                "[fishing] this release has no verified sound packet id, so "
+                "sound detection is off (velocity and drop still work; set "
+                "sound_packet_id in fishing.json to force it)."
             )
         return resolved
 
@@ -562,10 +599,12 @@ class AutoFishing(Plugin):
 
     @staticmethod
     def _decode_sound(payload: bytes):
-        """解析位置型音效包；布局不符返回 None（宁可不判也不误判）。
+        """Decode a positioned sound packet; None when the layout disagrees --
+        better no detection than a false one.
 
-        字段顺序：音效 holder（varint，0 = 内联 名称+bool+可选 float）、
-        分类 varint、x/y/z 定点整数（÷8）、音量 float、音调 float、种子 long。
+        Field order: sound holder (varint, 0 = inline name + bool + optional
+        float), category varint, x/y/z as fixed-point ints (/8), volume float,
+        pitch float, seed long.
         """
         try:
             reader = PacketReader(payload)
@@ -577,25 +616,26 @@ class AutoFishing(Plugin):
                 sound_id = None
             else:
                 sound_id = raw - 1
-            reader.read_varint()  # 分类
+            reader.read_varint()  # Category
             x = reader.read_int() / 8.0
             y = reader.read_int() / 8.0
             z = reader.read_int() / 8.0
-            reader.read_float()  # 音量
-            reader.read_float()  # 音调
-            reader.read_long()  # 随机种子
-            reader.expect_end()  # 严格校验：包 ID 配错时几乎必然在这里失败
+            reader.read_float()  # Volume
+            reader.read_float()  # Pitch
+            reader.read_long()  # Seed
+            reader.expect_end()  # Strict: a wrong packet id almost always
+            #                      fails right here
         except Exception:
             return None
         return sound_id, x, y, z
 
-    # ---- 咬钩判定（速度 / 下沉，均需先落稳） ----
+    # ---- Bite detection: velocity and drop, both after settling ----
 
     async def _on_entity_motion(self, entity_id, velocity, entity) -> None:
         if not self._watching(entity_id):
             return
         if not self._armed:
-            return  # 还在飞行途中：抛出去时的初速度同样可能是向下的
+            return  # Still in flight: a cast's initial velocity can be downward
         threshold = self._settings["bite_velocity"]
         if threshold < 0 and velocity[1] <= threshold:
             await self._reel(caught=True)
@@ -617,10 +657,11 @@ class AutoFishing(Plugin):
         )
 
     async def _check_dip(self, y: float) -> None:
-        """看浮标是否被从静止水面拽了下去。
+        """Whether the bobber was pulled below the resting water line.
 
-        基准线由 :meth:`_arm` 在落水延时之后确立，不再依赖「连续几次几乎
-        不动」——水面上的浮标根本不发位置包，那种判定常常永远等不到。
+        The baseline comes from :meth:`_arm` after the settle delay rather than
+        from "several updates barely moved": a bobber on the water sends no
+        position packets at all, so that test often waits forever.
         """
         drop = self._settings["bite_drop"]
         self._last_y = y
