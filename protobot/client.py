@@ -51,9 +51,11 @@ from .state import (
     EquipmentSlot,
     ItemStack,
     PlayerAbilities,
+    PlayerListEntry,
     PlayerState,
     WorldSessionState,
 )
+from .text import plain_text
 from .world import BlockStateRegistry, World
 
 _MOVEMENT_EFFECTS = {
@@ -63,6 +65,20 @@ _MOVEMENT_EFFECTS = {
     29: "minecraft:dolphins_grace",
     36: "minecraft:weaving",
 }
+
+# Player Info Update 的动作位（1.21.4+ 共 8 个，正好一个字节的定长位集）。
+_PLAYER_INFO_ADD = 0x01
+_PLAYER_INFO_INIT_CHAT = 0x02
+_PLAYER_INFO_GAME_MODE = 0x04
+_PLAYER_INFO_LISTED = 0x08
+_PLAYER_INFO_LATENCY = 0x10
+_PLAYER_INFO_DISPLAY_NAME = 0x20
+_PLAYER_INFO_LIST_ORDER = 0x40
+_PLAYER_INFO_HAT = 0x80
+
+#: 进入 PLAY 后这么久之内收到的玩家列表算「初始名单」，不当成有人加入。
+#: 原版服务端把在线玩家一次发完，但代理有可能拆成几个包。
+_ROSTER_GRACE = 1.0
 
 _MOVEMENT_ATTRIBUTES_774 = {
     14: "minecraft:gravity",
@@ -273,6 +289,10 @@ class Bot:
         self.state = ConnectionState.DISCONNECTED
         self.player = PlayerState()
         self.entities: dict[int, EntityState] = {}
+        #: Tab list, keyed by profile UUID; drives player_join / player_leave.
+        self.players: dict[uuid.UUID, PlayerListEntry] = {}
+        self._roster_synced = False
+        self._roster_deadline = 0.0
         self.containers: dict[int, ContainerState] = {}
         self._active_container_id: int | None = None
         self.session = WorldSessionState()
@@ -484,6 +504,25 @@ class Bot:
         if self._active_container_id is None:
             return None
         return self.containers.get(self._active_container_id)
+
+    @property
+    def online_players(self) -> tuple[str, ...]:
+        """Names in the tab list, sorted; empty before the first roster.
+
+        This is who the server says is online, not who is nearby -- unlike
+        :attr:`entities`, it is not limited to the loaded chunks.
+        """
+
+        return tuple(sorted(entry.name for entry in self.players.values() if entry.name))
+
+    def find_player(self, name: str) -> PlayerListEntry | None:
+        """Look a tab-list entry up by name, case-insensitively."""
+
+        wanted = name.strip().lower()
+        for entry in self.players.values():
+            if entry.name.lower() == wanted:
+                return entry
+        return None
 
     async def click_container(
         self,
@@ -1243,6 +1282,9 @@ class Bot:
         self.session = WorldSessionState()
         self.session_id = None
         self.entities.clear()
+        self.players.clear()
+        self._roster_synced = False
+        self._roster_deadline = 0.0
         self.containers.clear()
         self._active_container_id = None
         self.registries = RegistryStore()
@@ -1545,6 +1587,16 @@ class Bot:
             await self._handle_player_combat_kill(packet.payload)
         elif ids.clientbound_set_health and packet.packet_id == ids.clientbound_set_health:
             await self._handle_set_health(packet.payload)
+        elif (
+            ids.clientbound_player_info_update
+            and packet.packet_id == ids.clientbound_player_info_update
+        ):
+            await self._handle_player_info_update(packet.payload)
+        elif (
+            ids.clientbound_player_info_remove
+            and packet.packet_id == ids.clientbound_player_info_remove
+        ):
+            await self._handle_player_info_remove(packet.payload)
         elif packet.packet_id == ids.clientbound_section_blocks_update:
             await self._handle_section_blocks_update(packet.payload)
         elif packet.packet_id == ids.clientbound_set_entity_data:
@@ -2679,6 +2731,10 @@ class Bot:
 
     def _handle_play_login(self, payload: bytes) -> None:
         reader = PacketReader(payload)
+        # 新一轮 PLAY：玩家列表从零开始，随后到来的名单算「初始名单」。
+        self.players.clear()
+        self._roster_synced = False
+        self._roster_deadline = time.monotonic() + _ROSTER_GRACE
         self.session.entity_id = reader.read_int()
         self.session.hardcore = reader.read_bool()
         level_count = reader.read_varint()
@@ -2746,6 +2802,123 @@ class Bot:
             return
         self.player.dead = True
         await self.events.emit("death", message)
+
+    async def _handle_player_info_update(self, payload: bytes) -> None:
+        """玩家列表更新：维护 :attr:`players`，新玩家发出 ``player_join``。
+
+        整个包先解析到一边再落库：动作位集是定长的（1.21.4+ 八个动作正好一
+        字节），下一个版本多加一个动作就会变成两字节，届时这里读出来的都是错
+        位数据。要求 ``expect_end()`` 恰好读完，一旦对不上就整包丢弃并发出
+        ``player_list_unparsed``——宁可没有加入/退出事件，也不要拿错位的字节
+        编出人名来。
+        """
+
+        try:
+            decoded = self._decode_player_info(payload)
+        except (ProtocolError, ValueError) as error:
+            await self.events.emit("player_list_unparsed", str(error), payload)
+            return
+        joined: list[PlayerListEntry] = []
+        for entry_uuid, name, game_mode, latency, listed, display_name in decoded:
+            entry = self.players.get(entry_uuid)
+            if entry is None:
+                entry = PlayerListEntry(uuid=entry_uuid)
+                self.players[entry_uuid] = entry
+                if name is not None:
+                    joined.append(entry)
+            if name is not None:
+                entry.name = name
+            if game_mode is not None:
+                entry.game_mode = game_mode
+            if latency is not None:
+                entry.latency = latency
+            if listed is not None:
+                entry.listed = listed
+            if display_name is not None:
+                entry.display_name = display_name
+        # 刚进服时服务端把全部在线玩家发过来，那不是「有人加入」。
+        if not self._roster_synced or time.monotonic() < self._roster_deadline:
+            self._roster_synced = True
+            await self.events.emit("player_list", tuple(self.players.values()))
+            return
+        for entry in joined:
+            if entry.uuid == self.uuid:
+                continue  # 自己出现在列表里不算加入
+            await self.events.emit("player_join", entry)
+
+    def _decode_player_info(
+        self, payload: bytes
+    ) -> list[tuple[uuid.UUID, str | None, int | None, int | None, bool | None, str | None]]:
+        reader = PacketReader(payload)
+        actions = reader.read_unsigned_byte()
+        count = reader.read_varint()
+        if not 0 <= count <= 4096:
+            raise ProtocolError(f"invalid player info entry count {count}")
+        decoded: list[
+            tuple[uuid.UUID, str | None, int | None, int | None, bool | None, str | None]
+        ] = []
+        for _ in range(count):
+            entry_uuid = reader.read_uuid()
+            name: str | None = None
+            game_mode: int | None = None
+            latency: int | None = None
+            listed: bool | None = None
+            display_name: str | None = None
+            if actions & _PLAYER_INFO_ADD:
+                name = reader.read_string(max_chars=16)
+                if not name or any(character < " " for character in name):
+                    raise ProtocolError(f"invalid player name {name!r}")
+                properties = reader.read_varint()
+                if not 0 <= properties <= 64:
+                    raise ProtocolError(f"invalid property count {properties}")
+                for _ in range(properties):
+                    reader.read_string(max_chars=64)  # Property name.
+                    reader.read_string(max_chars=32767)  # Value.
+                    if reader.read_bool():
+                        reader.read_string(max_chars=32767)  # Signature.
+            if actions & _PLAYER_INFO_INIT_CHAT and reader.read_bool():
+                reader.read_uuid()  # Chat session ID.
+                reader.read_long()  # Public key expiry.
+                reader.read_bytes(max_length=1 << 16)  # Public key.
+                reader.read_bytes(max_length=1 << 16)  # Key signature.
+            if actions & _PLAYER_INFO_GAME_MODE:
+                game_mode = reader.read_varint()
+            if actions & _PLAYER_INFO_LISTED:
+                listed = reader.read_bool()
+            if actions & _PLAYER_INFO_LATENCY:
+                latency = reader.read_varint()
+            if actions & _PLAYER_INFO_DISPLAY_NAME:
+                display_name = (
+                    plain_text(read_anonymous_nbt(reader)) if reader.read_bool() else ""
+                )
+            if actions & _PLAYER_INFO_LIST_ORDER:
+                reader.read_varint()  # Tab-list sort order.
+            if actions & _PLAYER_INFO_HAT:
+                reader.read_bool()  # Show hat.
+            decoded.append(
+                (entry_uuid, name, game_mode, latency, listed, display_name)
+            )
+        reader.expect_end()
+        return decoded
+
+    async def _handle_player_info_remove(self, payload: bytes) -> None:
+        """玩家列表移除：发出 ``player_leave``。"""
+
+        try:
+            reader = PacketReader(payload)
+            count = reader.read_varint()
+            if not 0 <= count <= 4096:
+                raise ProtocolError(f"invalid player removal count {count}")
+            removed_uuids = [reader.read_uuid() for _ in range(count)]
+            reader.expect_end()
+        except (ProtocolError, ValueError) as error:
+            await self.events.emit("player_list_unparsed", str(error), payload)
+            return
+        for entry_uuid in removed_uuids:
+            entry = self.players.pop(entry_uuid, None)
+            if entry is None or entry.uuid == self.uuid or not entry.name:
+                continue
+            await self.events.emit("player_leave", entry)
 
     def _read_spawn_info(self, reader: PacketReader) -> None:
         dimension_type_id = reader.read_varint()

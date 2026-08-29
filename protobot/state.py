@@ -120,6 +120,29 @@ class EntityState:
 
 
 @dataclass(slots=True)
+class PlayerListEntry:
+    """One tab-list row: who the server says is online.
+
+    Fields keep their last known value: the server sends partial updates
+    (latency alone, game mode alone), so only what a packet carries is
+    replaced.  ``name`` is empty when the entry was created by an update that
+    arrived without the add-player action.
+    """
+
+    uuid: uuid.UUID
+    name: str = ""
+    game_mode: int = 0
+    latency: int = 0
+    listed: bool = True
+    #: 显示名的纯文本（服务器未下发时为空串，回落到 ``name``）。
+    display_name: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.display_name or self.name or str(self.uuid)
+
+
+@dataclass(slots=True)
 class PlayerAbilities:
     """The six values carried by the clientbound player-abilities packet."""
 

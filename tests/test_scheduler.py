@@ -7,6 +7,7 @@ or the real plugins/scheduler.json).
 
 from __future__ import annotations
 
+import inspect
 import json
 import tempfile
 import time
@@ -24,6 +25,12 @@ class FakeBot:
         self.username = "FakeBot"
         self.sent_messages: list[str] = []
         self.sent_commands: list[str] = []
+        # 条件求值读这些字段（真 Bot 上是 PlayerState 与 tab 列表）
+        self.player = SimpleNamespace(
+            health=20.0, food=20, saturation=5.0, x=1.0, y=64.0, z=-2.0, dead=False
+        )
+        self.players: dict[str, object] = {}
+        self.entities: dict[int, object] = {}
 
     async def send_message(self, text: str) -> None:
         self.sent_messages.append(text)
@@ -46,6 +53,10 @@ def make_task(**overrides) -> dict:
         "name": "t",
         "interval": 5.0,
         "time": None,
+        "event": None,
+        "condition": None,
+        "cooldown": 0.0,
+        "match": None,
         "action": "chat",
         "text": "hi",
         "enabled": True,
@@ -359,7 +370,8 @@ class ExposedServiceTest(unittest.IsolatedAsyncioTestCase):
             name="b", interval=60, text="y", enabled=False
         )
         self.assertEqual(
-            await self.plugin._service_status(), "2 scheduled task(s), 1 enabled"
+            await self.plugin._service_status(),
+            "2 scheduled task(s), 1 enabled, 0 event-triggered, 0 with a condition",
         )
 
     async def test_hand_written_extra_fields_survive_a_rewrite(self) -> None:
@@ -479,6 +491,414 @@ class SecondsUntilTest(unittest.TestCase):
         delta = self.plugin._seconds_until("00:00")
         self.assertGreater(delta, 0.0)
         self.assertLessEqual(delta, 86400.0)
+
+
+def scheduler_module():
+    """The loaded plugin module, for its module-level helpers."""
+    manager = PluginManager([SCHEDULER_FILE.parent])
+    manager.discover()
+    return inspect.getmodule(type(manager.plugins["scheduler"]))
+
+
+class ConditionParsingTest(unittest.TestCase):
+    """条件字符串的解析（不 eval，写错的条件在 add 时就被拒）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = scheduler_module()
+
+    def parse(self, text: str):
+        return self.module.parse_condition(text)
+
+    def test_single_comparison(self) -> None:
+        clauses, error = self.parse("health < 8")
+        self.assertEqual(error, "")
+        self.assertEqual(clauses, (("health", "<", 8.0),))
+
+    def test_multiple_clauses_joined_by_and(self) -> None:
+        clauses, _ = self.parse("players >= 2 and dead == false")
+        self.assertEqual(clauses, (("players", ">=", 2.0), ("dead", "==", 0.0)))
+
+    def test_booleans_become_numbers(self) -> None:
+        clauses, _ = self.parse("dead == TRUE")
+        self.assertEqual(clauses, (("dead", "==", 1.0),))
+
+    def test_all_operators_parse(self) -> None:
+        for operator in ("<", "<=", ">", ">=", "==", "!="):
+            clauses, error = self.parse(f"food {operator} 10")
+            self.assertEqual(error, "", operator)
+            self.assertEqual(clauses[0][1], operator)
+
+    def test_unknown_variable_is_rejected(self) -> None:
+        clauses, error = self.parse("mana < 5")
+        self.assertIsNone(clauses)
+        self.assertIn("unknown condition variable", error)
+
+    def test_or_is_rejected_with_advice(self) -> None:
+        clauses, error = self.parse("health < 5 or food < 5")
+        self.assertIsNone(clauses)
+        self.assertIn("does not support 'or'", error)
+
+    def test_garbage_is_rejected(self) -> None:
+        for text in ("health", "health <", "< 5", "health ~ 5"):
+            clauses, error = self.parse(text)
+            self.assertIsNone(clauses, text)
+            self.assertTrue(error)
+
+    def test_non_numeric_value_is_rejected(self) -> None:
+        clauses, error = self.parse("health < lots")
+        self.assertIsNone(clauses)
+        self.assertIn("must be a number", error)
+
+    def test_comparison_helper(self) -> None:
+        compare = self.module.compare
+        self.assertTrue(compare(1.0, "<", 2.0))
+        self.assertTrue(compare(2.0, "<=", 2.0))
+        self.assertTrue(compare(3.0, ">", 2.0))
+        self.assertTrue(compare(2.0, ">=", 2.0))
+        self.assertTrue(compare(2.0, "==", 2.0))
+        self.assertTrue(compare(1.0, "!=", 2.0))
+        self.assertFalse(compare(2.0, "!=", 2.0))
+
+
+class TriggerNormalizeTest(unittest.IsolatedAsyncioTestCase):
+    """新字段的校验：文件加载与 add/set 共用同一份规则。"""
+
+    def setUp(self) -> None:
+        self.manager = PluginManager([SCHEDULER_FILE.parent])
+        self.manager.discover()
+        self.plugin = self.manager.plugins["scheduler"]
+
+    def normalize(self, **fields):
+        return self.plugin._normalize({"name": "t", "text": "hi", **fields})
+
+    def test_event_task_needs_no_interval(self) -> None:
+        task, error = self.normalize(event="player_join")
+        self.assertEqual(error, "")
+        self.assertEqual(task["event"], "player_join")
+        self.assertIsNone(task["interval"])
+
+    def test_condition_task_needs_no_interval(self) -> None:
+        task, error = self.normalize(condition="health < 8")
+        self.assertEqual(error, "")
+        self.assertEqual(task["condition"], "health < 8")
+
+    def test_unknown_event_is_rejected(self) -> None:
+        task, error = self.normalize(event="player_sneezed")
+        self.assertIsNone(task)
+        self.assertIn("event must be one of", error)
+
+    def test_bad_condition_is_rejected_at_creation(self) -> None:
+        task, error = self.normalize(condition="mana < 5")
+        self.assertIsNone(task)
+        self.assertIn("unknown condition variable", error)
+
+    def test_no_trigger_at_all_is_rejected(self) -> None:
+        task, error = self.normalize()
+        self.assertIsNone(task)
+        self.assertIn("provide interval, time, event", error)
+
+    def test_negative_cooldown_is_rejected(self) -> None:
+        task, error = self.normalize(interval=60, cooldown=-1)
+        self.assertIsNone(task)
+        self.assertIn("cooldown cannot be negative", error)
+
+    def test_match_requires_an_event(self) -> None:
+        task, error = self.normalize(interval=60, match="Steve")
+        self.assertIsNone(task)
+        self.assertIn("match only applies", error)
+
+    def test_describe_mentions_the_trigger(self) -> None:
+        task, _ = self.normalize(event="player_join", match="Steve", cooldown=30)
+        described = self.plugin._describe(task)
+        self.assertIn("on player_join", described)
+        self.assertIn("matching 'Steve'", described)
+        self.assertIn("at most every 30s", described)
+
+    def test_describe_distinguishes_trigger_from_gate(self) -> None:
+        trigger, _ = self.normalize(condition="health < 8")
+        gate, _ = self.normalize(interval=60, condition="health < 8")
+        self.assertIn("when health < 8", self.plugin._describe(trigger))
+        self.assertIn("only while health < 8", self.plugin._describe(gate))
+
+    async def test_add_accepts_an_event_task_through_the_service(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.plugin._file = Path(tmp) / "scheduler.json"
+            result = await self.plugin._service_add(
+                name="greet", event="player_join", text="hi {player}"
+            )
+            self.assertIn("greet", result)
+            stored = json.loads(self.plugin._file.read_text(encoding="utf-8"))
+            self.assertEqual(stored["tasks"][0]["event"], "player_join")
+
+    async def test_add_rejects_a_broken_condition_through_the_service(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.plugin._file = Path(tmp) / "scheduler.json"
+            result = await self.plugin._service_add(
+                name="bad", condition="health <", text="x"
+            )
+            self.assertIn("Cannot add task", result)
+
+
+class EventTriggerTest(unittest.IsolatedAsyncioTestCase):
+    """player_join / player_leave / death / respawn 触发的任务。"""
+
+    def setUp(self) -> None:
+        self.manager = PluginManager([SCHEDULER_FILE.parent])
+        self.manager.discover()
+        self.plugin = self.manager.plugins["scheduler"]
+        self.plugin.manager = self.manager
+        self.plugin._file = None
+        self.plugin.bot = FakeBot()
+
+    def install(self, task: dict) -> None:
+        self.plugin._tasks = [task]
+
+    async def test_player_join_sends_chat_with_the_name(self) -> None:
+        self.install(
+            make_task(interval=None, event="player_join", text="欢迎 {player}!")
+        )
+        await self.plugin._on_player_join(SimpleNamespace(name="Steve"))
+        self.assertEqual(self.plugin.bot.sent_messages, ["欢迎 Steve!"])
+
+    async def test_player_leave_fires_its_own_task_only(self) -> None:
+        self.plugin._tasks = [
+            make_task(name="in", interval=None, event="player_join", text="in"),
+            make_task(name="out", interval=None, event="player_leave", text="out"),
+        ]
+        await self.plugin._on_player_leave(SimpleNamespace(name="Steve"))
+        self.assertEqual(self.plugin.bot.sent_messages, ["out"])
+
+    async def test_death_message_is_rendered_as_plain_text(self) -> None:
+        self.install(
+            make_task(interval=None, event="death", text="我死了: {message}")
+        )
+        await self.plugin._on_death(
+            {"translate": "death.attack.mob", "with": ["mie_233", "Zombie"]}
+        )
+        self.assertEqual(
+            self.plugin.bot.sent_messages, ["我死了: mie_233 was slain by Zombie"]
+        )
+
+    async def test_death_without_a_message(self) -> None:
+        self.install(make_task(interval=None, event="death", text="[{message}]"))
+        await self.plugin._on_death(None)
+        self.assertEqual(self.plugin.bot.sent_messages, ["[]"])
+
+    async def test_respawn_runs_a_command(self) -> None:
+        self.install(
+            make_task(interval=None, event="respawn", action="command", text="spawn")
+        )
+        await self.plugin._on_respawn(None)
+        self.assertEqual(self.plugin.bot.sent_commands, ["spawn"])
+
+    async def test_disabled_event_task_stays_quiet(self) -> None:
+        self.install(
+            make_task(interval=None, event="player_join", enabled=False)
+        )
+        await self.plugin._on_player_join(SimpleNamespace(name="Steve"))
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_match_filters_by_player_name(self) -> None:
+        self.install(
+            make_task(interval=None, event="player_join", match="wumie", text="hi")
+        )
+        await self.plugin._on_player_join(SimpleNamespace(name="Steve"))
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+        await self.plugin._on_player_join(SimpleNamespace(name="_ImWuMie"))
+        self.assertEqual(self.plugin.bot.sent_messages, ["hi"])
+
+    async def test_cooldown_suppresses_a_burst(self) -> None:
+        """十个人同时进服不该发十条消息。"""
+        self.install(
+            make_task(interval=None, event="player_join", cooldown=60.0, text="hi")
+        )
+        for name in ("a", "b", "c"):
+            await self.plugin._on_player_join(SimpleNamespace(name=name))
+        self.assertEqual(self.plugin.bot.sent_messages, ["hi"])
+
+    async def test_condition_gates_an_event_task(self) -> None:
+        self.install(
+            make_task(
+                interval=None,
+                event="player_join",
+                condition="health < 10",
+                text="hi",
+            )
+        )
+        await self.plugin._on_player_join(SimpleNamespace(name="Steve"))
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+        self.plugin.bot.player.health = 4.0
+        await self.plugin._on_player_join(SimpleNamespace(name="Steve"))
+        self.assertEqual(self.plugin.bot.sent_messages, ["hi"])
+
+    async def test_event_task_is_not_run_by_the_timer(self) -> None:
+        self.install(make_task(interval=None, event="player_join"))
+        self.plugin._next_run = {"t": time.monotonic() - 1.0}
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_events_while_disconnected_do_nothing(self) -> None:
+        self.install(make_task(interval=None, event="player_join"))
+        self.plugin.bot = None
+        await self.plugin._on_player_join(SimpleNamespace(name="Steve"))  # 不抛
+
+    async def test_handler_failure_is_isolated_by_the_framework(self) -> None:
+        """订阅是通过框架注册的，所以异常只会被记录，不会打断连接。"""
+        events = [event for event, _ in self.plugin._subscriptions]
+        self.assertEqual(
+            sorted(events), ["death", "player_join", "player_leave", "respawn"]
+        )
+
+
+class ConditionTriggerTest(unittest.IsolatedAsyncioTestCase):
+    """只有 condition 的任务：上升沿触发一次。"""
+
+    def setUp(self) -> None:
+        self.manager = PluginManager([SCHEDULER_FILE.parent])
+        self.manager.discover()
+        self.plugin = self.manager.plugins["scheduler"]
+        self.plugin.manager = self.manager
+        self.plugin._file = None
+        self.plugin.bot = FakeBot()
+        self.plugin._tasks = [
+            make_task(interval=None, condition="health < 8", text="血量 {health}")
+        ]
+
+    async def test_fires_when_the_condition_becomes_true(self) -> None:
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+        self.plugin.bot.player.health = 5.0
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_messages, ["血量 5"])
+
+    async def test_stays_quiet_while_the_condition_holds(self) -> None:
+        self.plugin.bot.player.health = 5.0
+        await self.plugin._run_due()
+        await self.plugin._run_due()
+        await self.plugin._run_due()
+        self.assertEqual(len(self.plugin.bot.sent_messages), 1)
+
+    async def test_fires_again_after_the_condition_clears(self) -> None:
+        self.plugin.bot.player.health = 5.0
+        await self.plugin._run_due()
+        self.plugin.bot.player.health = 20.0
+        await self.plugin._run_due()
+        self.plugin.bot.player.health = 3.0
+        await self.plugin._run_due()
+        self.assertEqual(len(self.plugin.bot.sent_messages), 2)
+
+    async def test_cooldown_blocks_the_second_edge(self) -> None:
+        self.plugin._tasks = [
+            make_task(interval=None, condition="health < 8", cooldown=60.0)
+        ]
+        self.plugin.bot.player.health = 5.0
+        await self.plugin._run_due()
+        self.plugin.bot.player.health = 20.0
+        await self.plugin._run_due()
+        self.plugin.bot.player.health = 5.0
+        await self.plugin._run_due()
+        self.assertEqual(len(self.plugin.bot.sent_messages), 1)
+
+    async def test_condition_gates_an_interval_task_without_losing_its_slot(self) -> None:
+        self.plugin._tasks = [
+            make_task(interval=5.0, condition="health < 8", text="low")
+        ]
+        self.plugin._next_run = {"t": time.monotonic() - 1.0}
+        before = time.monotonic()
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+        self.assertGreater(self.plugin._next_run["t"], before + 4.0)
+
+    async def test_dead_condition_uses_the_player_flag(self) -> None:
+        self.plugin._tasks = [
+            make_task(interval=None, condition="dead == true", text="躺了")
+        ]
+        await self.plugin._run_due()
+        self.plugin.bot.player.dead = True
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_messages, ["躺了"])
+
+    async def test_players_condition_counts_the_tab_list(self) -> None:
+        self.plugin._tasks = [
+            make_task(interval=None, condition="players >= 2", text="人多了")
+        ]
+        await self.plugin._run_due()
+        self.plugin.bot.players = {"a": 1, "b": 2}
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_messages, ["人多了"])
+
+    async def test_changing_the_condition_reopens_the_edge(self) -> None:
+        """改过条件的任务重新求值，否则新条件的第一次上升沿会被吃掉。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.plugin._file = Path(tmp) / "scheduler.json"
+            self.plugin._file.write_text(
+                json.dumps({"tasks": [
+                    {"name": "t", "condition": "health < 8", "text": "x"}
+                ]}),
+                encoding="utf-8",
+            )
+            self.plugin._load_tasks()
+            self.plugin.bot.player.health = 5.0
+            await self.plugin._run_due()
+            self.assertEqual(len(self.plugin.bot.sent_messages), 1)
+            self.plugin._file.write_text(
+                json.dumps({"tasks": [
+                    {"name": "t", "condition": "health < 6", "text": "x"}
+                ]}),
+                encoding="utf-8",
+            )
+            self.plugin._load_tasks()
+            await self.plugin._run_due()
+            self.assertEqual(len(self.plugin.bot.sent_messages), 2)
+
+
+class PlaceholderTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.manager = PluginManager([SCHEDULER_FILE.parent])
+        self.manager.discover()
+        self.plugin = self.manager.plugins["scheduler"]
+        self.plugin.manager = self.manager
+        self.plugin._file = None
+        self.plugin.bot = FakeBot()
+
+    async def test_state_placeholders_without_a_trigger(self) -> None:
+        self.plugin._tasks = [make_task(text="在 {x} {y} {z}，{food} 饱食度")]
+        self.plugin._next_run = {"t": time.monotonic() - 1.0}
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_messages, ["在 1.0 64.0 -2.0，20 饱食度"])
+
+    async def test_unknown_placeholder_is_left_alone(self) -> None:
+        """命令里的花括号不该被吃掉。"""
+        self.plugin._tasks = [
+            make_task(action="command", text="give @s stone{tag:1}")
+        ]
+        self.plugin._next_run = {"t": time.monotonic() - 1.0}
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_commands, ["give @s stone{tag:1}"])
+
+    async def test_bot_name_placeholder(self) -> None:
+        self.plugin._tasks = [make_task(text="我是 {bot}")]
+        self.plugin._next_run = {"t": time.monotonic() - 1.0}
+        await self.plugin._run_due()
+        self.assertEqual(self.plugin.bot.sent_messages, ["我是 FakeBot"])
+
+    async def test_remind_text_is_expanded_too(self) -> None:
+        calls: list[dict] = []
+
+        async def remind(text: str = "", source: str = "") -> str:
+            calls.append({"text": text, "source": source})
+            return "queued"
+
+        self.manager._services["llm_agent.remind"] = ExposedFunction(
+            plugin="llm_agent", name="remind", handler=remind
+        )
+        self.plugin._tasks = [
+            make_task(interval=None, event="player_join", action="remind",
+                      text="{player} 来了，打个招呼")
+        ]
+        await self.plugin._on_player_join(SimpleNamespace(name="Steve"))
+        self.assertEqual(calls[0]["text"], "Steve 来了，打个招呼")
 
 
 if __name__ == "__main__":

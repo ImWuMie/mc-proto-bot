@@ -18,7 +18,7 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 - **Client-side physics** — a 20 Hz deterministic physics engine that mirrors vanilla movement, including boats and hard entity collision.
 - **Navigation** — A\* path planning and execution over the decoded world with automatic replanning.
 - **Mod loader handshakes** — Forge, NeoForge, and Fabric client mod declarations, plus Velocity modern forwarding.
-- **Event bus** — subscribe to chat, chunk, entity, container, health/death, and raw packet events.
+- **Event bus** — subscribe to chat, chunk, entity, container, health/death, join/leave, and raw packet events.
 - **Plugin system & unified CLI** — plugins auto-discovered from `plugins/` with prerequisite declarations, dependency-ordered loading, exception isolation, and hot load/reload/close; `protobot login|run|plugins|setup` covers sign-in, connecting, and plugin management, with automatic reconnects.
 - **Diagnostic CLI** — live regression checks and movement traces against a local server.
 
@@ -85,7 +85,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from protobot import connect
+from protobot import connect, plain_text
 
 async def main():
     bot = await connect("127.0.0.1", username="MyBot")
@@ -105,6 +105,28 @@ async def main():
     async def on_close(reason):
         print("disconnected:", reason)
 
+    # Who is online, and when that changes. player_list is the roster the
+    # server sends at login, so join/leave really mean someone came or went.
+    @bot.on("player_join")
+    async def on_join(entry):
+        print("joined:", entry.name, "->", bot.online_players)
+
+    @bot.on("player_leave")
+    async def on_leave(entry):
+        print("left:", entry.name)
+
+    # This bot's own life cycle: death carries the death-message component
+    # (None when the signal came from health reaching 0), and the bot stays on
+    # the death screen until something calls bot.respawn() -- plugins/respawn.py
+    # does that for you.
+    @bot.on("death")
+    async def on_death(message):
+        print("died:", plain_text(message) if message else "?")
+
+    @bot.on("respawn")
+    async def on_respawn(session):
+        print("respawned in", session.dimension_name)
+
     await bot.send_message("hello from ProtoBot")
     await bot.send_command("say hello from ProtoBot")
     await asyncio.sleep(5)
@@ -112,6 +134,14 @@ async def main():
 
 asyncio.run(main())
 ```
+
+Chat components carry translation keys rather than sentences, and `plain_text()`
+formats them with the built-in `en_us` patterns — `{"translate": "chat.type.text",
+"with": ["Steve", "hi"]}` renders as `<Steve> hi`, and the whole vanilla death
+message set is included. A server-supplied `fallback` wins over the table; an
+unknown key is shown with its arguments appended rather than dropped. Add
+server-specific keys with `register_translations({...})`, or point
+`load_translations()` at a Mojang `en_us.json`.
 
 ### Server addresses and SRV records
 
@@ -458,9 +488,9 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 
 ### Scheduled tasks plugin (`scheduler`)
 
-`plugins/scheduler.py` runs chat messages and server commands on a schedule.
-Tasks live in `plugins/scheduler.json` (generated on first run with one
-disabled sample):
+`plugins/scheduler.py` runs chat messages and server commands on a schedule, on
+a game event, or when a state condition becomes true. Tasks live in
+`plugins/scheduler.json` (generated on first run with one disabled sample):
 
 ```json
 {
@@ -468,15 +498,39 @@ disabled sample):
     {"name": "evening", "time": "18:00", "action": "chat",
      "text": "Good evening!", "enabled": true},
     {"name": "cleanup", "interval": 1800, "action": "command",
-     "text": "say time to clear the drops", "enabled": true}
+     "text": "say time to clear the drops", "enabled": true},
+    {"name": "greet", "event": "player_join", "action": "chat",
+     "text": "welcome, {player}!", "cooldown": 5, "enabled": true},
+    {"name": "low health", "condition": "health < 8", "action": "remind",
+     "text": "only {health} health left, do something", "enabled": true}
   ]
 }
 ```
 
-- `interval` (seconds, minimum 5) repeats forever; `time` (`HH:MM`, 24-hour
-  local) fires once a day — give at least one. `action` is `chat` (say it),
-  `command` (run it), or `remind` (hand the text to the LLM agent and let it
-  decide what to do); `enabled: false` pauses a task.
+- Four ways to trigger, combinable: `interval` (seconds, minimum 5) repeats
+  forever; `time` (`HH:MM`, 24-hour local) fires once a day; `event` fires on a
+  game event (`player_join`, `player_leave`, `death`, `respawn`); `condition`
+  fires on a state expression. At least one is required.
+- **A `condition` on its own is a trigger** — it runs the task at the moment the
+  expression flips from false to true, once, not every second it stays true.
+  **Combined with `interval`/`time`/`event` it is a gate** instead: the task
+  fires on its own schedule, and a false condition skips that run.
+  Conditions are comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`) joined by
+  `and` over `health`, `food`, `players` (tab-list size), `entities`, `x`, `y`,
+  `z`, `dead`, `hour`, `minute` — for example `players > 4 and dead == false`.
+  There is no `or` and no arbitrary code: an expression is parsed, not
+  evaluated, and a bad one is rejected when the task is created rather than at
+  run time.
+- `cooldown` is the minimum number of seconds between two runs of the same task
+  — worth setting on a join greeter so ten people arriving at once do not
+  produce ten messages. `match` only triggers an event task when the event text
+  (player name, death message) contains that substring.
+- `text` may use placeholders, filled in as the task runs: `{player}`,
+  `{message}` (the death message), `{bot}`, `{health}`, `{food}`, `{players}`,
+  `{x}`, `{y}`, `{z}`, `{hour}`, `{minute}`. Anything else in braces is left
+  alone, so command syntax survives.
+- `action` is `chat` (say it), `command` (run it), or `remind` (hand the text to
+  the LLM agent and let it decide what to do); `enabled: false` pauses a task.
 - The file is re-read within 5 seconds of any change, so edits apply without
   restarting or hot-reloading the plugin. While the bot is disconnected, due
   tasks are postponed rather than dropped.
@@ -484,14 +538,17 @@ disabled sample):
   `scheduler.list`, `add`, `set`, `remove`, `run` (fire once now), and
   `status`, which reach the agent as tools automatically; everything except
   `list` and `status` is admin-only. So "every 30 minutes remind people to
-  eat" is enough to create a task in game, and "cancel the reminder" removes
-  it. Validation lives in the plugin, so the file, the services, and the agent
-  all obey one set of rules.
+  eat" is enough to create a task in game, and "greet anyone who joins" or
+  "tell me when my health drops below 8" creates an event or condition task the
+  same way. Validation lives in the plugin, so the file, the services, and the
+  agent all obey one set of rules.
 - **Waking the agent** — `action: remind` calls the exposed
   `llm_agent.remind`, so the text reaches the LLM as a reminder turn rather
   than being said verbatim: "every hour, check whether anyone needs help" lets
   it decide what to do, or stay quiet. Reminders carry no admin rights, and
   the task is skipped with a notice when no agent is loaded.
+- Event triggers need the tab-list packets, whose ids are unverified on
+  protocol 774 (1.21.11) — there, `player_join` / `player_leave` never fire.
 
 ### Auto-fishing plugin (`fishing`)
 
@@ -691,6 +748,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `settings.py` | Plugin companion files: defaults, deep merge, mtime hot reload, single-key writes |
 | `session.py` | `BotSession` reconnect loop and `BotContainer` |
 | `text.py` | Chat-component plain-text rendering (`plain_text`) |
+| `translations.py` | Built-in `en_us` patterns for translate keys, plus `register_translations` / `load_translations` |
 | `config.py` | Dependency-free YAML-subset codec for `config.yaml` |
 | `cli_app.py` | Unified CLI: `protobot login|run|plugins|setup` |
 | `tui.py` | Textual full-screen TUI (optional `tui` extra) with plain-log fallback |

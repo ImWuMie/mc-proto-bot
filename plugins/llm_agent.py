@@ -1638,6 +1638,10 @@ class LLMAgent(Plugin):
         chunk_count = len(getattr(world, "chunks", ())) if world is not None else "?"
         entity_count = len(getattr(bot, "entities", ()))
         lines.append(f"World: {chunk_count} chunks loaded, {entity_count} entities visible")
+        # tab 列表是服务端下发的在线名单，不受加载区块限制。
+        online = tuple(getattr(bot, "online_players", ()) or ())
+        if online:
+            lines.append(f"Online ({len(online)}): " + ", ".join(online))
         manager = self.manager
         if manager is not None:
             enabled = [plugin.name for plugin in manager.load_order()]
@@ -1945,6 +1949,13 @@ class LLMAgent(Plugin):
         if name:
             entity, display = self._find_player_entity(name)
             if entity is None:
+                # tab 列表能区分「在线但不在加载区块里」和「根本不在服务器上」
+                listed = bot.find_player(name) if hasattr(bot, "find_player") else None
+                if listed is not None:
+                    return (
+                        f"Player {listed.name} is online but out of range "
+                        "(not in a loaded chunk)"
+                    )
                 if display is None:
                     return f"Unknown player: {name} (no recent chat from them)"
                 return f"Player {name} is not visible nearby"

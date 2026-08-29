@@ -78,6 +78,10 @@ class PlayPacketIds:
     clientbound_set_health: int = 0
     clientbound_player_combat_kill: int = 0
     serverbound_client_command: int = 0
+    #: 玩家列表（tab list）增删，用于 player_join / player_leave 事件。
+    #: 同样以 0 表示「本版本未核实」。
+    clientbound_player_info_update: int = 0
+    clientbound_player_info_remove: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +223,10 @@ _PLAY_775_776 = PlayPacketIds(
     clientbound_set_health=0x68,  # 104: Float 血量, VarInt 饱食度, Float 饱和度
     clientbound_player_combat_kill=0x44,  # 68: VarInt 实体 ID + 死亡消息组件
     serverbound_client_command=0x0C,  # 12: 单个 VarInt，0 = perform respawn
+    # 69/70：紧跟 combat_kill，再往后是 player_look_at(0x47) 与
+    # player_position(0x48)——两侧都被本表里已核实的 ID 夹住，中间没有空位。
+    clientbound_player_info_remove=0x45,
+    clientbound_player_info_update=0x46,
     clientbound_add_entity=0x01,
     clientbound_custom_payload=0x18,
     clientbound_container_close=0x11,

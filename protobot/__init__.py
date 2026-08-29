@@ -59,7 +59,12 @@ from .protocol.versions import SUPPORTED_VERSIONS, VersionSpec, get_version
 from .session import BotContainer, BotSession, SessionConfig
 from .settings import PluginSettings, deep_merge
 from .srv import resolve_minecraft_srv
-from .text import plain_text
+from .text import format_translation, plain_text
+from .translations import (
+    TRANSLATIONS,
+    load_translations,
+    register_translations,
+)
 from .tui import ProtoBotApp, StdoutProxy, classify_submission, tui_enabled
 from .state import (
     ContainerState,
@@ -68,6 +73,7 @@ from .state import (
     EquipmentSlot,
     ItemStack,
     PlayerAbilities,
+    PlayerListEntry,
 )
 from .world import BlockStateDefinition, BlockStateRegistry, World
 
@@ -110,6 +116,7 @@ __all__ = [
     "PhysicsEngine",
     "PhysicsState",
     "PlayerAbilities",
+    "PlayerListEntry",
     "Plugin",
     "PluginError",
     "PluginManager",
@@ -121,6 +128,7 @@ __all__ = [
     "StaticCollisionWorld",
     "StdoutProxy",
     "StatusEffect",
+    "TRANSLATIONS",
     "UnsupportedVersion",
     "Vec3",
     "VersionSpec",
@@ -128,9 +136,12 @@ __all__ = [
     "classify_submission",
     "connect",
     "deep_merge",
+    "format_translation",
     "get_version",
+    "load_translations",
     "make_adapter",
     "plain_text",
+    "register_translations",
     "resolve_minecraft_srv",
     "minecraft_sha1_digest",
     "MinecraftProfile",

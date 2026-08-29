@@ -18,7 +18,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **客户端物理**——20 Hz 确定性物理引擎，精确复刻原版移动逻辑，含船载物理与实体硬碰撞。
 - **导航寻路**——基于解码后世界的 A\* 路径规划与执行，支持自动重规划。
 - **模组加载器握手**——支持 Forge、NeoForge、Fabric 客户端模组声明，以及 Velocity modern forwarding。
-- **事件总线**——可订阅聊天、区块、实体、容器、血量/死亡与原始数据包事件。
+- **事件总线**——可订阅聊天、区块、实体、容器、血量/死亡、玩家加入/退出与原始数据包事件。
 - **插件系统与统一 CLI**——`plugins/` 目录自动发现插件，支持前置插件依赖、拓扑排序加载、异常隔离、热加载/热重载/热关闭；`protobot login|run|plugins|setup` 一个命令搞定授权、连服与插件管理，掉线自动重连。
 - **诊断 CLI**——针对本地服务器的在线回归检查与移动轨迹采集。
 
@@ -85,7 +85,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from protobot import connect
+from protobot import connect, plain_text
 
 async def main():
     bot = await connect("127.0.0.1", username="MyBot")
@@ -104,6 +104,27 @@ async def main():
     async def on_close(reason):
         print("断开连接:", reason)
 
+    # 谁在线、什么时候变化。进服时的整份名单走 player_list，
+    # 所以 join/leave 真的就是有人来了、有人走了。
+    @bot.on("player_join")
+    async def on_join(entry):
+        print("加入:", entry.name, "->", bot.online_players)
+
+    @bot.on("player_leave")
+    async def on_leave(entry):
+        print("退出:", entry.name)
+
+    # 自己的生死：death 带死亡消息组件（血量归零那一路为 None），
+    # 死后会一直停在死亡界面，直到有人调用 bot.respawn()——
+    # plugins/respawn.py 会替你做这件事。
+    @bot.on("death")
+    async def on_death(message):
+        print("死亡:", plain_text(message) if message else "?")
+
+    @bot.on("respawn")
+    async def on_respawn(session):
+        print("重生于", session.dimension_name)
+
     await bot.send_message("hello from ProtoBot")
     await bot.send_command("say hello from ProtoBot")
     await asyncio.sleep(5)
@@ -111,6 +132,13 @@ async def main():
 
 asyncio.run(main())
 ```
+
+聊天组件里装的是翻译键而不是句子，`plain_text()` 会用内置的 `en_us` 模式
+把它**格式化**出来：`{"translate": "chat.type.text", "with": ["Steve", "hi"]}`
+渲染成 `<Steve> hi`，原版全套死亡消息也都在表里。服务器自带的 `fallback`
+优先于内置表；表里没有的键会连同参数一起显示，而不是把内容丢掉。服务器自定义
+的键用 `register_translations({...})` 补，或者用 `load_translations()` 直接读
+一份 Mojang 的 `en_us.json`。
 
 ### 服务器地址与 SRV 记录
 
@@ -416,8 +444,9 @@ class HelloReply(Plugin):
 
 ### 定时任务插件（scheduler）
 
-`plugins/scheduler.py` 按计划自动发送聊天或执行服务器命令。任务存放在
-`plugins/scheduler.json`（首次运行生成，内含一个默认禁用的示例）：
+`plugins/scheduler.py` 按时间、游戏事件或状态条件自动发送聊天、执行服务器
+命令。任务存放在 `plugins/scheduler.json`（首次运行生成，内含一个默认禁用的
+示例）：
 
 ```json
 {
@@ -425,26 +454,48 @@ class HelloReply(Plugin):
     {"name": "晚间问候", "time": "18:00", "action": "chat",
      "text": "晚上好！", "enabled": true},
     {"name": "清理提醒", "interval": 1800, "action": "command",
-     "text": "say 该清理掉落物啦", "enabled": true}
+     "text": "say 该清理掉落物啦", "enabled": true},
+    {"name": "迎新", "event": "player_join", "action": "chat",
+     "text": "欢迎 {player}！", "cooldown": 5, "enabled": true},
+    {"name": "血量告警", "condition": "health < 8", "action": "remind",
+     "text": "血量只剩 {health} 了，想想办法", "enabled": true}
   ]
 }
 ```
 
-- `interval`（秒，最小 5）循环执行；`time`（`HH:MM` 24 小时本地时间）每天
-  执行一次——两者至少给一个。`action` 为 `chat`（发聊天）、`command`
-  （执行命令）或 `remind`（把内容交给 LLM 智能体，由它决定说什么、做什么）；
-  `enabled: false` 暂停该任务。
+- 四种触发方式可以组合，至少给一个：`interval`（秒，最小 5）循环执行；
+  `time`（`HH:MM` 24 小时本地时间）每天一次；`event` 由游戏事件触发
+  （`player_join`、`player_leave`、`death`、`respawn`）；`condition` 由状态
+  条件触发。
+- **`condition` 单独出现时是触发器**——条件由假变真的那一刻执行一次，而不是
+  「条件为真就每秒来一遍」；**与 `interval`/`time`/`event` 同时出现时是开关**，
+  到点或事件发生时条件不成立就跳过这一次。条件是比较式（`<`、`<=`、`>`、
+  `>=`、`==`、`!=`）用 `and` 连接，变量有 `health`、`food`、`players`（tab
+  列表人数）、`entities`、`x`、`y`、`z`、`dead`、`hour`、`minute`，例如
+  `players > 4 and dead == false`。不支持 `or`，也不会 eval 任何代码：条件是
+  被解析的，写错在建任务的那一刻就被拒绝，而不是等到执行时才炸。
+- `cooldown` 是同一任务两次执行的最小间隔（秒）——迎新任务值得设一下，
+  否则十个人同时进服就会发十条。`match` 只在事件内容（玩家名、死亡消息）
+  包含该子串时才触发。
+- `text` 支持占位符，执行时替换：`{player}`、`{message}`（死亡消息）、
+  `{bot}`、`{health}`、`{food}`、`{players}`、`{x}`、`{y}`、`{z}`、`{hour}`、
+  `{minute}`。其他花括号内容原样保留，命令语法不会被吃掉。
+- `action` 为 `chat`（发聊天）、`command`（执行命令）或 `remind`（把内容交给
+  LLM 智能体，由它决定说什么、做什么）；`enabled: false` 暂停该任务。
 - 文件改动后 5 秒内自动重新加载，无需重启或热重载插件。未连接服务器时到期
   任务顺延，不会丢失。
 - **LLM 智能体可以直接管理这些任务**：插件暴露了 `scheduler.list` / `add` /
   `set` / `remove` / `run`（立即执行一次）/ `status`，会自动成为智能体的工具，
   除 `list`、`status` 外都仅限管理员。在游戏里说「每 30 分钟提醒大家吃饭」
-  就能建好任务，说「把提醒取消」就能删掉。校验规则只写在插件里，所以文件、
-  服务调用、智能体三条路径遵守同一套规则。
+  就能建好任务，说「有人进服就打个招呼」「血量低于 8 就告诉我」同样能建出
+  事件/条件任务。校验规则只写在插件里，所以文件、服务调用、智能体三条路径
+  遵守同一套规则。
 - **叫醒智能体**：`action: remind` 调用暴露出来的 `llm_agent.remind`，内容作为
   「提醒」进入 LLM 而不是被原样念出来——「每小时看看有没有人需要帮忙」这种任务
   就由它自己决定做什么、或者干脆不说话。提醒不携带管理员权限；没装智能体插件时
   任务会被跳过并提示。
+- 事件触发依赖玩家列表的两个包，它们在协议 774（1.21.11）上未经核实——
+  那个版本上 `player_join` / `player_leave` 不会触发。
 
 ### 自动钓鱼插件（fishing）
 
@@ -614,6 +665,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `settings.py` | 插件伴生配置：默认值、深合并、mtime 热重载、单键写回 |
 | `session.py` | `BotSession` 会话（重连循环）与 `BotContainer` 容器 |
 | `text.py` | 聊天组件转纯文本（`plain_text`） |
+| `translations.py` | 内置 `en_us` 翻译表，含 `register_translations` / `load_translations` |
 | `config.py` | 零依赖的 YAML 子集编解码（`config.yaml`） |
 | `cli_app.py` | 统一 CLI：`protobot login|run|plugins|setup` |
 | `tui.py` | Textual 全屏 TUI（可选 `tui` extra）与普通日志降级 |

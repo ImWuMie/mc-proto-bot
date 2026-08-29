@@ -76,6 +76,21 @@ Containers/inventory:
 - `container_content` (ContainerState) · `container_slot` (ContainerState, slot)
 - `container_close` (ContainerState)
 
+Players (tab list, i.e. who is online -- not limited to loaded chunks):
+- `player_join` (PlayerListEntry) · `player_leave` (PlayerListEntry) — someone
+  else came or went. The entry has `uuid`, `name`, `game_mode`, `latency`,
+  `listed`, `display_name`, and `label` (display name or name). The bot's own
+  entry never fires either event.
+- `player_list` (tuple[PlayerListEntry, ...]) — the roster the server sends
+  right after login. It is **not** a burst of `player_join`, so a greeter does
+  not welcome everyone who was already online.
+- `player_list_unparsed` (reason, payload) — the packet did not decode, so the
+  list was left untouched (a future action bit would misalign every name).
+- Read the list any time: `bot.players` (dict keyed by UUID),
+  `bot.online_players` (sorted names), `bot.find_player(name)`.
+- Protocol 774 (1.21.11) has these packet ids unverified, so no events arrive
+  there; write plugins that simply see nobody joining rather than assuming.
+
 State/misc:
 - `position` (PlayerState) · `abilities` (PlayerAbilities) · `game_mode` (int)
 - `health` (health: float, food: int, saturation: float) — this bot's own health,
@@ -157,7 +172,8 @@ mod-loader events; ordinary plugins do not need them.
   player on its own. Raises `UnsupportedVersion` on versions where that packet
   id is unverified (protocol 774), so catch it and degrade instead of retrying
 - State: `bot.player` (PlayerState: x/y/z, health, food, dead, yaw/pitch), `bot.world`
-  (chunks), `bot.entities`, `bot.containers`, `bot.session`, `bot.username`,
+  (chunks), `bot.entities`, `bot.players` (tab list) / `bot.online_players` /
+  `bot.find_player(name)`, `bot.containers`, `bot.session`, `bot.username`,
   `bot.uuid`, `bot.closed` (asyncio.Event), `bot.disconnect_reason`
 - Manager: `self.manager` (PluginManager, bound while the plugin is enabled):
   `load_order()`, `plugins` (name → Plugin), `source_of(name)`,
@@ -166,8 +182,13 @@ mod-loader events; ordinary plugins do not need them.
   `hot_reload_file(path)`, `hot_close(name)` — a plugin can list, toggle, or
   hot-load other plugins (see plugins/llm_agent.py for a full example)
 - Text: `from protobot.text import plain_text` (str/dict/list component →
-  plain text; handles translate+fallback and the empty-key `{'': '123'}`
-  server-plugin quirk)
+  plain text). `translate` components are **formatted**, not concatenated: the
+  arguments go into the pattern (`chat.type.text` + `["Steve", "hi"]` →
+  `<Steve> hi`), taken from the server's `fallback`, then the built-in `en_us`
+  table in `protobot.translations` (chat, join/leave, all vanilla death
+  messages), then the bare key with its arguments appended. Add server keys with
+  `register_translations({...})` or `load_translations("en_us.json")`. Also
+  handles the empty-key `{'': '123'}` server-plugin quirk
 
 ## Exposing capabilities to other plugins (and to the LLM agent)
 
