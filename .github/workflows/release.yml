@@ -33,7 +33,9 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-          - os: ubuntu-latest
+          # ubuntu-22.04 builds against glibc 2.35, so the binary also runs on
+          # Debian 12 / Rocky 9 class systems; 24.04 (glibc 2.39) would not.
+          - os: ubuntu-22.04
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
