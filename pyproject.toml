@@ -12,6 +12,9 @@ online = [
 tui = [
     "textual>=1.0",
 ]
+qq = [
+    "qq-botpy>=1.0",
+]
 
 [dependency-groups]
 dev = [

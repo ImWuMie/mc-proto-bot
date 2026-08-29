@@ -426,10 +426,25 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
   "persona_file": "llm_agent_persona.md",
   "skills_dir": "../.claude/skills",
   "memory_dir": "llm_agent_memory",
-  "generated_dir": "../plugins_llm"
+  "generated_dir": "../plugins_llm",
+  "qq": {                       // optional QQ bot bridge (protobot[qq])
+    "enabled": false,
+    "appid": "",                // from the QQ open platform
+    "token": "",
+    "admin_ids": []             // QQ openids treated as admins ([] = none)
+  }
 }
 ```
 
+- **QQ bridge** (`qq`, off by default; needs `pip install protobot[qq]`) — the
+  same agent answers QQ messages: C2C private chats and group @-mentions reach
+  the queue like any other trigger, and the reply goes back through QQ instead
+  of Minecraft chat. The agent keeps working even while disconnected from the
+  server. Requires an appid/token from the QQ open platform; configure
+  `enabled`, `appid` and `token` in `llm_agent.json` (reloads within ~3
+  seconds). Requester names look like `[QQ] <openid>`; QQ users are **never**
+  admins unless their openid is in `admin_ids` (an unrestricted `admins` list
+  does not leak rights to strangers on QQ).
 - **A second model for the small talk** (`speaker`, off by default) — turning it
   on adds a `speak` tool that forwards a player's line, **word for word**, to a
   second model and sends back whatever it answers. That model gets **nothing

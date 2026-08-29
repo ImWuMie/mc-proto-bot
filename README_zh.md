@@ -401,10 +401,23 @@ class HelloReply(Plugin):
   "persona_file": "llm_agent_persona.md",
   "skills_dir": "../.claude/skills",
   "memory_dir": "llm_agent_memory",
-  "generated_dir": "../plugins_llm"
+  "generated_dir": "../plugins_llm",
+  "qq": {                       // 可选的 QQ 机器人桥接（protobot[qq]）
+    "enabled": false,
+    "appid": "",                // 来自 QQ 开放平台
+    "token": "",
+    "admin_ids": []             // 视为管理员的 QQ openid（[] = 无）
+  }
 }
 ```
 
+- **QQ 桥接**（`qq`，默认关闭；需要 `pip install protobot[qq]`）——同一个
+  agent 接进 QQ：C2C 私聊与群内 @ 消息像其他触发一样进队列，回复走 QQ 发回，
+  而不是发到 Minecraft 聊天。即使没连服务器也能工作。需要 QQ 开放平台的
+  appid/token，在 `llm_agent.json` 里配 `enabled`、`appid`、`token`（约 3 秒
+  生效）。请求者名字形如 `[QQ] <openid>`；QQ 用户**默认不是**管理员，只有
+  openid 在 `admin_ids` 里才算——`admins` 留空放开限制不会把权限漏给 QQ 上
+  的陌生人。
 - **副 AI 专管闲聊**（`speaker`，默认关闭）：打开后主 AI 多一个 `speak`
   工具——把某人说的那句话**原样**转给第二个模型，它回什么就发到聊天里。
   这个副 AI **什么都没有**：请求里只有一条 user 消息，没有系统提示词、没有
