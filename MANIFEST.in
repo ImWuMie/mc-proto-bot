@@ -1,2 +1,2 @@
-include LICENSE README.md README_zh.md protobot.bat protobot.sh release.py
+include LICENSE README.md README_zh.md protobot.bat protobot.sh release.py protobot.spec protobot_launcher.py
 recursive-include plugins *.py

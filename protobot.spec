@@ -14,7 +14,7 @@ textual_datas, textual_binaries, textual_hidden = collect_all("textual")
 rich_datas, rich_binaries, rich_hidden = collect_all("rich")
 
 a = Analysis(
-    ["protobot/cli_app.py"],
+    ["protobot_launcher.py"],
     pathex=["."],
     binaries=textual_binaries + rich_binaries,
     datas=(

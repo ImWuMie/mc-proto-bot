@@ -800,19 +800,28 @@ python -m compileall protobot plugins run_bot.py   # fast syntax check
 ## Building a release
 
 The version lives in one place, `protobot/__init__.py` (`__version__`), and the
-CLI echoes it: `protobot --version`. Everything needed at runtime -- including
-the bundled block-state tables under `protobot/data/` -- ships inside the
-wheel, so a release is just:
+CLI echoes it: `protobot --version`. One command builds the whole release:
 
 ```bash
-uv build                              # -> dist/protobot-x.y.z.tar.gz + .whl
-uv tool install dist/protobot-x.y.z-py3-none-any.whl   # try it clean
-protobot --version                    # sanity check the installed build
+uv sync --extra online --extra tui   # once: dev tools incl. PyInstaller
+python release.py                    # -> everything below, into dist/
 ```
 
-`dist/` is gitignored. The repo has a GitHub Actions workflow that builds on
-every `v*` tag and attaches the artifacts to the GitHub release, so publishing
-is:
+What a release ships:
+
+- **`protobot-x.y.z.tar.gz` / `.whl`** -- the pip/uv packages. The wheel
+  carries the block-state tables and the bundled example plugins;
+  `protobot setup` writes a starter `plugins/` directory next to the config,
+  so a pip install gets the plugin system and the same examples.
+- **`protobot-x.y.z-windows-amd64-portable.zip`** -- the self-contained
+  build: `protobot.exe` with its own Python runtime, plus the example
+  plugins and the READMEs. Extract it anywhere, run `protobot.exe` in a
+  terminal -- **nothing to install, no Python required**. The first run
+  walks through the setup wizard and the bot is ready.
+
+`release.py packages` / `release.py portable` build just one of the two.
+`dist/` is gitignored. The GitHub Actions workflow builds on every `v*` tag
+and attaches the artifacts to the GitHub release, so publishing is:
 
 ```bash
 git tag v1.0.0

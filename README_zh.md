@@ -712,17 +712,26 @@ python -m compileall protobot plugins run_bot.py   # 快速语法检查
 ## 构建发布
 
 版本号只有一处：`protobot/__init__.py` 里的 `__version__`，命令行会跟着显示：
-`protobot --version`。运行时所需的一切——包括 `protobot/data/` 下内置的
-方块状态表——都在 wheel 里，所以发布只需要：
+`protobot --version`。一条命令构建整个发布：
 
 ```bash
-uv build                              # 产出 dist/protobot-x.y.z.tar.gz 与 .whl
-uv tool install dist/protobot-x.y.z-py3-none-any.whl   # 干净环境试装
-protobot --version                    # 验证装出来的版本
+uv sync --extra online --extra tui   # 一次性：装齐开发工具（含 PyInstaller）
+python release.py                    # -> dist/ 下产出全部产物
 ```
 
-`dist/` 已加入 .gitignore。仓库里的 GitHub Actions 工作流会在推送 `v*` tag
-时自动构建并把产物挂到 GitHub Release 上，所以发布流程是：
+一次发布包含两种形态：
+
+- **`protobot-x.y.z.tar.gz` / `.whl`**——pip/uv 包。wheel 自带方块状态表与
+  内置示例插件；`protobot setup` 会在配置旁生成一个初始 `plugins/` 目录，
+  所以 pip 安装同样拥有完整的插件系统和示例。
+- **`protobot-x.y.z-windows-amd64-portable.zip`**——自包含构建：
+  `protobot.exe` 自带整套 Python 运行时，外加示例插件与说明文档。解压到
+  任意位置，在终端里运行 `protobot.exe` 即可——**什么都不用装，不需要
+  安装 Python**。首次运行会走一遍配置向导，之后 bot 即可启动。
+
+`release.py packages` / `release.py portable` 可以只构建其中一种。`dist/`
+已加入 .gitignore。仓库里的 GitHub Actions 工作流会在推送 `v*` tag 时自动
+构建并把产物挂到 GitHub Release 上，所以发布流程是：
 
 ```bash
 git tag v1.0.0
