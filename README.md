@@ -1,6 +1,6 @@
 # ProtoBot
 
-README (English only for now; translations can come back once the project has i18n)
+English | [简体中文](README_zh.md)
 
 A modern Python 3.12+ Minecraft protocol client supporting both **offline-mode** and **online-mode** (Mojang / Microsoft authenticated) servers.
 
