@@ -1,8 +1,8 @@
 [project]
 name = "protobot"
-version = "0.1.0"
 description = "Dependency-free Python Minecraft protocol client and bot library with online-mode support"
 requires-python = ">=3.12"
+dynamic = ["version"]
 dependencies = []
 
 [project.optional-dependencies]
@@ -13,12 +13,8 @@ tui = [
     "textual>=1.0",
 ]
 
-# Development-only tooling. Runtime stays dependency-free; the suite also runs
-# under ``python -m unittest`` with nothing installed at all.
 [dependency-groups]
-dev = [
-    "pytest>=8.0",
-]
+dev = []
 
 [project.scripts]
 protobot = "protobot.cli_app:main"
@@ -34,6 +30,9 @@ build-backend = "setuptools.build_meta"
 # discovery works. The explicit include keeps the top-level helper script
 # (``run_bot.py``), the plugin examples, and the test suite out of the
 # distribution.
+[tool.setuptools.dynamic]
+version = {attr = "protobot.__version__"}
+
 [tool.setuptools.packages.find]
 include = ["protobot*"]
 namespaces = false

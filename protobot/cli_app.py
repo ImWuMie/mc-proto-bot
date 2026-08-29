@@ -27,6 +27,7 @@ from . import (
 from .config import load_config, save_config
 from .log import info, set_sink
 from .plugin import PluginError, PluginManager, PluginWatcher
+from . import __version__
 from .protocol.versions import SUPPORTED_VERSIONS
 from .session import BotContainer, BotSession, SessionConfig
 from .tui import ProtoBotApp, StdoutProxy, tui_enabled
@@ -585,6 +586,9 @@ def list_plugins(args: argparse.Namespace) -> int:
 def _root_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="protobot", description="ProtoBot command-line tool"
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     sub = parser.add_subparsers(
         dest="command", required=True, metavar="{login,run,plugins,setup}"

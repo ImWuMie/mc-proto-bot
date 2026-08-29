@@ -228,10 +228,10 @@ DEFAULT_SETTINGS: dict = {
     "admins": [],  # Only these players may have the LLM write or toggle plugins
     #              (empty = no restriction)
     "history_limit": 200,  # Chat lines kept for the read_chat tool
-    "persona_file": "llm_agent_persona.md",  # Character sheet, re-read every time
+    "persona_file": "./llm_agent_persona.md",  # Character sheet, re-read every time
     "skills_dir": "../.claude/skills",  # One SKILL.md per subdirectory
-    "memory_dir": "llm_agent_memory",  # Memory root (one subdirectory per server)
-    "generated_dir": "../plugins_llm",  # Where LLM-written plugins go
+    "memory_dir": "./llm/memory",  # Memory root (one subdirectory per server)
+    "generated_dir": "./llm/plugins",  # Where LLM-written plugins go
 }
 
 

@@ -1,5 +1,7 @@
 """Public API for ProtoBot."""
 
+__version__ = "1.0.0"
+
 from .auth import (
     MinecraftProfile,
     authorization_code_login,
@@ -130,6 +132,7 @@ __all__ = [
     "StatusEffect",
     "TRANSLATIONS",
     "UnsupportedVersion",
+    "__version__",
     "Vec3",
     "VersionSpec",
     "World",

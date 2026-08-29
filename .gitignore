@@ -15,8 +15,8 @@ protobot-live.log
 
 # LLM 智能体插件数据（llm_agent.json 含 api_key，切勿提交）
 plugins/llm_agent.json
-plugins/llm_agent_persona.md
-plugins/llm_agent_memory/
+plugins/llm/llm_agent_persona.md
+plugins/llm/llm_agent_memory/
 plugins_llm/
 
 # 定时任务插件数据（运行时自动生成/修改）
@@ -29,3 +29,4 @@ plugins/fishing.json
 plugins/respawn.json
 
 /run/
+/plugins/llm/
