@@ -742,4 +742,5 @@ git push origin main --tags
 
 ## 许可证
 
-版权归仓库所有者所有。
+MIT，见 [LICENSE](LICENSE)。你可以自由使用、修改与再分发 ProtoBot，
+包括用在闭源和商业项目里——只要保留版权与许可声明即可。

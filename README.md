@@ -832,4 +832,6 @@ artifacts). Offline mode stays dependency-free in the wheel -- `[online]` and
 
 ## License
 
-All rights reserved by the repository owner.
+MIT. See [LICENSE](LICENSE). You can use, modify, and redistribute ProtoBot
+freely, including in closed-source and commercial projects, as long as the
+copyright and permission notices stay attached.
