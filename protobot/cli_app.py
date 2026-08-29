@@ -28,6 +28,7 @@ from .config import load_config, save_config
 from .log import info, set_sink
 from .plugin import PluginError, PluginManager, PluginWatcher
 from . import __version__
+from .examples import plugins as _examples_plugins
 from .protocol.versions import SUPPORTED_VERSIONS
 from .session import BotContainer, BotSession, SessionConfig
 from .tui import ProtoBotApp, StdoutProxy, tui_enabled
@@ -364,18 +365,53 @@ def run_setup(config_path: Path) -> int:
         "tui": {"enabled": True, "autostart": True},
     }
     save_config(config_path, data)
+    plugin_count = _write_starter_plugins(config_path)
 
     print("\n" + "=" * 60)
     print("[done] setup complete")
     print(f"Login: {'online (Microsoft)' if mode == 'online' else 'offline'}")
     print(f"Server: {host}:{port}  Version: {version}")
     print(f"Config written to: {config_path}")
+    if plugin_count:
+        print(f"Starter plugins written to: {config_path.parent / 'plugins'}")
+        print(
+            f"  ({plugin_count} example plugin(s); [plugins] directory in the "
+            "config decides where they load from)"
+        )
     print("=" * 60)
     print("Next:")
     if mode == "online":
         print("  1. run protobot login once to authorize your Microsoft account")
     print("  2. run protobot run (or right-click run_bot.py in PyCharm)")
     return 0
+
+
+def _write_starter_plugins(config_path: Path) -> int:
+    """Copy the bundled example plugins into a starter plugins/ directory.
+
+    Only fills a directory that does not exist yet -- a folder the user already
+    created, or one configured elsewhere, is left alone. The examples are the
+    same files shipped in the repository's plugins/ directory, so the portable
+    zip and a pip install behave identically.
+    """
+    directory = config_path.parent / "plugins"
+    if directory.exists():
+        return 0
+    source = Path(_examples_plugins.__file__).parent
+    copied = 0
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        for path in sorted(source.iterdir()):
+            if path.suffix != ".py" or path.name == "__init__.py":
+                continue
+            (directory / path.name).write_text(
+                path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            copied += 1
+    except OSError as error:
+        print(f"[note] could not write the starter plugins directory ({error})")
+        return 0
+    return copied
 
 
 # ======================== Subcommands ========================

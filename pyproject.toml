@@ -39,3 +39,4 @@ namespaces = false
 
 [tool.setuptools.package-data]
 "protobot.data" = ["*.json.gz"]
+"protobot.examples.plugins" = ["*.py"]

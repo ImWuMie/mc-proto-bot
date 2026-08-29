@@ -1,0 +1,2 @@
+include LICENSE README.md README_zh.md protobot.bat protobot.sh release.py
+recursive-include plugins *.py
