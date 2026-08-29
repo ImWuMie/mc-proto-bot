@@ -406,6 +406,7 @@ class HelloReply(Plugin):
     "enabled": false,
     "appid": "",                // 来自 QQ 开放平台
     "token": "",
+    "sandbox": false,           // bot 在沙箱环境时设为 true
     "admin_ids": []             // 视为管理员的 QQ openid（[] = 无）
   }
 }

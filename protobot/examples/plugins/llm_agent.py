@@ -228,7 +228,8 @@ DEFAULT_SETTINGS: dict = {
     "qq": {
         "enabled": False,
         "appid": "",  # From the QQ open platform
-        "token": "",  # Bot token
+        "token": "",  # Bot token / app secret
+        "sandbox": False,  # True when the bot lives in the sandbox environment
         "admin_ids": [],  # Openids treated as admins ([] = no QQ admins)
     },
     "reply": {
@@ -894,12 +895,17 @@ class LLMAgent(Plugin):
         token = str(self._settings["qq"].get("token") or "")
         intents = botpy.Intents(public_messages=True)
         try:
-            client = botpy.Client(intents=intents, log_level=30)
+            sandbox = bool(self._settings["qq"].get("sandbox", False))
+            client = botpy.Client(intents=intents, log_level=30, is_sandbox=sandbox)
             self._qq_client = client
             self._qq_loop = client.loop
             client.on_c2c_message_create = self._qq_on_c2c
             client.on_group_at_message_create = self._qq_on_group_at
-            log.info("[LLM] QQ bridge connected.")
+
+            async def on_ready():
+                log.info("[LLM] QQ bridge connected (gateway authenticated).")
+
+            client.on_ready = on_ready
             # botpy's start() takes appid + secret on current releases, while
             # older ones (and the docs) use token -- the config field is
             # "token" either way, so pass whichever the installed SDK wants.
@@ -957,6 +963,23 @@ class LLMAgent(Plugin):
             "key": (name, text),
         }
         loop.call_soon_threadsafe(queue.put_nowait, item)
+
+    async def _send_qq_reply(self, message, content: str) -> None:
+        """Send the reply through the QQ bridge.
+
+        botpy's aiohttp session is bound to the bridge thread's event loop
+        (the gateway handshake creates it there), so awaiting message.reply()
+        from the main loop fails with "Timeout context manager should be used
+        inside a task". The call therefore runs on the bridge loop via
+        run_coroutine_threadsafe, and we wait for it here.
+        """
+        loop = self._qq_loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError("the QQ bridge is not running")
+        future = asyncio.run_coroutine_threadsafe(
+            message.reply(content=content), loop
+        )
+        await asyncio.wrap_future(future)
 
     async def _qq_on_c2c(self, message) -> None:
         """C2C private message: anyone who DMs the bot is answered."""
@@ -1065,6 +1088,7 @@ class LLMAgent(Plugin):
         merged["qq"]["enabled"] = bool(merged["qq"].get("enabled", False))
         merged["qq"]["appid"] = str(merged["qq"].get("appid") or "").strip()
         merged["qq"]["token"] = str(merged["qq"].get("token") or "").strip()
+        merged["qq"]["sandbox"] = bool(merged["qq"].get("sandbox", False))
         merged["qq"]["admin_ids"] = [
             str(admin_id) for admin_id in (merged["qq"].get("admin_ids") or [])
         ]
@@ -1674,7 +1698,7 @@ class LLMAgent(Plugin):
                 if channel == "qq" and qq_reply is not None:
                     if content and content.upper() != "NO_REPLY":
                         try:
-                            await qq_reply.reply(content=content)
+                            await self._send_qq_reply(qq_reply, content)
                         except Exception as error:
                             log.error(f"[LLM] failed to send the QQ reply: {error}")
                     return content

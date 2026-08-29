@@ -1,6 +1,6 @@
 """Public API for ProtoBot."""
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 from .auth import (
     MinecraftProfile,

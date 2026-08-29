@@ -431,6 +431,7 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
     "enabled": false,
     "appid": "",                // from the QQ open platform
     "token": "",
+    "sandbox": false,           // true when the bot lives in the sandbox env
     "admin_ids": []             // QQ openids treated as admins ([] = none)
   }
 }
