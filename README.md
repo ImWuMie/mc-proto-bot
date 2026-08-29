@@ -432,7 +432,8 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
     "appid": "",                // from the QQ open platform
     "token": "",
     "sandbox": false,           // true when the bot lives in the sandbox env
-    "admin_ids": []             // QQ openids treated as admins ([] = none)
+    "admin_ids": [],            // QQ openids treated as admins ([] = none)
+    "trust_players": []         // MC players whose chat may be relayed to you on QQ
   }
 }
 ```
@@ -450,7 +451,9 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
   user/group that messages it (the openid is logged as "QQ contact
   learned"), and exposes `send_qq` (admin-only) plus `qq_contacts` so it
   can reach out proactively -- paste your own openid into `admin_ids`
-  and scheduled tasks can ping you on QQ.
+  and scheduled tasks can ping you on QQ. Players listed in
+  `trust_players` may also have their chat relayed to you (`send_qq` with
+  `to='owner'`); they are not admins and can reach no one else.
 - **A second model for the small talk** (`speaker`, off by default) — turning it
   on adds a `speak` tool that forwards a player's line, **word for word**, to a
   second model and sends back whatever it answers. That model gets **nothing
