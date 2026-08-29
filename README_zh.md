@@ -361,8 +361,9 @@ class HelloReply(Plugin):
 （可按玩家/关键词/系统广播过滤），并用 OpenAI 兼容的 function calling 执行
 动作——发消息、执行命令、行走/寻路、转头（绝对/相对）、查询玩家位置、
 查看游戏状态、自检运行状态（`get_system_info`：模型、上下文占用、连接时长、
-插件与任务数）、开关/修改(patch)/读取/删除插件、编写新插件、管理定时任务，
-以及维护**按服务器分开的 Markdown 记忆**（`MEMORY.md`，可多文件）并自主更新。
+插件与任务数）、开关/修改(patch)/读取/删除插件、编写新插件、管理定时任务、
+把措辞交给一个无上下文的**副 AI**，以及维护**按服务器分开的 Markdown 记忆**
+（`MEMORY.md`，可多文件）并自主更新。
 
 **首次运行**会自动生成 `plugins/llm_agent.json`——填好端点与密钥后保存一次
 `llm_agent.py` 触发热重载即可：
@@ -377,6 +378,17 @@ class HelloReply(Plugin):
     "compact_reserve_ratio": 0.05,  // 预留 5%，超出后自动压缩旧对话
     "system_blocks": true,          // 系统提示词按块发送（content 数组）
     "cache_control": false          // 给最后一块打 {"type":"ephemeral"} 缓存标记
+  },
+  "speaker": {                  // 可选的副 AI：专门负责把话写出来
+    "enabled": false,
+    "base_url": "",             // 留空 = 与上面同一个端点
+    "api_key": "",              // 留空 = 用上面的 key
+    "model": "",                // 留空 = 用上面的 model
+    "max_tokens": 300,          // 一句聊天的生成上限（不是上下文窗口）
+    "temperature": 1.0,
+    "persona": true,            // 人物预设也给它，语气才一致
+    "system_prompt": "",        // 留空 = 用内置的副 AI 提示词
+    "route_send_message": false // true = send_message 与最终回复也走它
   },
   "reply": {
     "all": false,               // true = 回应每条聊天
@@ -396,6 +408,17 @@ class HelloReply(Plugin):
 }
 ```
 
+- **副 AI 专管说话**（`speaker`，默认关闭）：主 AI 只负责想清楚「要表达
+  什么」，交给一个更小更便宜的模型写出玩家真正看到的那句话。打开后主 AI 多
+  一个 `speak` 工具：它传 `intent`（「告诉 Steve 钻石在 -320，我现在忙」），
+  副 AI 写好措辞并发出去。副 AI **没有上下文**——没有对话历史、没有记忆、
+  没有聊天记录，只有它自己的提示词、bot 身份、人物预设和这一条 intent。这
+  正是它的意义：便宜、快，不会被聊天里的内容带跑，也不占主 AI 的上下文。
+  留空的字段沿用主 AI 的端点/密钥/模型，所以通常只需要把 `model` 指向一个
+  小模型就够了。再打开 `route_send_message`，连 `send_message` 与最终回复也
+  会被它改写；那条路径上副 AI 失败就按**原话**发出去（主 AI 已经不在环里，
+  没人能接手补救），而 `speak` 工具失败则会明确告诉主 AI「自己说」。
+  `get_system_info` 会报当前是哪个模型在说话、以及有没有开路由。
 - **控制台直接对话**：TUI 里输入 `.llm 内容` 就是一次完整的 agent 回合，回复
   打印在日志区、**不发到游戏聊天**，工具照常可用（叫它去聊天里说话，它会用
   `send_message`）。控制台按**管理员**对待——能启动这个进程的人本来就能改配置

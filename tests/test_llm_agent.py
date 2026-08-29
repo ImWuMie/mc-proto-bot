@@ -1647,6 +1647,209 @@ class InterjectionTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class SpeakerModelTest(unittest.IsolatedAsyncioTestCase):
+    """副 AI：主 AI 说「要表达什么」，它写出真正那句话，而且没有上下文。"""
+
+    def setUp(self) -> None:
+        self.manager = make_manager()
+        self.plugin = self.manager.plugins["llm_agent"]
+        self.plugin.manager = self.manager
+        self.plugin.bot = FakeBot(username="mie_233")
+        self.plugin.session = FakeSession()
+        self.plugin._settings["llm"].update(
+            {
+                "base_url": "https://main.example/v1",
+                "api_key": "main-key",
+                "model": "main-model",
+                "timeout": 30.0,
+            }
+        )
+
+    def enable(self, **overrides) -> None:
+        self.plugin._settings["speaker"].update({"enabled": True, **overrides})
+
+    def speaker_says(self, *lines: str) -> FakeLLM:
+        fake = FakeLLM(*(assistant(line) for line in lines))
+        self.plugin._post_json = fake
+        return fake
+
+    async def test_tool_is_offered_only_when_enabled(self) -> None:
+        names = {entry["function"]["name"] for entry in self.plugin._tool_list()}
+        self.assertNotIn("speak", names)
+        self.enable()
+        names = {entry["function"]["name"] for entry in self.plugin._tool_list()}
+        self.assertIn("speak", names)
+
+    async def test_speak_sends_the_line_the_speaker_wrote(self) -> None:
+        self.enable()
+        self.speaker_says("行吧，那我先去挖矿了")
+        result = await self.plugin._run_tool(
+            "speak", {"intent": "告诉 Steve 我要去挖矿，钻石在 -320"}
+        )
+        self.assertEqual(self.plugin.bot.sent_messages, ["行吧，那我先去挖矿了"])
+        self.assertIn("行吧", result)
+
+    async def test_speaker_gets_no_conversation_history(self) -> None:
+        """副 AI 是无状态的：一条系统提示词 + 一条 intent，没有别的。"""
+        self.enable()
+        fake = self.speaker_says("好")
+        self.plugin._conversation = [
+            {"role": "user", "content": "以前的对话"},
+            {"role": "assistant", "content": "以前的回复"},
+        ]
+        await self.plugin._run_tool("speak", {"intent": "答应他"})
+        _, payload, _, _ = fake.calls[0]
+        self.assertEqual([m["role"] for m in payload["messages"]], ["system", "user"])
+        self.assertIn("答应他", payload["messages"][1]["content"])
+        body = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("以前的对话", body)
+        self.assertNotIn("以前的回复", body)
+
+    async def test_blank_fields_inherit_the_main_endpoint(self) -> None:
+        self.enable()
+        fake = self.speaker_says("好")
+        await self.plugin._run_tool("speak", {"intent": "x"})
+        url, payload, headers, timeout = fake.calls[0]
+        self.assertEqual(url, "https://main.example/v1/chat/completions")
+        self.assertEqual(payload["model"], "main-model")
+        self.assertEqual(headers["Authorization"], "Bearer main-key")
+        self.assertEqual(timeout, 30.0)
+
+    async def test_own_endpoint_model_and_key_win(self) -> None:
+        self.enable(
+            base_url="https://small.example/v1",
+            api_key="small-key",
+            model="small-model",
+            timeout=5.0,
+        )
+        fake = self.speaker_says("好")
+        await self.plugin._run_tool("speak", {"intent": "x"})
+        url, payload, headers, timeout = fake.calls[0]
+        self.assertEqual(url, "https://small.example/v1/chat/completions")
+        self.assertEqual(payload["model"], "small-model")
+        self.assertEqual(headers["Authorization"], "Bearer small-key")
+        self.assertEqual(timeout, 5.0)
+
+    async def test_generation_limits_are_sent(self) -> None:
+        self.enable(max_tokens=120, temperature=0.4)
+        fake = self.speaker_says("好")
+        await self.plugin._run_tool("speak", {"intent": "x"})
+        _, payload, _, _ = fake.calls[0]
+        self.assertEqual(payload["max_tokens"], 120)
+        self.assertAlmostEqual(payload["temperature"], 0.4)
+
+    async def test_recipient_reaches_the_speaker(self) -> None:
+        self.enable()
+        fake = self.speaker_says("好")
+        await self.plugin._run_tool("speak", {"intent": "答应", "to": "Steve"})
+        self.assertIn("Steve", fake.calls[0][1]["messages"][1]["content"])
+
+    async def test_system_prompt_carries_identity_and_persona(self) -> None:
+        self.enable()
+        self.plugin._read_persona_text = lambda: "说话很短，爱说行吧"
+        fake = self.speaker_says("好")
+        await self.plugin._run_tool("speak", {"intent": "x"})
+        system = fake.calls[0][1]["messages"][0]["content"]
+        self.assertIn("mie_233", system)
+        self.assertIn("wolfx.jp", system)
+        self.assertIn("说话很短", system)
+
+    async def test_persona_can_be_withheld(self) -> None:
+        self.enable(persona=False)
+        self.plugin._read_persona_text = lambda: "说话很短，爱说行吧"
+        fake = self.speaker_says("好")
+        await self.plugin._run_tool("speak", {"intent": "x"})
+        self.assertNotIn("说话很短", fake.calls[0][1]["messages"][0]["content"])
+
+    async def test_custom_speaker_prompt_replaces_the_builtin(self) -> None:
+        self.enable(system_prompt="Answer in one word.")
+        fake = self.speaker_says("好")
+        await self.plugin._run_tool("speak", {"intent": "x"})
+        system = fake.calls[0][1]["messages"][0]["content"]
+        self.assertIn("Answer in one word.", system)
+        self.assertNotIn("You write the chat lines", system)
+
+    async def test_output_is_cleaned_into_one_line(self) -> None:
+        """引号与换行会被收拾掉：聊天包发不了换行。"""
+        self.enable()
+        self.speaker_says('"行吧\n那走了"')
+        await self.plugin._run_tool("speak", {"intent": "x"})
+        self.assertEqual(self.plugin.bot.sent_messages, ["行吧 那走了"])
+
+    async def test_failure_tells_the_main_model_to_speak_itself(self) -> None:
+        self.enable()
+        self.plugin._post_json = FakeLLM(RuntimeError("HTTP 500: boom"))
+        result = await self.plugin._run_tool("speak", {"intent": "x"})
+        self.assertIn("send_message", result)
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_empty_output_is_reported_not_sent(self) -> None:
+        self.enable()
+        self.speaker_says("   ")
+        result = await self.plugin._run_tool("speak", {"intent": "x"})
+        self.assertIn("send_message", result)
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_missing_intent_is_rejected(self) -> None:
+        self.enable()
+        result = await self.plugin._run_tool("speak", {})
+        self.assertIn("Missing intent", result)
+
+    async def test_speak_while_disabled_says_so(self) -> None:
+        result = await self.plugin._run_tool("speak", {"intent": "x"})
+        self.assertIn("disabled", result)
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_send_message_is_verbatim_by_default(self) -> None:
+        self.enable()
+        fake = self.speaker_says("改写过的")
+        await self.plugin._run_tool("send_message", {"text": "原话"})
+        self.assertEqual(self.plugin.bot.sent_messages, ["原话"])
+        self.assertEqual(fake.calls, [])  # 根本没调副 AI
+
+    async def test_routing_sends_the_speakers_wording(self) -> None:
+        self.enable(route_send_message=True)
+        self.speaker_says("改写过的")
+        await self.plugin._run_tool("send_message", {"text": "原话"})
+        self.assertEqual(self.plugin.bot.sent_messages, ["改写过的"])
+
+    async def test_routing_falls_back_to_the_original_text(self) -> None:
+        """这条路径上主 AI 已经不在环里了，宁可原话发出去也别不说话。"""
+        self.enable(route_send_message=True)
+        self.plugin._post_json = FakeLLM(RuntimeError("HTTP 500: boom"))
+        await self.plugin._run_tool("send_message", {"text": "原话"})
+        self.assertEqual(self.plugin.bot.sent_messages, ["原话"])
+
+    async def test_system_info_reports_the_speaker(self) -> None:
+        report = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("Speaker model: disabled", report)
+        self.enable(model="small-model")
+        report = await self.plugin._run_tool("get_system_info", {})
+        self.assertIn("small-model", report)
+        self.assertIn("stateless", report)
+
+    async def test_system_info_does_not_leak_the_speaker_endpoint(self) -> None:
+        self.enable(base_url="https://small.example/v1", api_key="small-key")
+        report = await self.plugin._run_tool("get_system_info", {})
+        self.assertNotIn("small.example", report)
+        self.assertNotIn("small-key", report)
+
+    def test_settings_are_clamped(self) -> None:
+        normalize = type(self.plugin)._normalize
+        merged = normalize(
+            {"speaker": {"max_tokens": 99999, "temperature": 9.0}}
+        )
+        self.assertEqual(merged["speaker"]["max_tokens"], 8000)
+        self.assertEqual(merged["speaker"]["temperature"], 2.0)
+        merged = normalize({"speaker": "nonsense"})
+        self.assertFalse(merged["speaker"]["enabled"])
+
+    def test_disabled_by_default(self) -> None:
+        defaults = plugin_module(self.plugin).DEFAULT_SETTINGS
+        self.assertFalse(defaults["speaker"]["enabled"])
+        self.assertFalse(defaults["speaker"]["route_send_message"])
+
+
 class SystemInfoToolTest(unittest.IsolatedAsyncioTestCase):
     """get_system_info：运行状态自检（含上下文占用），且不泄露密钥。"""
 

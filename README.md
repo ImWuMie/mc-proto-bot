@@ -386,7 +386,8 @@ broadcasts), and acts through OpenAI-compatible function calling — send chat,
 run commands, walk/navigate, turn/look, look up player positions, check
 status, inspect its own runtime (`get_system_info`: model, context budget in
 use, uptime, plugin/task counts), toggle/patch/read/delete plugins, write new
-plugins, manage scheduled tasks, and maintain **per-server Markdown memory**
+plugins, manage scheduled tasks, optionally hand the wording of a line to a
+second, stateless **speaker model**, and maintain **per-server Markdown memory**
 (`MEMORY.md`, multiple files allowed) that it updates autonomously.
 
 **On first run** the plugin generates `plugins/llm_agent.json` — fill in the
@@ -402,6 +403,17 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
     "compact_reserve_ratio": 0.05,  // reserve 5%; older turns auto-compact
     "system_blocks": true,          // send the system prompt as content blocks
     "cache_control": false          // tag the last block {"type":"ephemeral"}
+  },
+  "speaker": {                  // optional second model that writes the chat lines
+    "enabled": false,
+    "base_url": "",             // blank = same endpoint as above
+    "api_key": "",              // blank = same key
+    "model": "",                // blank = same model
+    "max_tokens": 300,          // generation limit for one chat line
+    "temperature": 1.0,
+    "persona": true,            // give it the character sheet too
+    "system_prompt": "",        // blank = built-in speaker prompt
+    "route_send_message": false // true = send_message and final replies go through it
   },
   "reply": {
     "all": false,               // true = reply to every chat line
@@ -421,6 +433,21 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 }
 ```
 
+- **A second model for the talking** (`speaker`, off by default) — the main
+  model decides *what* has to come across and hands that to a smaller, cheaper
+  model that writes the line players actually see. Turning it on adds a `speak`
+  tool: the agent passes an `intent` ("tell Steve the diamonds are at -320, and
+  that I'm busy") and the speaker returns and sends the wording. The speaker is
+  **stateless** — no conversation history, no memory, no chat log, just its own
+  prompt, the bot's identity, the character sheet, and that one intent — which
+  is the point: it stays cheap, it cannot be dragged off course by anything in
+  chat, and it never eats the main model's context. Blank fields inherit the
+  main endpoint/key/model, so pointing `model` at something small is often the
+  whole configuration. With `route_send_message: true` the plugin also rewrites
+  plain `send_message` calls and final replies; if the speaker call fails there
+  the original text is sent as-is (nobody is left in the loop to recover),
+  whereas a failed `speak` tool tells the main model to say it itself.
+  `get_system_info` reports which model is speaking and whether routing is on.
 - **Talking to it from the console** — `.llm <text>` in the TUI runs one full
   agent turn whose reply prints in the log area and **never goes to game
   chat**; tools still work, so asking it to greet the server makes it call
