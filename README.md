@@ -797,6 +797,32 @@ uv sync --extra online          # install runtime extras plus the dev tools
 python -m compileall protobot plugins run_bot.py   # fast syntax check
 ```
 
+## Building a release
+
+The version lives in one place, `protobot/__init__.py` (`__version__`), and the
+CLI echoes it: `protobot --version`. Everything needed at runtime -- including
+the bundled block-state tables under `protobot/data/` -- ships inside the
+wheel, so a release is just:
+
+```bash
+uv build                              # -> dist/protobot-x.y.z.tar.gz + .whl
+uv tool install dist/protobot-x.y.z-py3-none-any.whl   # try it clean
+protobot --version                    # sanity check the installed build
+```
+
+`dist/` is gitignored. The repo has a GitHub Actions workflow that builds on
+every `v*` tag and attaches the artifacts to the GitHub release, so publishing
+is:
+
+```bash
+git tag v1.0.0
+git push origin main --tags
+```
+
+(create the GitHub release for that tag afterwards; the workflow fills in the
+artifacts). Offline mode stays dependency-free in the wheel -- `[online]` and
+`[tui]` remain optional extras and are never required to import `protobot`.
+
 ## Notes and limitations
 
 - **Online & offline mode.** Offline mode has zero third-party dependencies. For online-mode servers, install `protobot[online]` (requires `cryptography`).
