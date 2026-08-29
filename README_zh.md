@@ -418,7 +418,10 @@ class HelloReply(Plugin):
   appid/token，在 `llm_agent.json` 里配 `enabled`、`appid`、`token`（约 3 秒
   生效）。请求者名字形如 `[QQ] <openid>`；QQ 用户**默认不是**管理员，只有
   openid 在 `admin_ids` 里才算——`admins` 留空放开限制不会把权限漏给 QQ 上
-  的陌生人。
+  的陌生人。bot 还会**记住**每个联系过它的用户/群（首次遇到时 openid 会以
+  「QQ contact learned」打进日志，之后可主动发消息），并暴露 `send_qq`
+  （仅管理员）与 `qq_contacts`；把自己的 openid 填进 `admin_ids`，定时
+  任务就能在 QQ 上 ping 你。
 - **副 AI 专管闲聊**（`speaker`，默认关闭）：打开后主 AI 多一个 `speak`
   工具——把某人说的那句话**原样**转给第二个模型，它回什么就发到聊天里。
   这个副 AI **什么都没有**：请求里只有一条 user 消息，没有系统提示词、没有
