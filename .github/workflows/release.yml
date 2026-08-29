@@ -19,12 +19,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: packages
-          path: dist/
+          path: dist/protobot-*
       - name: Publish artifacts to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: dist/protobot-*
 
   portable:
     # The self-contained build is platform-specific (a frozen Python runtime),
@@ -50,9 +50,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: portable-${{ matrix.os }}
-          path: dist/
+          path: dist/protobot-*
       - name: Publish artifacts to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: dist/protobot-*
