@@ -295,8 +295,14 @@ def _parse_address(value: str) -> tuple[str, int]:
     return host, port
 
 
-def run_setup(config_path: Path) -> int:
-    """Interactive wizard: login method -> server -> version, into config.yaml."""
+async def run_setup(config_path: Path) -> int:
+    """Interactive wizard: login method -> server -> version, into config.yaml.
+
+    With online mode it then checks for cached credentials next to the config
+    and goes straight into the Microsoft sign-in when there are none, so a
+    first run ends with the account ready rather than a hint to run another
+    command.
+    """
     print("=" * 60)
     print("        ProtoBot first-run setup")
     print("=" * 60)
@@ -379,11 +385,30 @@ def run_setup(config_path: Path) -> int:
             "config decides where they load from)"
         )
     print("=" * 60)
-    print("Next:")
     if mode == "online":
-        print("  1. run protobot login once to authorize your Microsoft account")
-    print("  2. run protobot run (or right-click run_bot.py in PyCharm)")
+        code = await _ensure_online_credentials(config_path)
+        if code != 0:
+            return code
+    print("Next:")
+    print("  run protobot run (or right-click run_bot.py in PyCharm) to connect")
     return 0
+
+
+async def _ensure_online_credentials(config_path: Path) -> int:
+    """Check for cached credentials next to the config; sign in when missing."""
+    cache_file = config_path.with_name("auth_cache.json")
+    loaded = load_profile(cache_file)
+    if loaded is not None:
+        profile, _ = loaded
+        print(f"[auth] cached credentials found for {profile.name}; no sign-in needed.")
+        return 0
+    print("\n[auth] no cached credentials yet; starting the Microsoft sign-in ...")
+    print("(Ctrl+C to cancel; you can also run 'protobot login' later)\n")
+    return await run_login(
+        argparse.Namespace(
+            auth_code=False, azure_client_id="", config=config_path
+        )
+    )
 
 
 def _write_starter_plugins(config_path: Path) -> int:
@@ -670,10 +695,10 @@ def _root_parser() -> argparse.ArgumentParser:
 
 async def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "setup":
-        return run_setup(args.config)
+        return await run_setup(args.config)
     if not args.config.exists():
         print("[note] no config file found, starting first-run setup ...\n")
-        code = run_setup(args.config)
+        code = await run_setup(args.config)
         if code != 0:
             return code
     if args.command == "login":
