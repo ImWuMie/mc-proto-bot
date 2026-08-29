@@ -385,7 +385,7 @@ lines through a `read_chat` tool** (filter by players / keyword / system
 broadcasts), and acts through OpenAI-compatible function calling — send chat,
 run commands, walk/navigate, turn/look, look up player positions, check
 status, inspect its own runtime (`get_system_info`: model, context budget in
-use, uptime, plugin/task counts), toggle/patch/read plugins, write new
+use, uptime, plugin/task counts), toggle/patch/read/delete plugins, write new
 plugins, manage scheduled tasks, and maintain **per-server Markdown memory**
 (`MEMORY.md`, multiple files allowed) that it updates autonomously.
 
@@ -477,9 +477,13 @@ endpoint and key, then save `llm_agent.py` once to hot-reload the settings:
 - **Memory** is stored per server at `llm_agent_memory/<host>_<port>/MEMORY.md`;
   the agent maintains it with the `read_memory` / `save_memory` / `write_memory`
   / `clear_memory` tools, and every conversation includes it.
-- **Admin tools** (`write_plugin`, `set_plugin`) are restricted to the `admins`
-  list. Generated plugins go to the separate `plugins_llm/` directory — never
-  the hand-written `plugins/` folder — and are re-registered after restarts.
+- **Admin tools** (`write_plugin`, `patch_plugin`, `set_plugin`,
+  `remove_plugin`) are restricted to the `admins` list. Generated plugins go to
+  the separate `plugins_llm/` directory — never the hand-written `plugins/`
+  folder — and are re-registered after restarts. `remove_plugin` closes a plugin
+  and deletes its source file for good (`set_plugin` with `enabled: false` is
+  the reversible one); it refuses to remove `llm_agent` itself, since that would
+  take the agent down with it.
 - **Whispers** — system messages of the form `[Player -> me] ...` (private
   messages to the bot) always trigger a reply; the sender is what admin
   checks compare against.
@@ -501,6 +505,8 @@ a game event, or when a state condition becomes true. Tasks live in
      "text": "say time to clear the drops", "enabled": true},
     {"name": "greet", "event": "player_join", "action": "chat",
      "text": "welcome, {player}!", "cooldown": 5, "enabled": true},
+    {"name": "open up", "event": "player_chat", "match": "open the door",
+     "action": "command", "text": "say coming", "enabled": true},
     {"name": "low health", "condition": "health < 8", "action": "remind",
      "text": "only {health} health left, do something", "enabled": true}
   ]
@@ -509,8 +515,9 @@ a game event, or when a state condition becomes true. Tasks live in
 
 - Four ways to trigger, combinable: `interval` (seconds, minimum 5) repeats
   forever; `time` (`HH:MM`, 24-hour local) fires once a day; `event` fires on a
-  game event (`player_join`, `player_leave`, `death`, `respawn`); `condition`
-  fires on a state expression. At least one is required.
+  game event (`player_chat`, `system_chat`, `player_join`, `player_leave`,
+  `death`, `respawn`); `condition` fires on a state expression. At least one is
+  required.
 - **A `condition` on its own is a trigger** — it runs the task at the moment the
   expression flips from false to true, once, not every second it stays true.
   **Combined with `interval`/`time`/`event` it is a gate** instead: the task
@@ -524,7 +531,11 @@ a game event, or when a state condition becomes true. Tasks live in
 - `cooldown` is the minimum number of seconds between two runs of the same task
   — worth setting on a join greeter so ten people arriving at once do not
   produce ten messages. `match` only triggers an event task when the event text
-  (player name, death message) contains that substring.
+  (chat line, player name, death message) contains that substring, and the two
+  chat events **require** it: without it every line anyone types would run the
+  task. A task whose own text contains its own `match` is refused, because it
+  would trigger itself forever; the bot also ignores its own lines coming back
+  from the server (by name, and by anything it said in the last 10 seconds).
 - `text` may use placeholders, filled in as the task runs: `{player}`,
   `{message}` (the death message), `{bot}`, `{health}`, `{food}`, `{players}`,
   `{x}`, `{y}`, `{z}`, `{hour}`, `{minute}`. Anything else in braces is left
@@ -538,17 +549,18 @@ a game event, or when a state condition becomes true. Tasks live in
   `scheduler.list`, `add`, `set`, `remove`, `run` (fire once now), and
   `status`, which reach the agent as tools automatically; everything except
   `list` and `status` is admin-only. So "every 30 minutes remind people to
-  eat" is enough to create a task in game, and "greet anyone who joins" or
-  "tell me when my health drops below 8" creates an event or condition task the
-  same way. Validation lives in the plugin, so the file, the services, and the
+  eat" is enough to create a task in game, and "greet anyone who joins",
+  "answer whenever someone says open the door", or "tell me when my health
+  drops below 8" creates an event or condition task the same way. Validation lives in the plugin, so the file, the services, and the
   agent all obey one set of rules.
 - **Waking the agent** — `action: remind` calls the exposed
   `llm_agent.remind`, so the text reaches the LLM as a reminder turn rather
   than being said verbatim: "every hour, check whether anyone needs help" lets
   it decide what to do, or stay quiet. Reminders carry no admin rights, and
   the task is skipped with a notice when no agent is loaded.
-- Event triggers need the tab-list packets, whose ids are unverified on
-  protocol 774 (1.21.11) — there, `player_join` / `player_leave` never fire.
+- On protocol 774 (1.21.11) the tab-list and combat-death packet ids are
+  unverified, so `player_join`, `player_leave`, and `death` never fire there;
+  the chat, `system_chat`, and `respawn` triggers work on every version.
 
 ### Auto-fishing plugin (`fishing`)
 

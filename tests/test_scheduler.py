@@ -747,7 +747,16 @@ class EventTriggerTest(unittest.IsolatedAsyncioTestCase):
         """订阅是通过框架注册的，所以异常只会被记录，不会打断连接。"""
         events = [event for event, _ in self.plugin._subscriptions]
         self.assertEqual(
-            sorted(events), ["death", "player_join", "player_leave", "respawn"]
+            sorted(events),
+            [
+                "chat_sent",
+                "death",
+                "player_chat",
+                "player_join",
+                "player_leave",
+                "respawn",
+                "system_chat",
+            ],
         )
 
 
@@ -899,6 +908,127 @@ class PlaceholderTest(unittest.IsolatedAsyncioTestCase):
         ]
         await self.plugin._on_player_join(SimpleNamespace(name="Steve"))
         self.assertEqual(calls[0]["text"], "Steve 来了，打个招呼")
+
+
+class ChatTriggerTest(unittest.IsolatedAsyncioTestCase):
+    """「别人说了这句话就做点什么」——聊天触发，以及不许自己触发自己。"""
+
+    def setUp(self) -> None:
+        self.manager = PluginManager([SCHEDULER_FILE.parent])
+        self.manager.discover()
+        self.plugin = self.manager.plugins["scheduler"]
+        self.plugin.manager = self.manager
+        self.plugin._file = None
+        self.plugin.bot = FakeBot()
+
+    def install(self, **fields) -> None:
+        task, error = self.plugin._normalize(
+            {"name": "t", "text": "hi", **fields}
+        )
+        self.assertEqual(error, "")
+        self.plugin._tasks = [task]
+
+    async def say(self, name: str, text: str) -> None:
+        await self.plugin._on_player_chat(None, name, {"text": text}, 0, None)
+
+    async def test_matching_chat_line_runs_the_task(self) -> None:
+        self.install(event="player_chat", match="开门", action="command",
+                     text="say 来了")
+        await self.say("Steve", "谁来开门啊")
+        self.assertEqual(self.plugin.bot.sent_commands, ["say 来了"])
+
+    async def test_other_lines_are_ignored(self) -> None:
+        self.install(event="player_chat", match="开门", text="来了")
+        await self.say("Steve", "今天天气不错")
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_match_is_case_insensitive(self) -> None:
+        self.install(event="player_chat", match="hello", text="hi")
+        await self.say("Steve", "HELLO everyone")
+        self.assertEqual(self.plugin.bot.sent_messages, ["hi"])
+
+    async def test_placeholders_carry_the_speaker_and_line(self) -> None:
+        self.install(
+            event="player_chat", match="求救", text="{player} 说了「{message}」"
+        )
+        await self.say("Steve", "求救 我掉洞里了")
+        self.assertEqual(
+            self.plugin.bot.sent_messages, ["Steve 说了「求救 我掉洞里了」"]
+        )
+
+    async def test_component_player_name_is_flattened(self) -> None:
+        """玩家名常常是组件而不是字符串（服务器给它挂颜色）。"""
+        self.install(event="player_chat", match="hi", text="{player}")
+        await self.plugin._on_player_chat(
+            None, {"text": "Steve", "color": "gold"}, {"text": "hi"}, 0, None
+        )
+        self.assertEqual(self.plugin.bot.sent_messages, ["Steve"])
+
+    async def test_own_line_echoed_back_does_not_trigger(self) -> None:
+        """服务器把自己说的话广播回来，不能拿它触发自己。"""
+        self.install(event="player_chat", match="开门", text="来了")
+        await self.say("FakeBot", "开门")
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_recently_sent_text_is_treated_as_an_echo(self) -> None:
+        """回显里的发送者名字未必是 bot 的名字（代理会改），所以还看内容。"""
+        self.install(event="player_chat", match="开门", text="来了")
+        await self.plugin._on_chat_sent("开门了吗")
+        await self.say("Steve", "<mie_233> 开门了吗")
+        self.assertEqual(self.plugin.bot.sent_messages, [])
+
+    async def test_echo_memory_expires(self) -> None:
+        self.install(event="player_chat", match="开门", text="来了")
+        await self.plugin._on_chat_sent("开门")
+        self.plugin._sent = [(time.monotonic() - 60.0, "开门")]  # 旧记录
+        await self.say("Steve", "开门")
+        self.assertEqual(self.plugin.bot.sent_messages, ["来了"])
+
+    async def test_system_chat_trigger(self) -> None:
+        self.install(event="system_chat", match="重启", action="chat",
+                     text="收到")
+        await self.plugin._on_system_chat({"text": "服务器将在 5 分钟后重启"}, False)
+        self.assertEqual(self.plugin.bot.sent_messages, ["收到"])
+
+    async def test_system_chat_translate_component(self) -> None:
+        """系统广播多半是翻译键，plain_text 现在会真的格式化它。"""
+        self.install(event="system_chat", match="joined", text="欢迎")
+        await self.plugin._on_system_chat(
+            {"translate": "multiplayer.player.joined", "with": ["Steve"]}, False
+        )
+        self.assertEqual(self.plugin.bot.sent_messages, ["欢迎"])
+
+    async def test_chat_event_without_match_is_rejected(self) -> None:
+        task, error = self.plugin._normalize(
+            {"name": "t", "event": "player_chat", "text": "hi"}
+        )
+        self.assertIsNone(task)
+        self.assertIn("chat events need match", error)
+
+    async def test_self_triggering_task_is_rejected(self) -> None:
+        """text 里含着自己的 match，会一直触发下去。"""
+        task, error = self.plugin._normalize(
+            {"name": "t", "event": "player_chat", "match": "开门",
+             "text": "开门来了"}
+        )
+        self.assertIsNone(task)
+        self.assertIn("trigger itself", error)
+
+    async def test_remind_may_repeat_the_match_text(self) -> None:
+        """remind 不直接发话，所以不受自触发限制。"""
+        task, error = self.plugin._normalize(
+            {"name": "t", "event": "player_chat", "match": "开门",
+             "action": "remind", "text": "有人说开门，看看要不要理"}
+        )
+        self.assertEqual(error, "")
+        self.assertIsNotNone(task)
+
+    async def test_cooldown_applies_to_chat_triggers(self) -> None:
+        self.install(event="player_chat", match="开门", cooldown=60.0,
+                     text="来了")
+        await self.say("Steve", "开门")
+        await self.say("Alex", "开门")
+        self.assertEqual(self.plugin.bot.sent_messages, ["来了"])
 
 
 if __name__ == "__main__":

@@ -952,6 +952,50 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("load failed", result)
             self.assertNotIn("broken", self.manager.plugins)
 
+    async def test_remove_plugin_closes_and_deletes_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "a.py"
+            file.write_text(TEMP_PLUGIN_SRC, encoding="utf-8")
+            await self.manager.hot_load_file(file)
+            result = await self.plugin._run_tool("remove_plugin", {"name": "temp_a"})
+            self.assertIn("temp_a", result)
+            self.assertNotIn("temp_a", self.manager.plugins)
+            self.assertFalse(file.exists())
+
+    async def test_remove_plugin_forgets_a_generated_file(self) -> None:
+        """删掉生成的插件后不能还登记着，否则重启又会加载回来。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.plugin._generated_dir = Path(tmp) / "gen"
+            code = TEMP_PLUGIN_SRC.replace('"temp_a"', '"temp_hello"')
+            await self.plugin._run_tool(
+                "write_plugin", {"filename": "hello.py", "code": code}
+            )
+            self.assertEqual(self.plugin._generated, ["hello.py"])
+            await self.plugin._run_tool("remove_plugin", {"name": "temp_hello"})
+            self.assertEqual(self.plugin._generated, [])
+            self.assertFalse((Path(tmp) / "gen" / "hello.py").exists())
+            state = json.loads(
+                (Path(tmp) / "gen" / ".llm_agent_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(state["generated_plugins"], [])
+
+    async def test_remove_plugin_refuses_self(self) -> None:
+        result = await self.plugin._run_tool("remove_plugin", {"name": "llm_agent"})
+        self.assertIn("Refused", result)
+        self.assertIn("llm_agent", self.manager.plugins)
+
+    async def test_remove_plugin_unknown_name(self) -> None:
+        result = await self.plugin._run_tool("remove_plugin", {"name": "nope"})
+        self.assertIn("Plugin not found", result)
+
+    async def test_remove_plugin_is_declared_as_a_tool(self) -> None:
+        names = {
+            entry["function"]["name"] for entry in self.plugin._tool_list()
+        }
+        self.assertIn("remove_plugin", names)
+
 
 class ReadChatToolTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -2377,6 +2421,21 @@ class AdminGateTest(unittest.IsolatedAsyncioTestCase):
             encoding="utf-8"
         )
         self.assertNotIn("MARKER_XYZ", content)  # 未改动
+
+    async def test_non_admin_cannot_remove_plugin(self) -> None:
+        # 故意不拿仓库里的插件当靶子：万一权限判断退化了，这个测试自己就会
+        # 把源码删掉。用临时目录里的副本，删错了也只是删掉临时文件。
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "a.py"
+            file.write_text(TEMP_PLUGIN_SRC, encoding="utf-8")
+            await self.manager.hot_load_file(file)
+            self.plugin._requester = "Steve"
+            result = await self.plugin._run_tool(
+                "remove_plugin", {"name": "temp_a"}
+            )
+            self.assertIn("Permission denied", result)
+            self.assertTrue(file.exists())
+            self.assertIn("temp_a", self.manager.plugins)
 
     async def test_admin_can_write_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

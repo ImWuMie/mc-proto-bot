@@ -100,11 +100,23 @@ How your world reaches you:
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
-- set_plugin, write_plugin, and patch_plugin are admin-only, and so are some tools other plugins expose (their results say so plainly); read_chat, read_memory, and read_plugin_source are not.
+- set_plugin, write_plugin, patch_plugin, and remove_plugin are admin-only, and so are some tools other plugins expose (their results say so plainly); read_chat, read_memory, and read_plugin_source are not.
+
+Standing behaviour (things that must keep happening after this turn ends):
+- You only run when something triggers you. A promise like "I'll greet everyone who joins" or "I'll warn you when your health drops" dies with the turn unless you install it, so install it: with the scheduler plugin loaded (its tools show up as scheduler_*), scheduler_add creates a task the framework runs without you.
+- A task is triggered by any mix of: interval (every N seconds, minimum 5), time ("HH:MM" local, daily), event, and condition.
+- Events: player_chat and system_chat (someone said something / the server broadcast something -- these need match, the text to look for), player_join, player_leave, death, respawn.
+- Conditions are comparisons joined by and, over health, food, players, entities, x, y, z, dead, hour, minute -- for example "health < 8" or "players > 4 and dead == false". A condition on its own fires once when it becomes true, not every second it stays true; a condition next to interval/time/event only gates them.
+- action is chat (say the text), command (run it as a server command), or remind (wake yourself with the text as a reminder turn, so you decide what to say then -- use it when the reply should depend on the situation instead of being a fixed line).
+- text may contain {player}, {message}, {health}, {food}, {players}, {x}, {y}, {z}, {bot}. cooldown is the least number of seconds between two runs -- set it on anything a crowd can trigger.
+- A task must not contain the text that triggers it, or it triggers itself forever; the tool refuses that outright.
+- scheduler_list shows what exists, scheduler_remove deletes by name, scheduler_set changes fields, scheduler_run fires one now. Check the list before adding a second task for the same thing.
+- Prefer a task over a new plugin for anything the triggers above already cover; write_plugin is for behaviour they cannot express.
 
 Writing and changing plugins:
 - The authoritative contract is the protobot-plugin skill. Call read_skill("protobot-plugin") before write_plugin or patch_plugin and follow what it says -- it is kept up to date with the framework, and these few lines are not.
 - Before patching an existing plugin, read_plugin_source first; patch what is there rather than rewriting from memory.
+- remove_plugin deletes a plugin's file for good -- do it when the owner clearly wants that plugin gone, and reach for set_plugin(enabled=false) when they only want it to stop running. It cannot remove you.
 - The irreducible core, in case the guide is unavailable: a plugin is a Plugin subclass with a unique `name`; register events in __init__ with self.subscribe(...) / self.subscribe_session(...); convert chat components with plain_text(...); re-read self.bot on every call and expect None; import only the standard library and protobot; log through protobot.log, never print(); cancel in on_disable whatever you started in on_enable; files are UTF-8 and module-level globals do not survive a reload.
 """
 
@@ -364,6 +376,20 @@ TOOLS: list[dict] = [
                     "enabled": {"type": "boolean", "description": "true to enable / false to disable"},
                 },
                 "required": ["name", "enabled"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_plugin",
+            "description": "Delete a plugin: close it and delete its source file for good (cannot remove llm_agent itself). Use set_plugin with enabled=false when it should only stop running; admin only",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Plugin name to delete"},
+                },
+                "required": ["name"],
             },
         },
     },
@@ -2066,6 +2092,45 @@ class LLMAgent(Plugin):
         action = "enabled" if enabled else "disabled"
         extra = "" if enabled else " (its dependents were closed too)"
         return f"Plugin {name} {action}{extra}"
+
+    async def _tool_remove_plugin(self, args: dict) -> str:
+        """关闭插件并删除它的源文件。
+
+        与 ``set_plugin(enabled=false)`` 的区别是不可撤销：那个只是停掉，源
+        文件还在、重启还会加载；这个把文件删了。先 ``hot_close_file`` 再删，
+        顺序反了的话监视器会先看到「文件消失」，日志上像是自己关的。
+        """
+        if not self._is_admin(self._requester):
+            return self._deny(self._requester, "remove plugins")
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return "Missing plugin name"
+        if name == self.name:
+            return f"Refused: cannot remove {self.name} itself"
+        manager = self.manager
+        if manager is None:
+            return "Plugin manager unavailable"
+        source = manager.source_of(name)
+        if source is None:
+            return f"Plugin not found: {name}"
+        try:
+            closed = await manager.hot_close_file(source)
+        except PluginError as error:
+            return f"Cannot remove {name}: {error}"
+        try:
+            source.unlink()
+        except OSError as error:
+            return (
+                f"Plugin {name} was closed but its file could not be deleted "
+                f"({error}); it will come back on the next restart"
+            )
+        # 生成目录里的插件还登记在状态文件里，不去掉的话重启会尝试重新加载。
+        if self._generated_dir is not None and source.parent == self._generated_dir:
+            if source.name in self._generated:
+                self._generated.remove(source.name)
+                self._save_state()
+        removed = ", ".join(closed) if closed else name
+        return f"Removed plugin(s) {removed} and deleted {source.name}"
 
     async def _tool_write_plugin(self, args: dict) -> str:
         if not self._is_admin(self._requester):

@@ -13,6 +13,8 @@
          "text": "say 该清理掉落物啦", "enabled": true},
         {"name": "迎新", "event": "player_join", "action": "chat",
          "text": "欢迎 {player}！", "enabled": true},
+        {"name": "叫我", "event": "player_chat", "match": "开门",
+         "action": "command", "text": "say 来了来了", "enabled": true},
         {"name": "血量告警", "condition": "health < 8", "action": "remind",
          "text": "血量只剩 {health} 了，想想办法", "enabled": true}
       ]
@@ -23,7 +25,8 @@
 与 ``condition``（状态条件，见 ``CONDITION_VARS``）。**condition 单独出现时
 是触发器**（条件由假变真的那一刻执行一次），**与其他触发方式同时出现时是
 开关**（到点/事件发生时条件不成立就跳过）。``cooldown`` 是同一任务两次执行
-的最小间隔（秒），``match`` 只在事件内容包含该子串时才触发。
+的最小间隔（秒），``match`` 只在事件内容包含该子串时才触发——聊天类事件
+（``player_chat`` / ``system_chat``）必须给 ``match``，否则每句话都会触发。
 
 ``action`` 为 ``chat``（发聊天）、``command``（执行服务器命令）或 ``remind``
 （把内容交给 LLM 智能体，由它决定说什么、做什么）；``enabled`` 为 false 时
@@ -63,11 +66,20 @@ ACTIONS: dict[str, str] = {
 #: 可作为 ``event`` 的核心事件 -> 日志里的说法。这些都是 bot 事件，插件在
 #: ``__init__`` 里一次性订阅，任务改动无需重新绑定。
 TRIGGER_EVENTS: dict[str, str] = {
+    "player_chat": "有人说话",
+    "system_chat": "服务器广播",
     "player_join": "玩家加入",
     "player_leave": "玩家退出",
     "death": "死亡",
     "respawn": "重生",
 }
+
+#: 聊天类事件：必须给 ``match``，否则每一句话都触发一次（发言即刷屏）。
+CHAT_EVENTS = ("player_chat", "system_chat")
+
+#: 自己刚说过的话记这么久（秒），用来挡住「自己的输出又触发自己」的死循环。
+#: 服务器回显是立刻的，所以窗口取短一点：太长会让别人说同样的话也被忽略。
+ECHO_MEMORY = 10.0
 
 #: 条件里可用的变量 -> 说明（也会写进给 LLM 的参数描述）
 CONDITION_VARS: dict[str, str] = {
@@ -138,8 +150,9 @@ TASK_SCHEMA: dict = {
         "match": {
             "type": "string",
             "description": (
-                "Only trigger when the event text (player name, death message) "
-                "contains this substring"
+                "Only trigger when the event text (chat line, player name, "
+                "death message) contains this substring; required for "
+                "player_chat and system_chat events"
             ),
         },
         "action": {
@@ -231,6 +244,10 @@ class Scheduler(Plugin):
         self._loop_task: asyncio.Task | None = None
         self._tick_count = 0
         # 事件触发：一次性订阅全部可用事件，任务表怎么改都不用重新绑定。
+        self._sent: list[tuple[float, str]] = []  # 自己说过的话（防自触发）
+        self.subscribe("player_chat", self._on_player_chat)
+        self.subscribe("system_chat", self._on_system_chat)
+        self.subscribe("chat_sent", self._on_chat_sent)
         self.subscribe("player_join", self._on_player_join)
         self.subscribe("player_leave", self._on_player_leave)
         self.subscribe("death", self._on_death)
@@ -248,9 +265,10 @@ class Scheduler(Plugin):
             description=(
                 "Add a scheduled task. It can repeat every interval seconds, "
                 "run daily at a local HH:MM time, fire on a game event "
-                "(player_join, player_leave, death, respawn), and/or fire when "
-                "a state condition such as 'health < 8' becomes true. Takes "
-                "effect within 5 seconds."
+                "(player_chat, system_chat, player_join, player_leave, death, "
+                "respawn), and/or fire when a state condition such as "
+                "'health < 8' becomes true. Chat events need match set to the "
+                "text to look for. Takes effect within 5 seconds."
             ),
             parameters=TASK_SCHEMA,
             llm=True,
@@ -426,6 +444,22 @@ class Scheduler(Plugin):
         match = str(task.get("match") or "").strip()
         if match and not event:
             return None, "match only applies to event tasks"
+        if event in CHAT_EVENTS and not match:
+            return None, (
+                "chat events need match: the text to look for (without it every "
+                "single chat line would run the task)"
+            )
+        # 自己的输出又命中自己的 match，就会一直触发下去。这种任务在建立的
+        # 那一刻就能看出来，不必等到刷屏被服务器禁言才发现。
+        if (
+            event in CHAT_EVENTS
+            and action in ("chat", "command")
+            and match.lower() in text.lower()
+        ):
+            return None, (
+                "this task would trigger itself: its text contains the match "
+                f"text {match!r}"
+            )
         if interval is None and not time_spec and not event and not condition:
             return None, "provide interval, time, event, and/or condition"
         return {
@@ -554,6 +588,37 @@ class Scheduler(Plugin):
         return str(wanted).lower() in haystack
 
     # ---- 事件触发 ----
+
+    async def _on_chat_sent(self, message) -> None:
+        """记下自己（或任何插件）说过的话，用来识别服务器回显。"""
+
+        text = str(message or "").strip()
+        if text:
+            self._sent.append((time.monotonic(), text))
+
+    def _is_echo(self, text: str) -> bool:
+        now = time.monotonic()
+        self._sent = [
+            (at, sent) for at, sent in self._sent if now - at <= ECHO_MEMORY
+        ]
+        lowered = text.lower()
+        return any(sent.lower() in lowered for _, sent in self._sent)
+
+    async def _on_player_chat(self, sender, name, message, chat_type_id, target) -> None:
+        speaker = plain_text(name)
+        text = plain_text(message) if message is not None else ""
+        bot = self.bot
+        if bot is not None and speaker == getattr(bot, "username", None):
+            return  # 服务器把自己说的话广播回来，不能拿它触发自己
+        if self._is_echo(text):
+            return
+        await self._fire_event("player_chat", {"player": speaker, "message": text})
+
+    async def _on_system_chat(self, component, overlay) -> None:
+        text = plain_text(component)
+        if self._is_echo(text):
+            return  # 命令/聊天的服务器回显
+        await self._fire_event("system_chat", {"message": text})
 
     async def _on_player_join(self, entry) -> None:
         await self._fire_event(

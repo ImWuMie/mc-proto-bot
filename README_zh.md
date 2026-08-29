@@ -361,7 +361,7 @@ class HelloReply(Plugin):
 （可按玩家/关键词/系统广播过滤），并用 OpenAI 兼容的 function calling 执行
 动作——发消息、执行命令、行走/寻路、转头（绝对/相对）、查询玩家位置、
 查看游戏状态、自检运行状态（`get_system_info`：模型、上下文占用、连接时长、
-插件与任务数）、开关/修改(patch)/读取插件源码、编写新插件、管理定时任务，
+插件与任务数）、开关/修改(patch)/读取/删除插件、编写新插件、管理定时任务，
 以及维护**按服务器分开的 Markdown 记忆**（`MEMORY.md`，可多文件）并自主更新。
 
 **首次运行**会自动生成 `plugins/llm_agent.json`——填好端点与密钥后保存一次
@@ -435,8 +435,11 @@ class HelloReply(Plugin):
 - **记忆**按服务器存放在 `llm_agent_memory/<host>_<port>/MEMORY.md`，智能体
   通过 `read_memory` / `save_memory` / `write_memory` / `clear_memory` 自主
   维护，每次对话都会带上。
-- **管理工具**（`write_plugin`、`set_plugin`）仅限 `admins` 名单；生成的插件
-  写入独立的 `plugins_llm/` 目录（与手工 `plugins/` 分开），重启后自动恢复。
+- **管理工具**（`write_plugin`、`patch_plugin`、`set_plugin`、`remove_plugin`）
+  仅限 `admins` 名单；生成的插件写入独立的 `plugins_llm/` 目录（与手工
+  `plugins/` 分开），重启后自动恢复。`remove_plugin` 会关掉插件并**删除源
+  文件**，不可撤销（只想停掉用 `set_plugin` 的 `enabled: false`）；它拒绝删
+  `llm_agent` 自己，否则智能体连自己一起没了。
 - **私聊**：形如 `[玩家 -> me] ...` 的系统私聊消息总是触发回复；发送者参与
   管理员权限判定。
 - `llm_agent.json`、记忆目录与 `plugins_llm/` 已加入 .gitignore——设置文件
@@ -457,6 +460,8 @@ class HelloReply(Plugin):
      "text": "say 该清理掉落物啦", "enabled": true},
     {"name": "迎新", "event": "player_join", "action": "chat",
      "text": "欢迎 {player}！", "cooldown": 5, "enabled": true},
+    {"name": "开门", "event": "player_chat", "match": "开门",
+     "action": "command", "text": "say 来了来了", "enabled": true},
     {"name": "血量告警", "condition": "health < 8", "action": "remind",
      "text": "血量只剩 {health} 了，想想办法", "enabled": true}
   ]
@@ -465,8 +470,8 @@ class HelloReply(Plugin):
 
 - 四种触发方式可以组合，至少给一个：`interval`（秒，最小 5）循环执行；
   `time`（`HH:MM` 24 小时本地时间）每天一次；`event` 由游戏事件触发
-  （`player_join`、`player_leave`、`death`、`respawn`）；`condition` 由状态
-  条件触发。
+  （`player_chat`、`system_chat`、`player_join`、`player_leave`、`death`、
+  `respawn`）；`condition` 由状态条件触发。
 - **`condition` 单独出现时是触发器**——条件由假变真的那一刻执行一次，而不是
   「条件为真就每秒来一遍」；**与 `interval`/`time`/`event` 同时出现时是开关**，
   到点或事件发生时条件不成立就跳过这一次。条件是比较式（`<`、`<=`、`>`、
@@ -475,8 +480,11 @@ class HelloReply(Plugin):
   `players > 4 and dead == false`。不支持 `or`，也不会 eval 任何代码：条件是
   被解析的，写错在建任务的那一刻就被拒绝，而不是等到执行时才炸。
 - `cooldown` 是同一任务两次执行的最小间隔（秒）——迎新任务值得设一下，
-  否则十个人同时进服就会发十条。`match` 只在事件内容（玩家名、死亡消息）
-  包含该子串时才触发。
+  否则十个人同时进服就会发十条。`match` 只在事件内容（聊天内容、玩家名、
+  死亡消息）包含该子串时才触发，两个聊天事件**必须**给它：不给的话任何人
+  说任何话都会触发一次。`text` 里含着自己 `match` 的任务会被拒绝——那会
+  一直触发自己；bot 也会忽略服务器回显的自己的话（按名字，以及按 10 秒内
+  自己说过的内容）。
 - `text` 支持占位符，执行时替换：`{player}`、`{message}`（死亡消息）、
   `{bot}`、`{health}`、`{food}`、`{players}`、`{x}`、`{y}`、`{z}`、`{hour}`、
   `{minute}`。其他花括号内容原样保留，命令语法不会被吃掉。
@@ -487,15 +495,16 @@ class HelloReply(Plugin):
 - **LLM 智能体可以直接管理这些任务**：插件暴露了 `scheduler.list` / `add` /
   `set` / `remove` / `run`（立即执行一次）/ `status`，会自动成为智能体的工具，
   除 `list`、`status` 外都仅限管理员。在游戏里说「每 30 分钟提醒大家吃饭」
-  就能建好任务，说「有人进服就打个招呼」「血量低于 8 就告诉我」同样能建出
-  事件/条件任务。校验规则只写在插件里，所以文件、服务调用、智能体三条路径
+  就能建好任务，说「有人进服就打个招呼」「有人说开门就应一声」「血量低于 8
+  就告诉我」同样能建出事件/条件任务。校验规则只写在插件里，所以文件、服务调用、智能体三条路径
   遵守同一套规则。
 - **叫醒智能体**：`action: remind` 调用暴露出来的 `llm_agent.remind`，内容作为
   「提醒」进入 LLM 而不是被原样念出来——「每小时看看有没有人需要帮忙」这种任务
   就由它自己决定做什么、或者干脆不说话。提醒不携带管理员权限；没装智能体插件时
   任务会被跳过并提示。
-- 事件触发依赖玩家列表的两个包，它们在协议 774（1.21.11）上未经核实——
-  那个版本上 `player_join` / `player_leave` 不会触发。
+- 协议 774（1.21.11）上玩家列表与 combat death 的包 ID 未经核实，所以那个
+  版本上 `player_join`、`player_leave`、`death` 不会触发；聊天、
+  `system_chat` 与 `respawn` 各版本都可用。
 
 ### 自动钓鱼插件（fishing）
 
