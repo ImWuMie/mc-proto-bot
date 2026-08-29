@@ -12,8 +12,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - name: Build
-        run: python release.py
+      - name: Build packages
+        run: python release.py packages
+      - name: Publish artifacts to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  portable:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build the self-contained portable
+        run: |
+          uv sync --extra online --extra tui
+          uv run python release.py portable
       - name: Publish artifacts to the release
         uses: softprops/action-gh-release@v2
         with:

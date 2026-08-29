@@ -14,7 +14,9 @@ tui = [
 ]
 
 [dependency-groups]
-dev = []
+dev = [
+    "pyinstaller>=6.11",  # release.py portable
+]
 
 [project.scripts]
 protobot = "protobot.cli_app:main"

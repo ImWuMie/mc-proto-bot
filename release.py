@@ -1,24 +1,26 @@
-"""Build everything a ProtoBot release ships, in one command.
+"""Build everything a ProtoBot release ships.
 
-What comes out of dist/:
+Two kinds of artifacts land in dist/:
 
-- ``protobot-<version>.tar.gz`` and ``.whl`` -- the pip/uv packages. The wheel
-  carries the block-state tables and the bundled example plugins, and exposes
-  the ``protobot`` console command with all its subcommands.
-- ``protobot-<version>-portable.zip`` -- the whole repository at HEAD (git
-  archive), launchers and example plugins included. Extract it anywhere, open
-  a terminal in that folder and run ``protobot.bat`` / ``./protobot.sh``; the
-  first-run wizard writes config.yaml and a starter plugins/ directory next to
-  it. Only Python 3.12+ is needed -- no install step.
+- **pip/uv packages** (``packages``): sdist + wheel. The wheel carries the
+  block-state tables and the bundled example plugins; ``protobot setup``
+  writes a starter plugins/ directory next to the config for pip users.
+- **Self-contained portable** (``portable``): a PyInstaller onedir build --
+  protobot.exe plus its own Python runtime -- zipped up with the example
+  plugins and the READMEs. Extract it anywhere and run protobot.exe: nothing
+  to install, no Python required. Built on Windows this is a Windows exe; the
+  zip name carries the platform.
 
-Usage: ``python release.py``. Requires git and uv on PATH (uv falls back to
-``python -m build``). The tree should be committed and clean so the zip and
-the version stamp match what was built.
+Usage: ``python release.py [all|packages|portable]`` (default: all).
+Requires git, uv, and PyInstaller (installed through the dev dependency
+group). The tree should be committed and clean so what is built matches HEAD.
 """
 
 from __future__ import annotations
 
+import argparse
 import pathlib
+import platform
 import shutil
 import subprocess
 import sys
@@ -46,41 +48,94 @@ def run(command: list[str], **kwargs) -> None:
     subprocess.run(command, check=True, **kwargs)
 
 
-def main() -> int:
-    ver = version()
+def sync_examples() -> None:
+    """Refresh the bundled example plugins from the canonical sources.
 
-    # 1. Refresh the bundled example plugins from the canonical sources.
-    #    Committed copies keep pip installs from a plain checkout complete;
-    #    overwriting here means a release can never ship stale examples.
+    Committed copies keep pip installs from a plain checkout complete;
+    overwriting here means a release can never ship stale examples.
+    """
     bundled = ROOT / "protobot" / "examples" / "plugins"
     for name in EXAMPLE_PLUGINS:
         shutil.copyfile(ROOT / "plugins" / name, bundled / name)
     print(f"synced {len(EXAMPLE_PLUGINS)} example plugin(s)")
 
-    # 2. sdist + wheel.
+
+def warn_if_dirty() -> None:
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True
+    ).stdout.strip()
+    if status:
+        print(
+            "warning: the working tree has uncommitted changes; the release is "
+            "built from HEAD and will not include them"
+        )
+
+
+def build_packages() -> None:
     DIST.mkdir(exist_ok=True)
     if shutil.which("uv"):
         run(["uv", "build"])
     else:
         run([sys.executable, "-m", "build"])
 
-    # 3. The portable zip: exactly the tracked files at HEAD, so .gitignore
-    #    already keeps config.yaml, credentials, dist/ and runtime data out.
-    status = subprocess.run(
-        ["git", "status", "--porcelain"], capture_output=True, text=True
-    ).stdout.strip()
-    if status:
-        print("warning: the working tree has uncommitted changes; the portable "
-              "zip is built from HEAD and will not include them")
-    zip_path = DIST / f"protobot-{ver}-portable.zip"
-    if zip_path.exists():
-        zip_path.unlink()
-    run(["git", "archive", "--format=zip", "--output", str(zip_path), "HEAD"])
+
+def build_portable(ver: str) -> None:
+    if shutil.which("uv"):
+        run(["uv", "run", "python", "-m", "PyInstaller", "--noconfirm", "--clean",
+             "protobot.spec"])
+    else:
+        run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+             "protobot.spec"])
+    # Stage the onedir output together with the example plugins and the docs,
+    # then zip it. Only tracked plugin files are copied, so local runtime data
+    # (settings, memory) never leaks into a release.
+    staging = DIST / "portable"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    for path in (DIST / "protobot").iterdir():
+        (shutil.copytree if path.is_dir() else shutil.copy2)(path, staging / path.name)
+    plugin_dir = staging / "plugins"
+    plugin_dir.mkdir()
+    for name in EXAMPLE_PLUGINS:
+        shutil.copyfile(ROOT / "plugins" / name, plugin_dir / name)
+    for name in ("README.md", "README_zh.md", "LICENSE"):
+        shutil.copyfile(ROOT / name, staging / name)
+    platform_tag = f"{platform.system().lower()}-{platform.machine().lower()}"
+    zip_base = DIST / f"protobot-{ver}-{platform_tag}-portable"
+    shutil.make_archive(str(zip_base), "zip", root_dir=staging)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "step", nargs="?", default="all",
+        choices=("all", "packages", "portable"),
+        help="what to build (default: everything)",
+    )
+    args = parser.parse_args()
+
+    ver = version()
+    DIST.mkdir(exist_ok=True)
+    sync_examples()
+    warn_if_dirty()
+
+    if args.step in ("all", "packages"):
+        build_packages()
+    if args.step in ("all", "portable"):
+        build_portable(ver)
 
     print("\nrelease artifacts:")
-    for path in sorted(DIST.glob(f"protobot-{ver}*")):
-        size = path.stat().st_size / 1024 / 1024
-        print(f"  {path.name}  ({size:.1f} MB)")
+    for path in sorted(DIST.iterdir()):
+        if path.name.startswith(("protobot-",)) and (
+            path.is_file() or (path.is_dir() and path.name == "protobot")
+        ):
+            size = (
+                path.stat().st_size / 1024 / 1024
+                if path.is_file()
+                else sum(p.stat().st_size for p in path.rglob("*")) / 1024 / 1024
+            )
+            print(f"  {path.name}  ({size:.1f} MB)")
     print("\nnext: tag and publish, see the README section 'Building a release'")
     return 0
 
