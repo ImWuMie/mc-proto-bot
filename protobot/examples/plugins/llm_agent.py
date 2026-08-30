@@ -398,6 +398,34 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "fly_to_bypass_permission",
+            "description": "Navigate through 3D space to X/Y/Z while explicitly bypassing the local flight-permission check; the server remains authoritative",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "Target X coordinate"},
+                    "y": {"type": "number", "description": "Target Y coordinate"},
+                    "z": {"type": "number", "description": "Target Z coordinate"},
+                    "vclip": {
+                        "type": "boolean",
+                        "description": "Enable vertical-only wall clipping; default uses local navigation.vclip config",
+                    },
+                    "vclip_up_limit": {
+                        "type": "number",
+                        "description": "Maximum continuous upward VClip distance in blocks; omit for local config",
+                    },
+                    "vclip_down_limit": {
+                        "type": "number",
+                        "description": "Maximum continuous downward VClip distance in blocks; omit for local config",
+                    },
+                },
+                "required": ["x", "y", "z"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_player",
             "description": "Get a player's position by name (players seen in recent chat; empty name lists all visible known players)",
             "parameters": {
@@ -2649,6 +2677,13 @@ class LLMAgent(Plugin):
             return f"Flight navigation failed: {error}"
         player = bot.player
         return f"Arrived at X={player.x:.1f} Y={player.y:.1f} Z={player.z:.1f}"
+
+    async def _tool_fly_to_bypass_permission(self, args: dict) -> str:
+        """Run fly_to with the local flight-permission check disabled."""
+
+        forwarded = dict(args)
+        forwarded["bypass_permission"] = True
+        return await self._tool_fly_to(forwarded)
 
     def _deny(self, requester: str | None, action: str) -> str:
         """Refuse for lack of permission, and log it so the TUI shows the list."""
