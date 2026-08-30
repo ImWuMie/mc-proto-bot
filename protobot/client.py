@@ -25,6 +25,8 @@ from .errors import (
     UnsupportedVersion,
 )
 from .events import EventBus
+from .log import debug as log_debug
+from .log import error as log_error
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
 from .navigation import (
     FlightPathfinder,
@@ -1364,6 +1366,12 @@ class Bot:
         packet_y = current_y
         if last_y is None:
             self._anti_kick_last_packet_y = current_y
+            # Meteor waits through its initial delay window before sending
+            # the first synthetic downward packet.  Without this, the
+            # previous zero deadline makes the second movement packet dip
+            # immediately after flight starts, which can trigger strict
+            # movement checks before the server has accepted the flight state.
+            self._next_anti_kick = now + self.anti_kick_interval
         elif current_y >= last_y or last_y - current_y < 0.03130:
             packet_y = last_y - 0.03130
         else:
@@ -1373,6 +1381,11 @@ class Bot:
             self._anti_kick_last_packet_y = current_y
             return current_y
         self._next_anti_kick = now + self.anti_kick_interval
+        if packet_y != current_y:
+            log_debug(
+                f"[anti-kick] movement Y adjusted from {current_y:.5f} "
+                f"to {packet_y:.5f} (interval {self.anti_kick_interval:.2f}s)"
+            )
         return packet_y
 
     async def _send_flying_state(self) -> None:
@@ -1576,10 +1589,10 @@ class Bot:
                 "sneak": controls.sneak or controls.crawl,
                 "sprint": controls.sprint,
             }
-            if self._force_flight_active and _navigation_tick:
-                await self.send_input(**input_values)
-            else:
-                await self._sync_input(**input_values)
+            # Input packets are state-synchronized and deduplicated.  Forced
+            # flight used to resend the same input every tick, adding 20
+            # packets/sec without changing server state.
+            await self._sync_input(**input_values)
             await self._sync_sprinting(self.physics_state.sprinting)
         if send_position:
             state = self.physics_state
@@ -1589,13 +1602,27 @@ class Bot:
                 # not advertise an on-ground movement packet while flying.
                 state.on_ground = False
                 state.vertical_collision = False
-            await self.send_position(
-                state.position.x,
-                state.position.y,
-                state.position.z,
-                on_ground=False if self._force_flight_active else state.on_ground,
-                horizontal_collision=state.horizontal_collision,
-            )
+            if self._force_flight_active and _navigation_tick:
+                # Navigation updates yaw immediately before the physics tick.
+                # Carry it in the same movement packet instead of sending a
+                # Look packet followed by a Position packet every tick.
+                await self.send_position_and_rotation(
+                    state.position.x,
+                    state.position.y,
+                    state.position.z,
+                    state.yaw,
+                    state.pitch,
+                    on_ground=False,
+                    horizontal_collision=state.horizontal_collision,
+                )
+            else:
+                await self.send_position(
+                    state.position.x,
+                    state.position.y,
+                    state.position.z,
+                    on_ground=False if self._force_flight_active else state.on_ground,
+                    horizontal_collision=state.horizontal_collision,
+                )
             self.player.yaw, self.player.pitch = state.yaw, state.pitch
         self.player.pose = self.physics_state.pose
         self.player.crouching = self.physics_state.crouching
@@ -2401,8 +2428,6 @@ class Bot:
                     sneak=vertical_mode < 0 and waypoint.operation == "fly",
                     sprint=True,
                 )
-                if horizontal_distance > 1.0e-5:
-                    await self.send_look(state.yaw, state.pitch)
                 try:
                     await self.tick(controls, _navigation_tick=True)
                 finally:
@@ -2592,8 +2617,19 @@ class Bot:
             raise
         except BaseException as error:
             self._terminal_error = error
-            if isinstance(error, LoginRejected):
+            if self.disconnect_reason is None and isinstance(
+                error, (ConnectionClosed, LoginRejected)
+            ):
                 self.disconnect_reason = str(error)
+            if not (
+                isinstance(error, ConnectionClosed)
+                and self.disconnect_reason is not None
+            ):
+                log_error(
+                    f"[disconnect] state={self.state.value} "
+                    f"error={type(error).__name__}: {error}; "
+                    f"reason={self.disconnect_reason or str(error)!r}"
+                )
             await self.events.emit("error", error)
         finally:
             await self._connection.close()
@@ -2749,7 +2785,16 @@ class Bot:
     async def _handle_play(self, packet: RawPacket) -> None:
         ids = self.version.packets
         if packet.packet_id == ids.clientbound_disconnect:
-            raise ConnectionClosed(self._best_effort_reason(packet.payload))
+            reason = self._best_effort_reason(packet.payload)
+            self.disconnect_reason = reason
+            raw = packet.payload.hex()
+            if len(raw) > 512:
+                raw = raw[:512] + "..."
+            log_error(
+                f"[disconnect] server kick reason={reason!r} "
+                f"payload_hex={raw}"
+            )
+            raise ConnectionClosed(reason)
         if packet.packet_id == ids.clientbound_container_close:
             await self._handle_container_close(packet.payload)
         elif packet.packet_id == ids.clientbound_container_set_content:
@@ -4338,9 +4383,11 @@ class Bot:
             if not reader.remaining:
                 try:
                     component = json.loads(text)
-                    if isinstance(component, dict) and isinstance(component.get("text"), str):
-                        return component["text"]
-                except json.JSONDecodeError:
+                    if isinstance(component, (dict, list)):
+                        rendered = plain_text(component).strip()
+                        if rendered:
+                            return rendered
+                except (TypeError, json.JSONDecodeError):
                     pass
                 return text
         except ProtocolError:

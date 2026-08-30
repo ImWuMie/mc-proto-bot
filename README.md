@@ -119,7 +119,14 @@ Packet anti-kick follows Meteor's packet mode: at the configured interval it
 rewrites the outgoing movement packet's wire Y to `lastPacketY - 0.03130` while
 leaving the local predictor position unchanged. It may reduce idle-flight
 kicks, but it cannot grant server flight permission or bypass server-side
-movement validation.
+movement validation. It does not create an additional heartbeat packet. Flight
+navigation also combines heading and position into one `PositionRotation`
+packet per physics tick to avoid duplicate movement traffic.
+
+When the server disconnects the client, the reason is rendered from the
+disconnect component and logged as `[disconnect] server kick reason=...` along
+with a bounded `payload_hex=...` field. Unexpected socket/protocol failures are
+logged with their exception type and reason as well.
 
 VClip is enabled by default. Configure vertical clip distance locally in
 `config.yaml` (in blocks); the limits apply separately to upward and downward
