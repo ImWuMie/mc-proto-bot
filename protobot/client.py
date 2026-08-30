@@ -342,6 +342,7 @@ class Bot:
         self.vclip_down_limit = vclip_down_limit
         self.boat_physics = BoatPhysicsEngine()
         self.physics_state = PhysicsState()
+        self._navigation_active = False
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -1187,6 +1188,7 @@ class Bot:
         *,
         send_input: bool = True,
         send_position: bool = True,
+        _navigation_tick: bool = False,
     ) -> PhysicsState:
         """Advance the local player by one 20 Hz tick.
 
@@ -1198,6 +1200,8 @@ class Bot:
 
         self._require_play()
         controls = controls or MovementInput()
+        if self._navigation_active and not _navigation_tick:
+            return self.physics_state
         self._tick_remote_entity_metadata()
         if self.player.vehicle_id is not None:
             vehicle = self._controlled_root_vehicle()
@@ -1502,7 +1506,6 @@ class Bot:
                     (state.position.x, state.position.y, state.position.z),
                     (x, y, z),
                 ) <= tolerance:
-                    await self.tick(MovementInput())
                     await self._stop_flying_after_navigation(keep_flying)
                     return self.physics_state
         loop = asyncio.get_running_loop()
@@ -1523,7 +1526,6 @@ class Bot:
             if await self._execute_flight_path(path, deadline, tolerance, tick_interval):
                 state = self.physics_state
                 if math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)) <= tolerance:
-                    await self.tick(MovementInput())
                     await self._stop_flying_after_navigation(keep_flying)
                     return self.physics_state
         state = self.physics_state
@@ -1563,6 +1565,23 @@ class Bot:
         tolerance: float,
         tick_interval: float,
     ) -> bool:
+        if self._navigation_active:
+            raise RuntimeError("another navigation task is already running")
+        self._navigation_active = True
+        try:
+            return await self._execute_flight_path_unlocked(
+                path, deadline, tolerance, tick_interval
+            )
+        finally:
+            self._navigation_active = False
+
+    async def _execute_flight_path_unlocked(
+        self,
+        path: NavigationPath,
+        deadline: float,
+        tolerance: float,
+        tick_interval: float,
+    ) -> bool:
         loop = asyncio.get_running_loop()
         for waypoint in path:
             stagnant_ticks = 0
@@ -1595,7 +1614,7 @@ class Bot:
                     sneak=delta.y < -0.08,
                 )
                 await self.send_look(state.yaw, state.pitch)
-                await self.tick(controls)
+                await self.tick(controls, _navigation_tick=True)
                 if distance < best_distance - 0.01:
                     best_distance = distance
                     stagnant_ticks = 0
@@ -1608,6 +1627,24 @@ class Bot:
         return True
 
     async def _execute_path(
+        self,
+        path: NavigationPath,
+        deadline: float,
+        tolerance: float,
+        sprint: bool,
+        tick_interval: float,
+    ) -> bool:
+        if self._navigation_active:
+            raise RuntimeError("another navigation task is already running")
+        self._navigation_active = True
+        try:
+            return await self._execute_path_unlocked(
+                path, deadline, tolerance, sprint, tick_interval
+            )
+        finally:
+            self._navigation_active = False
+
+    async def _execute_path_unlocked(
         self,
         path: NavigationPath,
         deadline: float,
@@ -1640,6 +1677,7 @@ class Bot:
                         jump=jump,
                         sprint=sprint,
                     ),
+                    _navigation_tick=True,
                 )
 
                 distance = horizontal + vertical
@@ -1678,6 +1716,7 @@ class Bot:
         self._active_container_id = None
         self.registries = RegistryStore()
         self.physics_state = PhysicsState()
+        self._navigation_active = False
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
