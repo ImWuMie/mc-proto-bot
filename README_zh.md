@@ -85,8 +85,17 @@ asyncio.run(main())
 `fly_to` 到达目标后默认会关闭创造飞行。需要继续悬停时传入
 `keep_flying=True`，也可以稍后调用 `await bot.stop_flying()` 手动关闭。
 
-飞行寻路默认不会穿墙。需要使用上下 VClip 时，可以在 `config.yaml` 中配置
-本地限制（单位为方块）：
+如果服务器或代理会踢出长时间悬停的玩家，可以在本地配置 anti-kick：
+
+```yaml
+navigation:
+  anti_kick: true
+  anti_kick_interval: 1.0
+```
+
+它会周期性发送很小的上下位置变化，可能降低空中挂机被踢的概率，但不能授予服务器飞行权限，也不能绕过服务器端移动校验。
+
+飞行寻路默认开启 VClip。上下穿墙距离仍由本地配置限制（单位为方块）：
 
 ```yaml
 navigation:

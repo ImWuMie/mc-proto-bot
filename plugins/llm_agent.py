@@ -396,6 +396,18 @@ TOOLS: list[dict] = [
                         "type": "boolean",
                         "description": "Keep flight enabled after reaching the target; default false",
                     },
+                    "anti_kick": {
+                        "type": "boolean",
+                        "description": "Send small periodic flight position heartbeats to reduce idle-flying kicks; default uses local config",
+                    },
+                    "anti_kick_interval": {
+                        "type": "number",
+                        "description": "Anti-kick heartbeat interval in seconds, minimum 0.2; omit for local config",
+                    },
+                    "allow_diagonal": {
+                        "type": "boolean",
+                        "description": "Allow diagonal flight path segments; default true",
+                    },
                 },
                 "required": ["x", "y", "z"],
             },
@@ -428,6 +440,9 @@ TOOLS: list[dict] = [
                         "type": "boolean",
                         "description": "Keep flight enabled after reaching the target; default false",
                     },
+                    "anti_kick": {"type": "boolean", "description": "Enable anti-kick flight heartbeats; omit for local config"},
+                    "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
+                    "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
                 },
                 "required": ["x", "y", "z"],
             },
@@ -452,6 +467,9 @@ TOOLS: list[dict] = [
                     "vclip_up_limit": {"type": "number"},
                     "vclip_down_limit": {"type": "number"},
                     "keep_flying": {"type": "boolean", "description": "Keep flight enabled after reaching the target; default false"},
+                    "anti_kick": {"type": "boolean", "description": "Enable anti-kick flight heartbeats; omit for local config"},
+                    "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
+                    "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
                 },
                 "required": ["coordinates"],
             },
@@ -2717,6 +2735,15 @@ class LLMAgent(Plugin):
                 except (TypeError, ValueError):
                     return f"Argument {name} must be a number"
         kwargs["keep_flying"] = keep_flying
+        if "allow_diagonal" in args:
+            kwargs["allow_diagonal"] = bool(args["allow_diagonal"])
+        if "anti_kick" in args:
+            kwargs["anti_kick"] = bool(args["anti_kick"])
+        if "anti_kick_interval" in args and args["anti_kick_interval"] is not None:
+            try:
+                kwargs["anti_kick_interval"] = float(args["anti_kick_interval"])
+            except (TypeError, ValueError):
+                return "Argument anti_kick_interval must be a number"
         try:
             log.info(
                 f"[LLM] flight navigation requested: X={x:.1f} Y={y:.1f} Z={z:.1f} "
@@ -2740,6 +2767,10 @@ class LLMAgent(Plugin):
                     await bot.stop_flying()
                 except Exception:
                     pass
+            try:
+                await bot.set_anti_kick(False)
+            except Exception:
+                pass
             return f"Flight navigation failed: {error}"
         player = bot.player
         log.info(
@@ -2770,6 +2801,11 @@ class LLMAgent(Plugin):
                 forwarded[key] = args[key]
         if "keep_flying" in args:
             forwarded["keep_flying"] = args["keep_flying"]
+        for key in ("anti_kick", "anti_kick_interval"):
+            if key in args:
+                forwarded[key] = args[key]
+        if "allow_diagonal" in args:
+            forwarded["allow_diagonal"] = args["allow_diagonal"]
         return await self._tool_fly_to(forwarded)
 
     def _deny(self, requester: str | None, action: str) -> str:

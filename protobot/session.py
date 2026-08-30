@@ -42,9 +42,11 @@ class SessionConfig:
     reconnect_delay: float = 5.0  # seconds between attempts
     reconnect_max_attempts: int | None = None  # None = reconnect forever
     connect_timeout: float = 30.0  # passed to connect(timeout=...)
-    vclip: bool = False
+    vclip: bool = True
     vclip_up_limit: float = 0.0
     vclip_down_limit: float = 0.0
+    anti_kick: bool = True
+    anti_kick_interval: float = 1.0
 
     def __post_init__(self) -> None:
         if not 1 <= self.port <= 65535:
@@ -78,6 +80,15 @@ class SessionConfig:
             or self.vclip_down_limit < 0
         ):
             raise ValueError("VClip limits must be non-negative")
+        if not isinstance(self.anti_kick, bool):
+            raise ValueError("anti_kick must be a bool")
+        if (
+            not isinstance(self.anti_kick_interval, (int, float))
+            or isinstance(self.anti_kick_interval, bool)
+            or not math.isfinite(self.anti_kick_interval)
+            or self.anti_kick_interval < 0.2
+        ):
+            raise ValueError("anti_kick_interval must be at least 0.2 seconds")
 
 
 # Returns (username, access_token, profile_uuid) -- resolved fresh per attempt.
@@ -116,6 +127,8 @@ async def default_connector(
         vclip=config.vclip,
         vclip_up_limit=config.vclip_up_limit,
         vclip_down_limit=config.vclip_down_limit,
+        anti_kick=config.anti_kick,
+        anti_kick_interval=config.anti_kick_interval,
     )
 
 

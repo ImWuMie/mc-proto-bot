@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import ipaddress
@@ -29,6 +30,7 @@ from .navigation import (
     FlightPathfinder,
     NavigationPath,
     NavigationTimeout,
+    PathNotFound,
     PathWaypoint,
     Pathfinder,
 )
@@ -163,6 +165,60 @@ def _parse_chat_text(text: str) -> object:
         return text
 
 
+def _find_ground_path(
+    world,
+    start: Vec3,
+    target: Vec3,
+    *,
+    player_width: float,
+    player_height: float,
+    step_height: float,
+    max_drop: float,
+    allow_diagonal: bool,
+    max_nodes: int,
+    match_target_y: bool,
+) -> NavigationPath:
+    planner = Pathfinder(
+        world,
+        player_width=player_width,
+        player_height=player_height,
+        step_height=step_height,
+        max_drop=max_drop,
+        allow_diagonal=allow_diagonal,
+    )
+    return planner.find_path(
+        start,
+        target,
+        match_target_y=match_target_y,
+        max_nodes=max_nodes,
+    )
+
+
+def _find_flight_path(
+    world,
+    start: Vec3,
+    target: Vec3,
+    *,
+    player_width: float,
+    player_height: float,
+    allow_diagonal: bool,
+    vclip: bool,
+    vclip_up_limit: float,
+    vclip_down_limit: float,
+    max_nodes: int,
+) -> NavigationPath:
+    planner = FlightPathfinder(
+        world,
+        player_width=player_width,
+        player_height=player_height,
+        allow_diagonal=allow_diagonal,
+        vclip=vclip,
+        vclip_up_limit=vclip_up_limit,
+        vclip_down_limit=vclip_down_limit,
+    )
+    return planner.find_path(start, target, max_nodes=max_nodes)
+
+
 class _UnsupportedItemComponents(Exception):
     pass
 
@@ -236,9 +292,11 @@ class Bot:
         block_state_table: str | None = None,
         physics_engine: PhysicsEngine | None = None,
         physics_attributes: PhysicsAttributes | None = None,
-        vclip: bool = False,
+        vclip: bool = True,
         vclip_up_limit: float = 0.0,
         vclip_down_limit: float = 0.0,
+        anti_kick: bool = True,
+        anti_kick_interval: float = 1.0,
     ) -> None:
         if not 1 <= len(username) <= 16:
             raise ValueError("username must contain 1 to 16 characters")
@@ -340,6 +398,14 @@ class Bot:
         self.vclip = vclip
         self.vclip_up_limit = vclip_up_limit
         self.vclip_down_limit = vclip_down_limit
+        if not isinstance(anti_kick, bool):
+            raise TypeError("anti_kick must be a bool")
+        if not math.isfinite(anti_kick_interval) or anti_kick_interval < 0.2:
+            raise ValueError("anti_kick_interval must be at least 0.2 seconds")
+        self.anti_kick = anti_kick
+        self.anti_kick_interval = anti_kick_interval
+        self._next_anti_kick = 0.0
+        self._anti_kick_direction = 1.0
         self.boat_physics = BoatPhysicsEngine()
         self.physics_state = PhysicsState()
         self._navigation_active = False
@@ -1065,6 +1131,28 @@ class Bot:
 
         await self.set_flying(False, bypass_permission=True)
 
+    async def set_anti_kick(
+        self,
+        enabled: bool,
+        *,
+        interval: float | None = None,
+    ) -> None:
+        """Enable periodic flying heartbeats and local flight reassertion.
+
+        This helps proxies/plugins that kick idle flying clients, but it cannot
+        grant server-side ``mayfly`` permission or defeat server movement checks.
+        """
+
+        if not isinstance(enabled, bool):
+            raise TypeError("anti_kick enabled must be a bool")
+        if interval is not None:
+            if not math.isfinite(interval) or interval < 0.2:
+                raise ValueError("anti_kick interval must be at least 0.2 seconds")
+            self.anti_kick_interval = interval
+        self.anti_kick = enabled
+        self._next_anti_kick = 0.0
+        self._anti_kick_direction = 1.0
+
     async def start_gliding(self) -> None:
         """Request fall-flying and start the local Elytra predictor.
 
@@ -1276,6 +1364,19 @@ class Bot:
                 horizontal_collision=state.horizontal_collision,
             )
             self.player.yaw, self.player.pitch = state.yaw, state.pitch
+            if self.anti_kick and self.physics_state.flying and not self._navigation_active:
+                now = asyncio.get_running_loop().time()
+                if now >= self._next_anti_kick:
+                    offset = 0.04 * self._anti_kick_direction
+                    self._anti_kick_direction *= -1.0
+                    await self.send_position(
+                        state.position.x,
+                        state.position.y + offset,
+                        state.position.z,
+                        on_ground=False,
+                        horizontal_collision=False,
+                    )
+                    self._next_anti_kick = now + self.anti_kick_interval
         self.player.pose = self.physics_state.pose
         self.player.crouching = self.physics_state.crouching
         self.player.swimming = self.physics_state.swimming
@@ -1359,6 +1460,68 @@ class Bot:
             max_nodes=max_nodes,
         )
 
+    def _navigation_world_snapshot(self) -> World:
+        """Copy loaded chunks so worker-thread pathfinding never reads live state."""
+
+        snapshot = copy.copy(self.world)
+        snapshot.chunks = {}
+        for key, chunk in self.world.chunks.items():
+            cloned = copy.copy(chunk)
+            cloned.sections = list(chunk.sections)
+            snapshot.chunks[key] = cloned
+        snapshot.set_entity_collision_provider(None)
+        return snapshot
+
+    async def _plan_path_async(
+        self,
+        x: float,
+        z: float,
+        *,
+        y: float | None,
+        max_nodes: int,
+        max_drop: float,
+        allow_diagonal: bool = True,
+    ) -> NavigationPath:
+        self._require_play()
+        if not self.world_ready.is_set():
+            raise RuntimeError("path planning requires at least one decoded chunk")
+        state = self.physics_state
+        target_y = state.position.y if y is None else y
+        return await asyncio.to_thread(
+            _find_ground_path,
+            self._navigation_world_snapshot(),
+            state.position,
+            Vec3(x, target_y, z),
+            player_width=state.width,
+            player_height=state.height,
+            step_height=self.physics._attribute(state, "step_height"),
+            max_drop=max_drop,
+            allow_diagonal=allow_diagonal,
+            max_nodes=max_nodes,
+            match_target_y=y is not None,
+        )
+
+    async def plan_path_async(
+        self,
+        x: float,
+        z: float,
+        *,
+        y: float | None = None,
+        max_nodes: int = 4096,
+        max_drop: float = 3.0,
+        allow_diagonal: bool = True,
+    ) -> NavigationPath:
+        """Plan a walking route in a worker thread without blocking I/O."""
+
+        return await self._plan_path_async(
+            x,
+            z,
+            y=y,
+            max_nodes=max_nodes,
+            max_drop=max_drop,
+            allow_diagonal=allow_diagonal,
+        )
+
     async def navigate_to(
         self,
         x: float,
@@ -1372,6 +1535,7 @@ class Bot:
         max_drop: float = 3.0,
         replans: int = 3,
         tick_interval: float = 0.05,
+        allow_diagonal: bool = True,
     ) -> PhysicsState:
         """Plan and execute a route using ordinary player input and physics.
 
@@ -1401,7 +1565,17 @@ class Bot:
             remaining = deadline - loop.time()
             if remaining <= 0.0:
                 break
-            path = self.plan_path(x, z, y=y, max_nodes=max_nodes, max_drop=max_drop)
+            path = await asyncio.wait_for(
+                self._plan_path_async(
+                    x,
+                    z,
+                    y=y,
+                    max_nodes=max_nodes,
+                    max_drop=max_drop,
+                    allow_diagonal=allow_diagonal,
+                ),
+                timeout=remaining,
+            )
             await self.events.emit("path", path, attempt)
             if await self._execute_path(path, deadline, tolerance, sprint, tick_interval):
                 state = self.physics_state
@@ -1455,6 +1629,62 @@ class Bot:
             max_nodes=max_nodes,
         )
 
+    async def _plan_flight_path_async(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        *,
+        max_nodes: int,
+        vclip: bool | None,
+        vclip_up_limit: float | None,
+        vclip_down_limit: float | None,
+        allow_diagonal: bool = True,
+    ) -> NavigationPath:
+        self._require_play()
+        if not self.world_ready.is_set():
+            raise RuntimeError("flight path planning requires at least one decoded chunk")
+        self._validate_finite((x, y, z), "flight target")
+        state = self.physics_state
+        return await asyncio.to_thread(
+            _find_flight_path,
+            self._navigation_world_snapshot(),
+            state.position,
+            Vec3(x, y, z),
+            player_width=state.width,
+            player_height=state.height,
+            allow_diagonal=allow_diagonal,
+            vclip=self.vclip if vclip is None else vclip,
+            vclip_up_limit=self.vclip_up_limit if vclip_up_limit is None else vclip_up_limit,
+            vclip_down_limit=self.vclip_down_limit if vclip_down_limit is None else vclip_down_limit,
+            max_nodes=max_nodes,
+        )
+
+    async def plan_flight_path_async(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        *,
+        max_nodes: int = 8192,
+        vclip: bool | None = None,
+        vclip_up_limit: float | None = None,
+        vclip_down_limit: float | None = None,
+        allow_diagonal: bool = True,
+    ) -> NavigationPath:
+        """Plan a 3D flight route in a worker thread without blocking I/O."""
+
+        return await self._plan_flight_path_async(
+            x,
+            y,
+            z,
+            max_nodes=max_nodes,
+            vclip=vclip,
+            vclip_up_limit=vclip_up_limit,
+            vclip_down_limit=vclip_down_limit,
+            allow_diagonal=allow_diagonal,
+        )
+
     async def fly_to(
         self,
         x: float,
@@ -1471,6 +1701,9 @@ class Bot:
         vclip_up_limit: float | None = None,
         vclip_down_limit: float | None = None,
         keep_flying: bool = False,
+        anti_kick: bool | None = None,
+        anti_kick_interval: float | None = None,
+        allow_diagonal: bool = True,
     ) -> PhysicsState:
         """Enable creative/spectator flight and navigate to a 3D target."""
 
@@ -1488,6 +1721,17 @@ class Bot:
             raise TypeError("bypass_permission must be a bool")
         if not isinstance(keep_flying, bool):
             raise TypeError("keep_flying must be a bool")
+        if anti_kick is not None and not isinstance(anti_kick, bool):
+            raise TypeError("anti_kick must be a bool or None")
+        if anti_kick_interval is not None and (
+            not math.isfinite(anti_kick_interval) or anti_kick_interval < 0.2
+        ):
+            raise ValueError("anti_kick_interval must be at least 0.2 seconds")
+        if anti_kick is not None or anti_kick_interval is not None:
+            await self.set_anti_kick(
+                self.anti_kick if anti_kick is None else anti_kick,
+                interval=anti_kick_interval,
+            )
         if not self.physics_state.flying:
             await self.set_flying(True, bypass_permission=bypass_permission)
         # A player asking for a point directly above/below the bot should not
@@ -1513,15 +1757,25 @@ class Bot:
         for attempt in range(replans + 1):
             if deadline <= loop.time():
                 break
-            path = self.plan_flight_path(
-                x,
-                y,
-                z,
-                max_nodes=max_nodes,
-                vclip=vclip,
-                vclip_up_limit=vclip_up_limit,
-                vclip_down_limit=vclip_down_limit,
-            )
+            try:
+                path = await asyncio.wait_for(
+                    self._plan_flight_path_async(
+                        x,
+                        y,
+                        z,
+                        max_nodes=max_nodes,
+                        vclip=vclip,
+                        vclip_up_limit=vclip_up_limit,
+                        vclip_down_limit=vclip_down_limit,
+                        allow_diagonal=allow_diagonal,
+                    ),
+                    timeout=deadline - loop.time(),
+                )
+            except (asyncio.TimeoutError, PathNotFound) as error:
+                await self._stop_flying_after_navigation(keep_flying)
+                if isinstance(error, asyncio.TimeoutError):
+                    raise NavigationTimeout("flight path planning timed out") from error
+                raise
             await self.events.emit("flight_path", path, attempt)
             if await self._execute_flight_path(path, deadline, tolerance, tick_interval):
                 state = self.physics_state
@@ -1717,6 +1971,8 @@ class Bot:
         self.registries = RegistryStore()
         self.physics_state = PhysicsState()
         self._navigation_active = False
+        self._next_anti_kick = 0.0
+        self._anti_kick_direction = 1.0
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -3553,9 +3809,11 @@ async def connect(
     block_state_table: str | None = None,
     physics_engine: PhysicsEngine | None = None,
     physics_attributes: PhysicsAttributes | None = None,
-    vclip: bool = False,
+    vclip: bool = True,
     vclip_up_limit: float = 0.0,
     vclip_down_limit: float = 0.0,
+    anti_kick: bool = True,
+    anti_kick_interval: float = 1.0,
 ) -> Bot:
     """Connect a bot (offline or online) and return it after the initial spawn position."""
     if not math.isfinite(timeout) or timeout <= 0.0:
@@ -3591,6 +3849,8 @@ async def connect(
         vclip=vclip,
         vclip_up_limit=vclip_up_limit,
         vclip_down_limit=vclip_down_limit,
+        anti_kick=anti_kick,
+        anti_kick_interval=anti_kick_interval,
     )
     try:
         await bot.start()

@@ -86,7 +86,20 @@ asyncio.run(main())
 `fly_to` disables creative flight after it reaches the target. Pass
 `keep_flying=True` to remain airborne, or call `await bot.stop_flying()` later.
 
-VClip is disabled by default. Configure vertical clip distance locally in
+For servers or proxies that kick idle flying players, the anti-kick heartbeat
+is enabled by default and can be configured locally:
+
+```yaml
+navigation:
+  anti_kick: true
+  anti_kick_interval: 1.0
+```
+
+The heartbeat sends a tiny alternating vertical position update. It may reduce
+idle-flight kicks, but it cannot grant server flight permission or bypass
+server-side movement validation.
+
+VClip is enabled by default. Configure vertical clip distance locally in
 `config.yaml` (in blocks); the limits apply separately to upward and downward
 vertical wall passage:
 
