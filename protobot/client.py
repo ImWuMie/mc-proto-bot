@@ -25,7 +25,13 @@ from .errors import (
 )
 from .events import EventBus
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
-from .navigation import FlightPathfinder, NavigationPath, NavigationTimeout, Pathfinder
+from .navigation import (
+    FlightPathfinder,
+    NavigationPath,
+    NavigationTimeout,
+    PathWaypoint,
+    Pathfinder,
+)
 from .physics import (
     AABB,
     BoatPhysicsEngine,
@@ -1472,6 +1478,24 @@ class Bot:
             raise TypeError("bypass_permission must be a bool")
         if not self.physics_state.flying:
             await self.set_flying(True, bypass_permission=bypass_permission)
+        # A player asking for a point directly above/below the bot should not
+        # pay the cost of a world-wide A* search (and this also works before
+        # the surrounding chunks have finished loading).
+        direct_distance = math.dist(
+            (self.physics_state.position.x, self.physics_state.position.y, self.physics_state.position.z),
+            (x, y, z),
+        )
+        if direct_distance <= 8.0:
+            direct_deadline = asyncio.get_running_loop().time() + min(timeout, 10.0)
+            direct_path = NavigationPath((PathWaypoint(Vec3(x, y, z)),), 0, direct_distance)
+            if await self._execute_flight_path(direct_path, direct_deadline, tolerance, tick_interval):
+                state = self.physics_state
+                if math.dist(
+                    (state.position.x, state.position.y, state.position.z),
+                    (x, y, z),
+                ) <= tolerance:
+                    await self.tick(MovementInput())
+                    return self.physics_state
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         for attempt in range(replans + 1):
@@ -1596,7 +1620,7 @@ class Bot:
                         forward=1.0 if horizontal > tolerance else 0.0,
                         jump=jump,
                         sprint=sprint,
-                    )
+                    ),
                 )
 
                 distance = horizontal + vertical

@@ -121,6 +121,7 @@ How your world reaches you:
 - A turn marked "(interjection)" is the same player adding something while you were still working on their request -- a correction, a change of mind, or a new question. Fold it into what you are doing instead of finishing the old plan blindly. Only the person who started the turn can interject; anyone else waits their turn, and their words never extend your permissions.
 - The live chat stream is not in your context. Use read_chat to look up recent lines (the latest 200 are kept; filter by players, keyword, or include_system) whenever you need to know what was said.
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
+- Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
@@ -420,6 +421,29 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": ["x", "y", "z"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fly_to_xyz",
+            "description": "Parse a raw XYZ coordinate string such as '1895 71-4169' and fly there with permission bypass enabled",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "coordinates": {
+                        "type": "string",
+                        "description": "Three coordinates in X Y Z order; spaces, commas, and signed values are accepted",
+                    },
+                    "vclip": {
+                        "type": "boolean",
+                        "description": "Enable vertical-only wall clipping; default uses local navigation.vclip config",
+                    },
+                    "vclip_up_limit": {"type": "number"},
+                    "vclip_down_limit": {"type": "number"},
+                },
+                "required": ["coordinates"],
             },
         },
     },
@@ -1978,7 +2002,13 @@ class LLMAgent(Plugin):
                     arguments = json.loads(function.get("arguments") or "{}")
                 except (TypeError, json.JSONDecodeError):
                     arguments = {}
-                result = await self._run_tool(tool_name, arguments)
+                try:
+                    result = await asyncio.wait_for(
+                        self._run_tool(tool_name, arguments),
+                        timeout=max(10.0, min(float(settings.get("timeout", 120.0)), 60.0)),
+                    )
+                except asyncio.TimeoutError:
+                    result = f"Tool {tool_name} timed out; the movement was cancelled"
                 messages.append(
                     {
                         "role": "tool",
@@ -2640,11 +2670,17 @@ class LLMAgent(Plugin):
             z = float(args.get("z"))
         except (TypeError, ValueError):
             return "Arguments x/z must be numbers"
-        try:
-            await bot.navigate_to(x, z, timeout=60.0)
-        except TimeoutError:
-            return "Failed to reach the target within 60 s"
         player = bot.player
+        if math.hypot(x - player.x, z - player.z) > 256.0:
+            return "Ground target is too far for walking; use fly_to_xyz with the full X Y Z coordinates"
+        try:
+            log.info(f"[LLM] ground navigation requested: X={x:.1f} Z={z:.1f}")
+            await asyncio.wait_for(bot.navigate_to(x, z, timeout=30.0), timeout=35.0)
+        except TimeoutError:
+            return "Failed to reach the ground target within 35 s"
+        except Exception as error:
+            return f"Ground navigation failed: {error}"
+        log.info(f"[LLM] ground navigation finished: X={player.x:.1f} Z={player.z:.1f}")
         return f"Arrived at X={player.x:.1f} Z={player.z:.1f}"
 
     async def _tool_fly_to(self, args: dict) -> str:
@@ -2670,12 +2706,23 @@ class LLMAgent(Plugin):
                 except (TypeError, ValueError):
                     return f"Argument {name} must be a number"
         try:
-            await bot.fly_to(x, y, z, **kwargs)
+            log.info(
+                f"[LLM] flight navigation requested: X={x:.1f} Y={y:.1f} Z={z:.1f} "
+                f"vclip={kwargs.get('vclip', 'config')}"
+            )
+            await asyncio.wait_for(bot.fly_to(x, y, z, timeout=45.0, **kwargs), timeout=50.0)
         except TimeoutError:
-            return "Failed to reach the flight target within 60 s"
-        except (ValueError, RuntimeError) as error:
+            try:
+                await bot.send_input()
+            except Exception:
+                pass
+            return "Failed to reach the flight target within 50 s"
+        except Exception as error:
             return f"Flight navigation failed: {error}"
         player = bot.player
+        log.info(
+            f"[LLM] flight navigation finished: X={player.x:.1f} Y={player.y:.1f} Z={player.z:.1f}"
+        )
         return f"Arrived at X={player.x:.1f} Y={player.y:.1f} Z={player.z:.1f}"
 
     async def _tool_fly_to_bypass_permission(self, args: dict) -> str:
@@ -2683,6 +2730,22 @@ class LLMAgent(Plugin):
 
         forwarded = dict(args)
         forwarded["bypass_permission"] = True
+        return await self._tool_fly_to(forwarded)
+
+    async def _tool_fly_to_xyz(self, args: dict) -> str:
+        raw = str(args.get("coordinates") or "")
+        numbers = re.findall(r"[-+]?\d+(?:\.\d+)?", raw)
+        if len(numbers) != 3:
+            return "coordinates must contain exactly three numbers in X Y Z order"
+        forwarded: dict[str, object] = {
+            "x": numbers[0],
+            "y": numbers[1],
+            "z": numbers[2],
+            "bypass_permission": True,
+        }
+        for key in ("vclip", "vclip_up_limit", "vclip_down_limit"):
+            if key in args:
+                forwarded[key] = args[key]
         return await self._tool_fly_to(forwarded)
 
     def _deny(self, requester: str | None, action: str) -> str:
