@@ -123,6 +123,7 @@ How your world reaches you:
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
 - Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
 - `fly_to` uses the original flight physics by default while suppressing abilities packets; pass `force_flight=false` to use normal abilities-controlled flight.
+- If a flight tool reports `Flying is not enabled`, server correction, or missing flight authorization, do not retry the same XYZ target immediately and do not fall back to `navigate_to`; wait for the owner/server to grant flight and report the failure once.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
@@ -843,6 +844,10 @@ SENT_ECHO_WINDOW = 10.0
 #: Send-dedupe window (seconds) and how many recent lines it compares
 SENT_DEDUPE_WINDOW = 120.0
 SENT_DEDUPE_MAX = 5
+# A server-side flight denial is stable for a short period.  Suppress repeated
+# tool calls and accidental XYZ -> ground-navigation fallbacks during that
+# window; a later call can retry after permissions change.
+FLIGHT_REJECT_COOLDOWN = 20.0
 #: How many recent messages survive an auto compact
 COMPACT_KEEP_TAIL = 10
 #: Hard cap on conversation length, in case compaction keeps failing
@@ -956,6 +961,10 @@ class LLMAgent(Plugin):
         self._requester: str | None = None  # Who triggered this turn (permissions)
         self._connected_at: float | None = None  # When this connection came up
         self._sent_recent: list[tuple[float, str]] = []  # Recent sends (time, text)
+        self._flight_target_in_progress: tuple[float, float, float] | None = None
+        self._flight_rejected_target: tuple[float, float, float] | None = None
+        self._flight_rejected_until = 0.0
+        self._flight_rejected_reason = ""
         self._post_json = _http_post_json  # Tests swap in a fake
         # QQ bridge state: the botpy client runs in its own daemon thread with
         # its own loop; messages cross into the agent queue thread-safely.

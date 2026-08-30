@@ -123,6 +123,7 @@ How your world reaches you:
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
 - Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
 - `fly_to` uses the original flight physics by default while suppressing abilities packets; pass `force_flight=false` to use normal abilities-controlled flight.
+- If a flight tool reports `Flying is not enabled`, server correction, or missing flight authorization, do not retry the same XYZ target immediately and do not fall back to `navigate_to`; wait for the owner/server to grant flight and report the failure once.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
@@ -843,6 +844,10 @@ SENT_ECHO_WINDOW = 10.0
 #: Send-dedupe window (seconds) and how many recent lines it compares
 SENT_DEDUPE_WINDOW = 120.0
 SENT_DEDUPE_MAX = 5
+# A server-side flight denial is stable for a short period.  Suppress repeated
+# tool calls and accidental XYZ -> ground-navigation fallbacks during that
+# window; a later call can retry after permissions change.
+FLIGHT_REJECT_COOLDOWN = 20.0
 #: How many recent messages survive an auto compact
 COMPACT_KEEP_TAIL = 10
 #: Hard cap on conversation length, in case compaction keeps failing
@@ -956,6 +961,10 @@ class LLMAgent(Plugin):
         self._requester: str | None = None  # Who triggered this turn (permissions)
         self._connected_at: float | None = None  # When this connection came up
         self._sent_recent: list[tuple[float, str]] = []  # Recent sends (time, text)
+        self._flight_target_in_progress: tuple[float, float, float] | None = None
+        self._flight_rejected_target: tuple[float, float, float] | None = None
+        self._flight_rejected_until = 0.0
+        self._flight_rejected_reason = ""
         self._post_json = _http_post_json  # Tests swap in a fake
         # QQ bridge state: the botpy client runs in its own daemon thread with
         # its own loop; messages cross into the agent queue thread-safely.
@@ -2801,6 +2810,13 @@ class LLMAgent(Plugin):
         except (TypeError, ValueError):
             return "Arguments x/z must be numbers"
         player = bot.player
+        rejected = self._flight_rejected_target
+        if rejected is not None and time.monotonic() < self._flight_rejected_until:
+            if math.hypot(x - rejected[0], z - rejected[2]) <= 1.0:
+                return (
+                    "The requested XYZ flight target was just rejected by the server; "
+                    "do not switch to ground navigation until flight permission is granted"
+                )
         if math.hypot(x - player.x, z - player.z) > 256.0:
             return "Ground target is too far for walking; use fly_to_xyz with the full X Y Z coordinates"
         try:
@@ -2824,6 +2840,22 @@ class LLMAgent(Plugin):
         except (TypeError, ValueError):
             return "Arguments x/y/z must be numbers"
 
+        target = (x, y, z)
+        now = time.monotonic()
+        if self._flight_target_in_progress is not None:
+            active = self._flight_target_in_progress
+            if math.dist(active, target) <= 1.0:
+                return "A flight navigation to this target is already in progress"
+        if (
+            self._flight_rejected_target is not None
+            and now < self._flight_rejected_until
+            and math.dist(self._flight_rejected_target, target) <= 1.0
+        ):
+            reason = self._flight_rejected_reason or "server rejected flight movement"
+            return (
+                f"Flight target is temporarily blocked: {reason}. "
+                "Grant flight permission before retrying."
+            )
         kwargs: dict[str, object] = {
             "bypass_permission": bool(args.get("bypass_permission", True)),
         }
@@ -2855,6 +2887,7 @@ class LLMAgent(Plugin):
                 kwargs["anti_kick_interval"] = float(args["anti_kick_interval"])
             except (TypeError, ValueError):
                 return "Argument anti_kick_interval must be a number"
+        self._flight_target_in_progress = target
         try:
             log.info(
                 f"[LLM] flight navigation requested: X={x:.1f} Y={y:.1f} Z={z:.1f} "
@@ -2873,6 +2906,10 @@ class LLMAgent(Plugin):
                 except Exception:
                     pass
             detail = str(error).strip()
+            if "not authorized flying" in detail.lower() or "flying is not enabled" in detail.lower():
+                self._flight_rejected_target = target
+                self._flight_rejected_until = time.monotonic() + FLIGHT_REJECT_COOLDOWN
+                self._flight_rejected_reason = detail
             if detail:
                 return f"Flight navigation timed out: {detail}"
             return "Failed to reach the flight target within 50 s; check get_status"
@@ -2886,7 +2923,18 @@ class LLMAgent(Plugin):
                 await bot.set_anti_kick(False)
             except Exception:
                 pass
+            detail = str(error)
+            if (
+                "not authorized flying" in detail.lower()
+                or "flying is not enabled" in detail.lower()
+                or "server repeatedly corrected" in detail.lower()
+            ):
+                self._flight_rejected_target = target
+                self._flight_rejected_until = time.monotonic() + FLIGHT_REJECT_COOLDOWN
+                self._flight_rejected_reason = detail
             return f"Flight navigation failed: {error}"
+        finally:
+            self._flight_target_in_progress = None
         player = bot.player
         log.info(
             f"[LLM] flight navigation finished: X={player.x:.1f} Y={player.y:.1f} Z={player.z:.1f}"

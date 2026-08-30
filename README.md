@@ -106,9 +106,11 @@ navigation:
   anti_kick_interval: 1.0
 ```
 
-The heartbeat sends a tiny alternating vertical position update. It may reduce
-idle-flight kicks, but it cannot grant server flight permission or bypass
-server-side movement validation.
+Packet anti-kick follows Meteor's packet mode: at the configured interval it
+rewrites the outgoing movement packet's wire Y to `lastPacketY - 0.03130` while
+leaving the local predictor position unchanged. It may reduce idle-flight
+kicks, but it cannot grant server flight permission or bypass server-side
+movement validation.
 
 VClip is enabled by default. Configure vertical clip distance locally in
 `config.yaml` (in blocks); the limits apply separately to upward and downward

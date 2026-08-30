@@ -404,7 +404,11 @@ class Bot:
         self.anti_kick = anti_kick
         self.anti_kick_interval = anti_kick_interval
         self._next_anti_kick = 0.0
-        self._anti_kick_direction = 1.0
+        # Meteor's packet anti-kick mode keeps the local position untouched and
+        # rewrites only a periodic movement packet to the previous packet Y -
+        # 0.03130.  The server sees a tiny downward motion while the predictor
+        # continues from the real coordinate.
+        self._anti_kick_last_packet_y: float | None = None
         self.boat_physics = BoatPhysicsEngine()
         self.physics_state = PhysicsState()
         self._navigation_active = False
@@ -1054,10 +1058,11 @@ class Bot:
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
         self._last_sent_position = self.physics_state.position
+        packet_y = self._anti_kick_wire_y(y)
         payload = (
             PacketWriter()
             .write_double(x)
-            .write_double(y)
+            .write_double(packet_y)
             .write_double(z)
             .write_unsigned_byte(self._movement_flags())
             .to_bytes()
@@ -1084,10 +1089,11 @@ class Bot:
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
         self._last_sent_position = self.physics_state.position
+        packet_y = self._anti_kick_wire_y(y)
         payload = (
             PacketWriter()
             .write_double(x)
-            .write_double(y)
+            .write_double(packet_y)
             .write_double(z)
             .write_float(yaw)
             .write_float(pitch)
@@ -1238,7 +1244,7 @@ class Bot:
             self.anti_kick_interval = interval
         self.anti_kick = enabled
         self._next_anti_kick = 0.0
-        self._anti_kick_direction = 1.0
+        self._anti_kick_last_packet_y = None
 
     async def start_gliding(self) -> None:
         """Request fall-flying and start the local Elytra predictor.
@@ -1302,6 +1308,39 @@ class Bot:
             self.physics_state.gliding = False
             self.physics_state.gliding_ticks = 0
             self.player.gliding = False
+        else:
+            self._anti_kick_last_packet_y = None
+            self._next_anti_kick = 0.0
+
+    def _anti_kick_wire_y(self, current_y: float) -> float:
+        """Return Meteor-style packet anti-kick Y without changing local state.
+
+        Meteor's Packet mode waits for its delay window, then rewrites the
+        outgoing movement packet to ``lastPacketY - 0.03130`` whenever the
+        current packet would otherwise be level or rising (or only falling by
+        less than that threshold).  ProtoBot sends a position packet every
+        physics tick, so rewriting the packet in-place gives the same wire
+        behavior without injecting a second packet or moving the predictor.
+        """
+
+        if not self.anti_kick or not self.physics_state.flying:
+            return current_y
+        now = asyncio.get_running_loop().time()
+        if now < self._next_anti_kick:
+            # Meteor tracks the last ordinary movement packet continuously,
+            # not just when its 20-tick rewrite window opens.
+            self._anti_kick_last_packet_y = current_y
+            return current_y
+        last_y = self._anti_kick_last_packet_y
+        packet_y = current_y
+        if last_y is None:
+            self._anti_kick_last_packet_y = current_y
+        elif current_y >= last_y or last_y - current_y < 0.03130:
+            packet_y = last_y - 0.03130
+        else:
+            self._anti_kick_last_packet_y = current_y
+        self._next_anti_kick = now + self.anti_kick_interval
+        return packet_y
 
     async def _send_flying_state(self) -> None:
         if self._force_flight_active:
@@ -1350,6 +1389,22 @@ class Bot:
         self._set_movement_flags(on_ground, horizontal_collision)
         self.player.yaw, self.player.pitch = yaw, pitch
         self.physics_state.yaw, self.physics_state.pitch = yaw, pitch
+        if self.anti_kick and self.physics_state.flying:
+            # Meteor's packet mode converts rotation-only movement to a full
+            # position+rotation packet so its Y rewrite can be applied.
+            packet_y = self._anti_kick_wire_y(self.physics_state.position.y)
+            payload = (
+                PacketWriter()
+                .write_double(self.physics_state.position.x)
+                .write_double(packet_y)
+                .write_double(self.physics_state.position.z)
+                .write_float(yaw)
+                .write_float(pitch)
+                .write_unsigned_byte(self._movement_flags())
+                .to_bytes()
+            )
+            await self.send_raw(self.version.packets.serverbound_position_look, payload)
+            return
         payload = (
             PacketWriter()
             .write_float(yaw)
@@ -1369,6 +1424,20 @@ class Bot:
 
         self._require_play()
         self._set_movement_flags(on_ground, horizontal_collision)
+        if self.anti_kick and self.physics_state.flying:
+            # Likewise turn a status-only packet into a position packet.  This
+            # mirrors Meteor's Packet mode interception for Flying packets.
+            packet_y = self._anti_kick_wire_y(self.physics_state.position.y)
+            payload = (
+                PacketWriter()
+                .write_double(self.physics_state.position.x)
+                .write_double(packet_y)
+                .write_double(self.physics_state.position.z)
+                .write_unsigned_byte(self._movement_flags())
+                .to_bytes()
+            )
+            await self.send_raw(self.version.packets.serverbound_position, payload)
+            return
         await self.send_raw(
             self.version.packets.serverbound_flying,
             PacketWriter().write_unsigned_byte(self._movement_flags()).to_bytes(),
@@ -1495,19 +1564,6 @@ class Bot:
                 horizontal_collision=state.horizontal_collision,
             )
             self.player.yaw, self.player.pitch = state.yaw, state.pitch
-            if self.anti_kick and self.physics_state.flying and not self._navigation_active:
-                now = asyncio.get_running_loop().time()
-                if now >= self._next_anti_kick:
-                    offset = 0.04 * self._anti_kick_direction
-                    self._anti_kick_direction *= -1.0
-                    await self.send_position(
-                        state.position.x,
-                        state.position.y + offset,
-                        state.position.z,
-                        on_ground=False,
-                        horizontal_collision=False,
-                    )
-                    self._next_anti_kick = now + self.anti_kick_interval
         self.player.pose = self.physics_state.pose
         self.player.crouching = self.physics_state.crouching
         self.player.swimming = self.physics_state.swimming
@@ -2266,7 +2322,7 @@ class Bot:
         self._flight_server_rejected = False
         self._last_sent_position = None
         self._next_anti_kick = 0.0
-        self._anti_kick_direction = 1.0
+        self._anti_kick_last_packet_y = None
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
