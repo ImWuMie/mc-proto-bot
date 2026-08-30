@@ -1059,6 +1059,11 @@ class Bot:
         self._set_local_flying(enabled)
         await self._send_flying_state()
 
+    async def stop_flying(self) -> None:
+        """Disable creative flight and synchronize the state to the server."""
+
+        await self.set_flying(False, bypass_permission=True)
+
     async def start_gliding(self) -> None:
         """Request fall-flying and start the local Elytra predictor.
 
@@ -1461,6 +1466,7 @@ class Bot:
         vclip: bool | None = None,
         vclip_up_limit: float | None = None,
         vclip_down_limit: float | None = None,
+        keep_flying: bool = False,
     ) -> PhysicsState:
         """Enable creative/spectator flight and navigate to a 3D target."""
 
@@ -1476,6 +1482,8 @@ class Bot:
             raise ValueError("flight tick interval and replans must be non-negative")
         if not isinstance(bypass_permission, bool):
             raise TypeError("bypass_permission must be a bool")
+        if not isinstance(keep_flying, bool):
+            raise TypeError("keep_flying must be a bool")
         if not self.physics_state.flying:
             await self.set_flying(True, bypass_permission=bypass_permission)
         # A player asking for a point directly above/below the bot should not
@@ -1495,6 +1503,7 @@ class Bot:
                     (x, y, z),
                 ) <= tolerance:
                     await self.tick(MovementInput())
+                    await self._stop_flying_after_navigation(keep_flying)
                     return self.physics_state
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -1515,12 +1524,22 @@ class Bot:
                 state = self.physics_state
                 if math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)) <= tolerance:
                     await self.tick(MovementInput())
+                    await self._stop_flying_after_navigation(keep_flying)
                     return self.physics_state
         state = self.physics_state
+        await self._stop_flying_after_navigation(keep_flying)
         raise NavigationTimeout(
             f"fly_to did not reach ({x:.3f}, {y:.3f}, {z:.3f}); "
             f"remaining distance is {math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)):.3f} blocks"
         )
+
+    async def _stop_flying_after_navigation(self, keep_flying: bool) -> None:
+        """Leave creative flight off after a completed navigation task."""
+
+        if keep_flying or not self.physics_state.flying or self.physics_state.spectator:
+            return
+        self._set_local_flying(False)
+        await self._send_flying_state()
 
     async def navigate_flying_to(self, x: float, y: float, z: float, **kwargs) -> PhysicsState:  # type: ignore[no-untyped-def]
         """Alias for :meth:`fly_to`."""

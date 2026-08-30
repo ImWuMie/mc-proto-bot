@@ -122,6 +122,7 @@ How your world reaches you:
 - The live chat stream is not in your context. Use read_chat to look up recent lines (the latest 200 are kept; filter by players, keyword, or include_system) whenever you need to know what was said.
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
 - Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
+- `fly_to` stops creative flight after arrival by default; pass `keep_flying=true` only when the bot should remain airborne for another action.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
@@ -391,6 +392,10 @@ TOOLS: list[dict] = [
                         "type": "boolean",
                         "description": "Skip the local allow_flying check (default true); the server remains authoritative",
                     },
+                    "keep_flying": {
+                        "type": "boolean",
+                        "description": "Keep flight enabled after reaching the target; default false",
+                    },
                 },
                 "required": ["x", "y", "z"],
             },
@@ -419,6 +424,10 @@ TOOLS: list[dict] = [
                         "type": "number",
                         "description": "Maximum continuous downward VClip distance in blocks; omit for local config",
                     },
+                    "keep_flying": {
+                        "type": "boolean",
+                        "description": "Keep flight enabled after reaching the target; default false",
+                    },
                 },
                 "required": ["x", "y", "z"],
             },
@@ -442,6 +451,7 @@ TOOLS: list[dict] = [
                     },
                     "vclip_up_limit": {"type": "number"},
                     "vclip_down_limit": {"type": "number"},
+                    "keep_flying": {"type": "boolean", "description": "Keep flight enabled after reaching the target; default false"},
                 },
                 "required": ["coordinates"],
             },
@@ -2697,6 +2707,7 @@ class LLMAgent(Plugin):
         kwargs: dict[str, object] = {
             "bypass_permission": bool(args.get("bypass_permission", True)),
         }
+        keep_flying = bool(args.get("keep_flying", False))
         if "vclip" in args:
             kwargs["vclip"] = bool(args["vclip"])
         for name in ("vclip_up_limit", "vclip_down_limit"):
@@ -2705,6 +2716,7 @@ class LLMAgent(Plugin):
                     kwargs[name] = float(args[name])
                 except (TypeError, ValueError):
                     return f"Argument {name} must be a number"
+        kwargs["keep_flying"] = keep_flying
         try:
             log.info(
                 f"[LLM] flight navigation requested: X={x:.1f} Y={y:.1f} Z={z:.1f} "
@@ -2716,8 +2728,18 @@ class LLMAgent(Plugin):
                 await bot.send_input()
             except Exception:
                 pass
+            try:
+                if not bot.physics_state.spectator:
+                    await bot.set_flying(False, bypass_permission=True)
+            except Exception:
+                pass
             return "Failed to reach the flight target within 50 s"
         except Exception as error:
+            if not keep_flying:
+                try:
+                    await bot.stop_flying()
+                except Exception:
+                    pass
             return f"Flight navigation failed: {error}"
         player = bot.player
         log.info(
@@ -2746,6 +2768,8 @@ class LLMAgent(Plugin):
         for key in ("vclip", "vclip_up_limit", "vclip_down_limit"):
             if key in args:
                 forwarded[key] = args[key]
+        if "keep_flying" in args:
+            forwarded["keep_flying"] = args["keep_flying"]
         return await self._tool_fly_to(forwarded)
 
     def _deny(self, requester: str | None, action: str) -> str:

@@ -83,6 +83,9 @@ async def main():
 asyncio.run(main())
 ```
 
+`fly_to` disables creative flight after it reaches the target. Pass
+`keep_flying=True` to remain airborne, or call `await bot.stop_flying()` later.
+
 VClip is disabled by default. Configure vertical clip distance locally in
 `config.yaml` (in blocks); the limits apply separately to upward and downward
 vertical wall passage:

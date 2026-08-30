@@ -82,6 +82,9 @@ async def main():
 asyncio.run(main())
 ```
 
+`fly_to` 到达目标后默认会关闭创造飞行。需要继续悬停时传入
+`keep_flying=True`，也可以稍后调用 `await bot.stop_flying()` 手动关闭。
+
 飞行寻路默认不会穿墙。需要使用上下 VClip 时，可以在 `config.yaml` 中配置
 本地限制（单位为方块）：
 
