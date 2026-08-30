@@ -1214,9 +1214,16 @@ class Bot:
         await self._send_flying_state()
 
     async def stop_flying(self) -> None:
-        """Disable creative flight and synchronize the state to the server."""
+        """Stop local/abilities flight, clear flight input, and resume gravity."""
 
-        await self.set_flying(False, bypass_permission=True)
+        self._force_flight_active = False
+        self._set_physics_flying(False)
+        velocity = self.physics_state.velocity
+        self.physics_state.velocity = Vec3(velocity.x, 0.0, velocity.z)
+        await self.send_input()
+        if self.player.abilities.flying:
+            self.player.abilities.flying = False
+            await self._send_flying_state()
 
     async def set_anti_kick(
         self,
@@ -2068,11 +2075,11 @@ class Bot:
 
         if force_flight:
             if self._force_flight_active:
-                previous_flying = self._force_flight_previous
                 self._force_flight_active = False
-                self._set_physics_flying(
-                    True if keep_flying else previous_flying
-                )
+                self._set_physics_flying(bool(keep_flying))
+                velocity = self.physics_state.velocity
+                self.physics_state.velocity = Vec3(velocity.x, 0.0, velocity.z)
+                await self.send_input()
             return
         if keep_flying or not self.physics_state.flying or self.physics_state.spectator:
             return

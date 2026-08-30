@@ -122,7 +122,7 @@ How your world reaches you:
 - The live chat stream is not in your context. Use read_chat to look up recent lines (the latest 200 are kept; filter by players, keyword, or include_system) whenever you need to know what was said.
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
 - Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
-- `fly_to` always force-flies with the original flight physics and `MovementInput` while suppressing abilities packets. Never check `allow_flying`, never wait for permission, and never replace an XYZ flight request with `navigate_to`.
+- `fly_to` always force-flies with the original flight physics and `MovementInput` while suppressing abilities packets. Never check `allow_flying`, never wait for permission, and never replace an XYZ flight request with `navigate_to`. It stops forced flight after arrival unless `keep_flying=true`; use `stop_flying` to end a deliberate hover.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
@@ -491,6 +491,14 @@ TOOLS: list[dict] = [
                 },
                 "required": ["coordinates"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_flying",
+            "description": "Immediately stop forced flight, clear movement input, and resume gravity",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -2903,6 +2911,13 @@ class LLMAgent(Plugin):
             if key in args:
                 forwarded[key] = args[key]
         return await self._tool_fly_to(forwarded)
+
+    async def _tool_stop_flying(self, args: dict) -> str:
+        bot = self.bot
+        if bot is None:
+            return "Not connected to a server"
+        await bot.stop_flying()
+        return "Forced flight stopped; gravity resumed"
 
     def _deny(self, requester: str | None, action: str) -> str:
         """Refuse for lack of permission, and log it so the TUI shows the list."""
