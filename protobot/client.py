@@ -408,7 +408,14 @@ class Bot:
         self.boat_physics = BoatPhysicsEngine()
         self.physics_state = PhysicsState()
         self._navigation_active = False
+        self._navigation_planning = False
+        self._navigation_claimed = False
         self._force_flight_active = False
+        self._force_flight_previous = False
+        self._flight_correction_count = 0
+        self._flight_correction_window = 0.0
+        self._flight_server_rejected = False
+        self._last_sent_position: Vec3 | None = None
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -602,6 +609,32 @@ class Bot:
         """
 
         return tuple(sorted(entry.name for entry in self.players.values() if entry.name))
+
+    @property
+    def loaded_chunk_bounds(self) -> tuple[int, int, int, int] | None:
+        """Return ``(min_x, max_x, min_z, max_z)`` for currently loaded chunks."""
+
+        if not self.world.chunks:
+            return None
+        xs = [key[0] for key in self.world.chunks]
+        zs = [key[1] for key in self.world.chunks]
+        return min(xs), max(xs), min(zs), max(zs)
+
+    @property
+    def loaded_chunk_radius(self) -> int | None:
+        """Return the loaded chunk radius around the bot's current chunk."""
+
+        bounds = self.loaded_chunk_bounds
+        if bounds is None:
+            return None
+        chunk_x = math.floor(self.physics_state.position.x) >> 4
+        chunk_z = math.floor(self.physics_state.position.z) >> 4
+        return max(
+            abs(chunk_x - bounds[0]),
+            abs(bounds[1] - chunk_x),
+            abs(chunk_z - bounds[2]),
+            abs(bounds[3] - chunk_z),
+        )
 
     def find_player(self, name: str) -> PlayerListEntry | None:
         """Look a tab-list entry up by name, case-insensitively."""
@@ -1020,6 +1053,7 @@ class Bot:
         self.physics_state.position = Vec3(x, y, z)
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
+        self._last_sent_position = self.physics_state.position
         payload = (
             PacketWriter()
             .write_double(x)
@@ -1049,6 +1083,7 @@ class Bot:
         self.physics_state.yaw, self.physics_state.pitch = yaw, pitch
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
+        self._last_sent_position = self.physics_state.position
         payload = (
             PacketWriter()
             .write_double(x)
@@ -1150,6 +1185,12 @@ class Bot:
         self._require_play()
         if not isinstance(bypass_permission, bool):
             raise TypeError("bypass_permission must be a bool")
+        if self._force_flight_active:
+            # Forced navigation owns only the local predictor.  An external
+            # cleanup call must not rewrite the server-provided abilities
+            # snapshot or send a competing abilities packet.
+            self._set_physics_flying(enabled)
+            return
         abilities = self.player.abilities
         if (
             enabled
@@ -1160,7 +1201,14 @@ class Bot:
             raise RuntimeError("the server has not granted flight permission")
         if not enabled and self.physics_state.spectator:
             raise RuntimeError("spectator flight is locked")
+        # Forced navigation can leave the local predictor flying while the
+        # server snapshot remains ``flying=False``.  In that state a request
+        # to stop must still clear the predictor even though no abilities
+        # packet is needed.
+        if enabled == abilities.flying and enabled == self.physics_state.flying:
+            return
         if enabled == abilities.flying:
+            self._set_physics_flying(enabled)
             return
         self._set_local_flying(enabled)
         await self._send_flying_state()
@@ -1248,6 +1296,9 @@ class Bot:
 
         self.physics_state.flying = enabled
         if enabled:
+            self.physics_state.on_ground = False
+            self.physics_state.vertical_collision = False
+            self.player.on_ground = False
             self.physics_state.gliding = False
             self.physics_state.gliding_ticks = 0
             self.player.gliding = False
@@ -1341,7 +1392,11 @@ class Bot:
 
         self._require_play()
         controls = controls or MovementInput()
-        if self._navigation_active and not _navigation_tick:
+        if (
+            self._navigation_claimed
+            or self._navigation_active
+            or self._navigation_planning
+        ) and not _navigation_tick:
             return self.physics_state
         self._tick_remote_entity_metadata()
         if self.player.vehicle_id is not None:
@@ -1403,24 +1458,40 @@ class Bot:
             else:
                 self.player.abilities.flying = self.physics_state.flying
                 await self._send_flying_state()
+        if self._force_flight_active:
+            # A ground collision must not make the next navigation tick enter
+            # the walking branch.  The server receives an airborne movement
+            # flag below; keep the predictor in that same state as well.
+            self._set_physics_flying(True)
+            self.physics_state.on_ground = False
         if send_input:
-            await self._sync_input(
-                forward=controls.forward > 0,
-                backward=controls.forward < 0,
-                left=controls.strafe < 0,
-                right=controls.strafe > 0,
-                jump=controls.jump,
-                sneak=controls.sneak or controls.crawl,
-                sprint=controls.sprint,
-            )
+            input_values = {
+                "forward": controls.forward > 0,
+                "backward": controls.forward < 0,
+                "left": controls.strafe < 0,
+                "right": controls.strafe > 0,
+                "jump": controls.jump,
+                "sneak": controls.sneak or controls.crawl,
+                "sprint": controls.sprint,
+            }
+            if self._force_flight_active and _navigation_tick:
+                await self.send_input(**input_values)
+            else:
+                await self._sync_input(**input_values)
             await self._sync_sprinting(self.physics_state.sprinting)
         if send_position:
             state = self.physics_state
+            if self._force_flight_active:
+                # Forced flight is local-only.  Do not let the predictor's
+                # landing flag switch the next tick back to walking, and do
+                # not advertise an on-ground movement packet while flying.
+                state.on_ground = False
+                state.vertical_collision = False
             await self.send_position(
                 state.position.x,
                 state.position.y,
                 state.position.z,
-                on_ground=state.on_ground,
+                on_ground=False if self._force_flight_active else state.on_ground,
                 horizontal_collision=state.horizontal_collision,
             )
             self.player.yaw, self.player.pitch = state.yaw, state.pitch
@@ -1520,7 +1591,7 @@ class Bot:
             max_nodes=max_nodes,
         )
 
-    def _navigation_world_snapshot(self) -> World:
+    def _navigation_world_snapshot(self, *, missing_chunks_solid: bool = True) -> World:
         """Copy loaded chunks so worker-thread pathfinding never reads live state."""
 
         snapshot = copy.copy(self.world)
@@ -1529,8 +1600,18 @@ class Bot:
             cloned = copy.copy(chunk)
             cloned.sections = list(chunk.sections)
             snapshot.chunks[key] = cloned
+        snapshot.missing_chunks_solid = missing_chunks_solid
         snapshot.set_entity_collision_provider(None)
         return snapshot
+
+    def _flight_roll_target(self, start: Vec3, target: Vec3, horizon: float) -> Vec3:
+        """Return a short rolling target, never farther than one horizon."""
+
+        delta = target - start
+        distance = math.sqrt(delta.length_squared)
+        if distance <= horizon:
+            return target
+        return start + delta.scale(horizon / distance)
 
     async def _plan_path_async(
         self,
@@ -1605,6 +1686,8 @@ class Bot:
         """
 
         self._require_play()
+        if self._navigation_claimed:
+            raise RuntimeError("another navigation task is already running")
         numeric = (x, z, tolerance, timeout, max_drop, tick_interval)
         if not all(math.isfinite(value) for value in numeric):
             raise ValueError("navigation coordinates and limits must be finite")
@@ -1616,41 +1699,50 @@ class Bot:
             raise ValueError("replans cannot be negative")
         if y is not None and not math.isfinite(y):
             raise ValueError("navigation Y coordinate must be finite")
-        if not self.world_ready.is_set():
-            await self.wait_world(timeout=timeout)
+        self._navigation_claimed = True
+        try:
+            if not self.world_ready.is_set():
+                await self.wait_world(timeout=timeout)
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        for attempt in range(replans + 1):
-            remaining = deadline - loop.time()
-            if remaining <= 0.0:
-                break
-            path = await asyncio.wait_for(
-                self._plan_path_async(
-                    x,
-                    z,
-                    y=y,
-                    max_nodes=max_nodes,
-                    max_drop=max_drop,
-                    allow_diagonal=allow_diagonal,
-                ),
-                timeout=remaining,
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            for attempt in range(replans + 1):
+                remaining = deadline - loop.time()
+                if remaining <= 0.0:
+                    break
+                self._navigation_planning = True
+                try:
+                    path = await asyncio.wait_for(
+                        self._plan_path_async(
+                            x,
+                            z,
+                            y=y,
+                            max_nodes=max_nodes,
+                            max_drop=max_drop,
+                            allow_diagonal=allow_diagonal,
+                        ),
+                        timeout=remaining,
+                    )
+                finally:
+                    self._navigation_planning = False
+                await self.events.emit("path", path, attempt)
+                if await self._execute_path(path, deadline, tolerance, sprint, tick_interval):
+                    state = self.physics_state
+                    horizontal = math.hypot(x - state.position.x, z - state.position.z)
+                    vertical = abs(y - state.position.y) if y is not None else 0.0
+                    if horizontal <= tolerance and (y is None or vertical <= 0.55):
+                        await self.tick(MovementInput(), _navigation_tick=True)
+                        return self.physics_state
+
+            state = self.physics_state
+            distance = math.hypot(x - state.position.x, z - state.position.z)
+            raise NavigationTimeout(
+                f"navigate_to did not reach ({x:.3f}, {z:.3f}); "
+                f"remaining horizontal distance is {distance:.3f} blocks"
             )
-            await self.events.emit("path", path, attempt)
-            if await self._execute_path(path, deadline, tolerance, sprint, tick_interval):
-                state = self.physics_state
-                horizontal = math.hypot(x - state.position.x, z - state.position.z)
-                vertical = abs(y - state.position.y) if y is not None else 0.0
-                if horizontal <= tolerance and (y is None or vertical <= 0.55):
-                    await self.tick(MovementInput())
-                    return self.physics_state
-
-        state = self.physics_state
-        distance = math.hypot(x - state.position.x, z - state.position.z)
-        raise NavigationTimeout(
-            f"navigate_to did not reach ({x:.3f}, {z:.3f}); "
-            f"remaining horizontal distance is {distance:.3f} blocks"
-        )
+        finally:
+            self._navigation_planning = False
+            self._navigation_claimed = False
 
     def plan_flight_path(
         self,
@@ -1708,7 +1800,12 @@ class Bot:
         state = self.physics_state
         return await asyncio.to_thread(
             _find_flight_path,
-            self._navigation_world_snapshot(),
+            # A rolling flight planner must be able to cross the edge of the
+            # currently received chunk set.  Treating every unknown chunk as
+            # a full cube deadlocks the client: it cannot move far enough for
+            # the server to send the next chunk.  Any authoritative correction
+            # is consumed by the next rolling plan.
+            self._navigation_world_snapshot(missing_chunks_solid=False),
             state.position,
             Vec3(x, y, z),
             player_width=state.width,
@@ -1765,6 +1862,8 @@ class Bot:
         anti_kick_interval: float | None = None,
         allow_diagonal: bool = True,
         force_flight: bool = True,
+        realtime: bool = True,
+        planning_horizon: float = 8.0,
     ) -> PhysicsState:
         """Navigate to a 3D target using flight pathfinding.
 
@@ -1775,6 +1874,8 @@ class Bot:
         """
 
         self._require_play()
+        if self._navigation_claimed:
+            raise RuntimeError("another navigation task is already running")
         if not all(
             math.isfinite(value)
             for value in (x, y, z, tolerance, timeout, tick_interval)
@@ -1790,69 +1891,125 @@ class Bot:
             raise TypeError("keep_flying must be a bool")
         if not isinstance(force_flight, bool):
             raise TypeError("force_flight must be a bool")
+        if not isinstance(realtime, bool):
+            raise TypeError("realtime must be a bool")
+        if not math.isfinite(planning_horizon) or planning_horizon <= 0.0:
+            raise ValueError("planning_horizon must be a finite positive number")
         if anti_kick is not None and not isinstance(anti_kick, bool):
             raise TypeError("anti_kick must be a bool or None")
         if anti_kick_interval is not None and (
             not math.isfinite(anti_kick_interval) or anti_kick_interval < 0.2
         ):
             raise ValueError("anti_kick_interval must be at least 0.2 seconds")
-        if anti_kick is not None or anti_kick_interval is not None:
-            await self.set_anti_kick(
-                self.anti_kick if anti_kick is None else anti_kick,
-                interval=anti_kick_interval,
-            )
-        if not self.world_ready.is_set():
-            await self.wait_world(timeout=timeout)
-        if not force_flight and not self.physics_state.flying:
-            await self.set_flying(True, bypass_permission=bypass_permission)
+        self._navigation_claimed = True
+        force_started = False
+        try:
+            if anti_kick is not None or anti_kick_interval is not None:
+                await self.set_anti_kick(
+                    self.anti_kick if anti_kick is None else anti_kick,
+                    interval=anti_kick_interval,
+                )
+            if not self.world_ready.is_set():
+                await self.wait_world(timeout=timeout)
+            if not force_flight and not self.physics_state.flying:
+                await self.set_flying(True, bypass_permission=bypass_permission)
+            if force_flight and not self._force_flight_active:
+                self._force_flight_active = True
+                self._force_flight_previous = self.physics_state.flying
+                self._flight_correction_count = 0
+                self._flight_correction_window = time.monotonic()
+                self._flight_server_rejected = False
+                self._set_physics_flying(True)
+                force_started = True
+        except BaseException:
+            if force_started:
+                self._force_flight_active = False
+                self._set_physics_flying(self._force_flight_previous)
+            self._navigation_claimed = False
+            raise
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        for attempt in range(replans + 1):
-            if deadline <= loop.time():
-                break
-            try:
-                path = await asyncio.wait_for(
-                    self._plan_flight_path_async(
-                        x,
-                        y,
-                        z,
-                        max_nodes=max_nodes,
-                        vclip=vclip,
-                        vclip_up_limit=vclip_up_limit,
-                        vclip_down_limit=vclip_down_limit,
-                        allow_diagonal=allow_diagonal,
-                    ),
-                    timeout=deadline - loop.time(),
-                )
-            except (asyncio.TimeoutError, PathNotFound) as error:
-                await self._stop_flying_after_navigation(
-                    keep_flying, force_flight=force_flight
-                )
-                if isinstance(error, asyncio.TimeoutError):
-                    raise NavigationTimeout("flight path planning timed out") from error
-                raise
-            await self.events.emit("flight_path", path, attempt)
-            if await self._execute_flight_path(
-                path,
-                deadline,
-                tolerance,
-                tick_interval,
-                force_flight=force_flight,
-            ):
+        attempt = 0
+        try:
+            while deadline > loop.time():
                 state = self.physics_state
-                if math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)) <= tolerance:
-                    await self._stop_flying_after_navigation(
-                        keep_flying, force_flight=force_flight
-                    )
+                remaining_distance = math.dist(
+                    (state.position.x, state.position.y, state.position.z),
+                    (x, y, z),
+                )
+                if remaining_distance <= tolerance:
                     return self.physics_state
-        state = self.physics_state
-        await self._stop_flying_after_navigation(
-            keep_flying, force_flight=force_flight
-        )
-        raise NavigationTimeout(
-            f"fly_to did not reach ({x:.3f}, {y:.3f}, {z:.3f}); "
-            f"remaining distance is {math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)):.3f} blocks"
-        )
+                plan_x, plan_y, plan_z = x, y, z
+                if realtime and remaining_distance > planning_horizon:
+                    roll_target = self._flight_roll_target(
+                        state.position,
+                        Vec3(x, y, z),
+                        planning_horizon,
+                    )
+                    plan_x, plan_y, plan_z = (
+                        roll_target.x,
+                        roll_target.y,
+                        roll_target.z,
+                    )
+                self._navigation_planning = True
+                try:
+                    path = await asyncio.wait_for(
+                        self._plan_flight_path_async(
+                            plan_x,
+                            plan_y,
+                            plan_z,
+                            max_nodes=max_nodes,
+                            vclip=vclip,
+                            vclip_up_limit=vclip_up_limit,
+                            vclip_down_limit=vclip_down_limit,
+                            allow_diagonal=allow_diagonal,
+                        ),
+                        timeout=deadline - loop.time(),
+                    )
+                except (asyncio.TimeoutError, PathNotFound) as error:
+                    if isinstance(error, asyncio.TimeoutError):
+                        raise NavigationTimeout("flight path planning timed out") from error
+                    if not realtime or attempt >= replans:
+                        raise
+                    attempt += 1
+                    await asyncio.sleep(min(0.25, max(0.0, deadline - loop.time())))
+                    continue
+                finally:
+                    self._navigation_planning = False
+                await self.events.emit("flight_path", path, attempt)
+                if await self._execute_flight_path(
+                    path,
+                    deadline,
+                    tolerance,
+                    tick_interval,
+                    force_flight=force_flight,
+                ):
+                    state = self.physics_state
+                    if math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)) <= tolerance:
+                        return self.physics_state
+                    if realtime:
+                        attempt = 0
+                        continue
+                if self._flight_server_rejected:
+                    raise NavigationTimeout(
+                        "server repeatedly corrected flight movement; "
+                        "the server has not authorized flying"
+                    )
+                attempt += 1
+                if attempt > replans:
+                    break
+                await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
+            state = self.physics_state
+            raise NavigationTimeout(
+                f"fly_to did not reach ({x:.3f}, {y:.3f}, {z:.3f}); "
+                f"remaining distance is {math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)):.3f} blocks"
+            )
+        finally:
+            self._navigation_planning = False
+            await self._stop_flying_after_navigation(
+                keep_flying, force_flight=force_flight
+            )
+            self._navigation_claimed = False
 
     async def _stop_flying_after_navigation(
         self,
@@ -1862,12 +2019,17 @@ class Bot:
     ) -> None:
         """Leave creative flight off after a completed navigation task."""
 
-        if (
-            force_flight
-            or keep_flying
-            or not self.physics_state.flying
-            or self.physics_state.spectator
-        ):
+        if force_flight:
+            if self._force_flight_active:
+                previous_flying = self._force_flight_previous
+                self._force_flight_active = False
+                self._set_physics_flying(
+                    True if keep_flying else previous_flying
+                )
+                self._flight_correction_count = 0
+                self._flight_correction_window = 0.0
+            return
+        if keep_flying or not self.physics_state.flying or self.physics_state.spectator:
             return
         self._set_local_flying(False)
         await self._send_flying_state()
@@ -1900,7 +2062,8 @@ class Bot:
             raise RuntimeError("another navigation task is already running")
         self._navigation_active = True
         previous_flying = self.physics_state.flying
-        if force_flight:
+        owns_force_state = force_flight and not self._force_flight_active
+        if owns_force_state:
             self._force_flight_active = True
             self._set_physics_flying(True)
         try:
@@ -1908,7 +2071,7 @@ class Bot:
                 path, deadline, tolerance, tick_interval
             )
         finally:
-            if force_flight:
+            if owns_force_state:
                 self._force_flight_active = False
                 self._set_physics_flying(previous_flying)
             self._navigation_active = False
@@ -1924,6 +2087,7 @@ class Bot:
         for waypoint in path:
             stagnant_ticks = 0
             best_distance = math.inf
+            vertical_mode = 0
             while True:
                 state = self.physics_state
                 delta = waypoint.position - state.position
@@ -1951,8 +2115,7 @@ class Bot:
                         stagnant_ticks += 1
                     if stagnant_ticks >= 20:
                         return False
-                    if tick_interval:
-                        await asyncio.sleep(tick_interval)
+                    await asyncio.sleep(tick_interval if tick_interval else 0)
                     continue
                 # Re-aim every tick, but damp the requested vector near a
                 # waypoint.  Full forward input while the predicted physics
@@ -1960,16 +2123,37 @@ class Bot:
                 # old executor to alternate headings around the target.
                 if horizontal_distance > 1.0e-5:
                     state.yaw = math.degrees(math.atan2(-delta.x, delta.z))
+                vertical_error = delta.y
+                vertical_deadband = max(0.15, tolerance * 0.5)
+                vertical_start = max(0.35, tolerance)
+                if vertical_mode > 0:
+                    if vertical_error <= vertical_deadband:
+                        vertical_mode = 0
+                elif vertical_mode < 0:
+                    if vertical_error >= -vertical_deadband:
+                        vertical_mode = 0
+                elif vertical_error > vertical_start:
+                    vertical_mode = 1
+                elif vertical_error < -vertical_start:
+                    vertical_mode = -1
+                if vertical_mode == 0 and abs(vertical_error) <= vertical_start:
+                    # Creative flight has vertical inertia.  Clearing it in
+                    # the target band prevents alternating jump/sneak packets
+                    # and leaves the bot level while it finishes horizontally.
+                    state.velocity = Vec3(state.velocity.x, 0.0, state.velocity.z)
                 speed_scale = min(1.0, horizontal_distance / 2.0)
                 controls = MovementInput(
                     forward=speed_scale,
                     strafe=0.0,
-                    jump=delta.y > 0.08,
-                    sneak=delta.y < -0.08,
+                    jump=vertical_mode > 0,
+                    sneak=vertical_mode < 0,
+                    sprint=True,
                 )
                 if horizontal_distance > 1.0e-5:
                     await self.send_look(state.yaw, state.pitch)
                 await self.tick(controls, _navigation_tick=True)
+                if self._flight_server_rejected:
+                    return False
                 if distance < best_distance - 0.01:
                     best_distance = distance
                     stagnant_ticks = 0
@@ -1977,8 +2161,11 @@ class Bot:
                     stagnant_ticks += 1
                 if stagnant_ticks >= 30:
                     return False
-                if tick_interval:
-                    await asyncio.sleep(tick_interval)
+                # ``send_raw`` can complete synchronously with an in-memory
+                # transport (and often does when the socket write buffer is
+                # empty).  Always yield once so the reader task can process
+                # chunk data and position corrections, even at interval=0.
+                await asyncio.sleep(tick_interval if tick_interval else 0)
         return True
 
     async def _execute_path(
@@ -2043,8 +2230,7 @@ class Bot:
                     stagnant_ticks += 1
                 if stagnant_ticks >= 20:
                     return False
-                if tick_interval:
-                    await asyncio.sleep(tick_interval)
+                await asyncio.sleep(tick_interval if tick_interval else 0)
         return True
 
     def _require_play(self) -> None:
@@ -2072,7 +2258,13 @@ class Bot:
         self.registries = RegistryStore()
         self.physics_state = PhysicsState()
         self._navigation_active = False
+        self._navigation_planning = False
+        self._navigation_claimed = False
         self._force_flight_active = False
+        self._flight_correction_count = 0
+        self._flight_correction_window = 0.0
+        self._flight_server_rejected = False
+        self._last_sent_position = None
         self._next_anti_kick = 0.0
         self._anti_kick_direction = 1.0
         self._last_sent_input_flags = 0
@@ -3825,6 +4017,7 @@ class Bot:
             if relative & (1 << (index + 5)):
                 velocity[index] += rotated_current[index]
 
+        previous_position = self.physics_state.position
         self.player.x, self.player.y, self.player.z = position
         self.player.velocity_x, self.player.velocity_y, self.player.velocity_z = velocity
         self.player.yaw, self.player.pitch = yaw, pitch
@@ -3834,6 +4027,31 @@ class Bot:
         self.physics_state.pitch = pitch
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
+        if self._force_flight_active:
+            # A server correction is expected when the server rejects flight;
+            # keep the local predictor aligned with that correction instead of
+            # continuing from a stale airborne point.
+            self.physics_state.on_ground = False
+            self.physics_state.flying = True
+            self.physics_state.velocity = Vec3(*velocity)
+            correction_reference = self._last_sent_position or previous_position
+            correction_distance_squared = (
+                self.physics_state.position - correction_reference
+            ).length_squared
+            # Clientbound player-position packets are authoritative correction
+            # or teleport packets.  Count each one during forced navigation:
+            # after the first large reset, a server may keep sending smaller
+            # packets that would otherwise evade a distance-only threshold.
+            now = time.monotonic()
+            if now - self._flight_correction_window > 3.0:
+                self._flight_correction_window = now
+                self._flight_correction_count = 0
+            self._flight_correction_count += 1
+            if self._flight_correction_count >= 3:
+                self._flight_server_rejected = True
+            if correction_distance_squared > 0.25:
+                await self.events.emit("flight_correction", previous_position, self.physics_state.position)
+            self._last_sent_position = None
         await self.send_raw(
             self.version.packets.serverbound_teleport_confirm,
             PacketWriter().write_varint(teleport_id).to_bytes(),

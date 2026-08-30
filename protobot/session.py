@@ -275,7 +275,9 @@ class BotSession:
         info("\n[running] the bot is running (Ctrl+C to quit) ...")
         tick_count = 0
         while not bot.closed.is_set() and not self._stop.is_set():
-            if not getattr(bot, "_navigation_active", False):
+            if not getattr(bot, "_navigation_claimed", False) and not getattr(
+                bot, "_navigation_active", False
+            ) and not getattr(bot, "_navigation_planning", False):
                 await bot.tick(MovementInput())
             await asyncio.sleep(self._tick_interval)
             tick_count += 1

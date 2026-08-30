@@ -602,7 +602,11 @@ class FlightPathfinder:
             and (exact - previous).length_squared > 1.0e-8
         ):
             waypoints.append(PathWaypoint(exact))
-        return NavigationPath(tuple(waypoints), explored, costs[goal.key])
+        return NavigationPath(
+            tuple(self._simplify_waypoints(waypoints, start=start)),
+            explored,
+            costs[goal.key],
+        )
 
     plan = find_path
 
@@ -633,6 +637,42 @@ class FlightPathfinder:
             if not self._body_clear(point.x, point.y, point.z):
                 return False
         return True
+
+    def _simplify_waypoints(
+        self,
+        waypoints: list[PathWaypoint],
+        *,
+        start: Vec3 | None = None,
+    ) -> list[PathWaypoint]:
+        """Drop redundant grid corners when a longer segment is clear.
+
+        The raw half-block A* chain is useful for search but makes the flight
+        executor toggle vertical input at every node.  Greedy line-of-sight
+        compression keeps VClip boundaries intact while producing stable,
+        meaningful steering points.
+        """
+
+        if len(waypoints) < 3:
+            return waypoints
+        result: list[PathWaypoint] = []
+        index = 0
+        origin = start if start is not None else waypoints[0].position
+        while index < len(waypoints):
+            current_position = origin
+            farthest = index
+            for candidate in range(index + 1, len(waypoints)):
+                if any(item.vclip for item in waypoints[index : candidate + 1]):
+                    break
+                if not self._segment_clear(
+                    current_position,
+                    waypoints[candidate].position,
+                ):
+                    break
+                farthest = candidate
+            result.append(waypoints[farthest])
+            origin = waypoints[farthest].position
+            index = farthest + 1
+        return result
 
     @staticmethod
     def _heuristic(node: _FlightNode, target: Vec3) -> float:

@@ -412,6 +412,14 @@ TOOLS: list[dict] = [
                         "type": "boolean",
                         "description": "Use original flight physics while suppressing abilities packets; default true",
                     },
+                    "realtime": {
+                        "type": "boolean",
+                        "description": "Replan in short rolling segments while moving; default true",
+                    },
+                    "planning_horizon": {
+                        "type": "number",
+                        "description": "Rolling flight planning distance in blocks; default 8",
+                    },
                 },
                 "required": ["x", "y", "z"],
             },
@@ -448,6 +456,8 @@ TOOLS: list[dict] = [
                     "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
                     "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
                     "force_flight": {"type": "boolean", "description": "Use original flight physics without abilities packets; default true"},
+                    "realtime": {"type": "boolean", "description": "Replan while moving; default true"},
+                    "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 8"},
                 },
                 "required": ["x", "y", "z"],
             },
@@ -476,6 +486,8 @@ TOOLS: list[dict] = [
                     "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
                     "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
                     "force_flight": {"type": "boolean", "description": "Use original flight physics without abilities packets; default true"},
+                    "realtime": {"type": "boolean", "description": "Replan while moving; default true"},
+                    "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 8"},
                 },
                 "required": ["coordinates"],
             },
@@ -514,6 +526,63 @@ TOOLS: list[dict] = [
                 },
                 "required": ["yaw", "pitch"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "select_slot",
+            "description": "Select the currently held hotbar slot (zero-based, 0 through 8)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slot": {"type": "integer", "description": "Hotbar slot, zero-based (0-8)"}
+                },
+                "required": ["slot"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_inventory",
+            "description": "Read the latest player inventory snapshot; optionally inspect one slot (0-45)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slot": {"type": "integer", "description": "Optional inventory slot, 0-45"}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inventory_action",
+            "description": "Perform a player-inventory action: click, quick_move, or drop",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["click", "quick_move", "drop"],
+                        "description": "Action to perform",
+                    },
+                    "slot": {"type": "integer", "description": "Inventory slot, 0-45"},
+                    "button": {"type": "integer", "description": "Mouse button for click (0/1), default 0"},
+                    "whole_stack": {"type": "boolean", "description": "For drop: drop the whole stack, default false"},
+                    "state_id": {"type": "integer", "description": "Known inventory state ID, default 0"},
+                },
+                "required": ["action", "slot"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_container",
+            "description": "Close the currently open inventory/container menu",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -2433,6 +2502,18 @@ class LLMAgent(Plugin):
         mode_names = {0: "survival", 1: "creative", 2: "adventure", 3: "spectator"}
         mode = mode_names.get(getattr(session, "game_mode", -1), "?")
         lines.append(f"Dimension: {dimension}  Game mode: {mode}")
+        abilities = getattr(player, "abilities", None)
+        if abilities is not None:
+            local_flying = bool(getattr(getattr(bot, "physics_state", None), "flying", False))
+            server_flying = bool(getattr(abilities, "flying", False))
+            allow_flying = bool(getattr(abilities, "allow_flying", False))
+            corrections = int(getattr(bot, "_flight_correction_count", 0) or 0)
+            lines.append(
+                f"Flight: local={'on' if local_flying else 'off'}, "
+                f"server_flying={'on' if server_flying else 'off'}, "
+                f"server_allow_flying={'yes' if allow_flying else 'no'}, "
+                f"recent_corrections={corrections}"
+            )
         # Health is only accurate once the server has sent set_health (releases
         # with an unverified packet id keep the initial values).
         health = getattr(player, "health", None)
@@ -2444,7 +2525,22 @@ class LLMAgent(Plugin):
         world = getattr(bot, "world", None)
         chunk_count = len(getattr(world, "chunks", ())) if world is not None else "?"
         entity_count = len(getattr(bot, "entities", ()))
-        lines.append(f"World: {chunk_count} chunks loaded, {entity_count} entities visible")
+        radius = getattr(bot, "loaded_chunk_radius", None)
+        bounds = getattr(bot, "loaded_chunk_bounds", None)
+        chunk_info = f"{chunk_count} chunks loaded"
+        if radius is not None:
+            chunk_info += f" (radius about {radius} chunks)"
+        if bounds is not None:
+            chunk_info += f", bounds X={bounds[0]}..{bounds[1]} Z={bounds[2]}..{bounds[3]}"
+        lines.append(f"World: {chunk_info}, {entity_count} entities visible")
+        world_state = getattr(bot, "session", None)
+        view_distance = getattr(world_state, "view_distance", None)
+        simulation_distance = getattr(world_state, "simulation_distance", None)
+        if view_distance is not None or simulation_distance is not None:
+            lines.append(
+                f"Server distances: view={view_distance if view_distance is not None else '?'} "
+                f"simulation={simulation_distance if simulation_distance is not None else '?'} chunks"
+            )
         # The tab list is the server's roster and is not limited to loaded chunks.
         online = tuple(getattr(bot, "online_players", ()) or ())
         if online:
@@ -2710,7 +2806,7 @@ class LLMAgent(Plugin):
         try:
             log.info(f"[LLM] ground navigation requested: X={x:.1f} Z={z:.1f}")
             await asyncio.wait_for(bot.navigate_to(x, z, timeout=30.0), timeout=35.0)
-        except TimeoutError:
+        except TimeoutError as error:
             return "Failed to reach the ground target within 35 s"
         except Exception as error:
             return f"Ground navigation failed: {error}"
@@ -2745,6 +2841,13 @@ class LLMAgent(Plugin):
             kwargs["allow_diagonal"] = bool(args["allow_diagonal"])
         if "force_flight" in args:
             kwargs["force_flight"] = bool(args["force_flight"])
+        if "realtime" in args:
+            kwargs["realtime"] = bool(args["realtime"])
+        if "planning_horizon" in args and args["planning_horizon"] is not None:
+            try:
+                kwargs["planning_horizon"] = float(args["planning_horizon"])
+            except (TypeError, ValueError):
+                return "Argument planning_horizon must be a number"
         if "anti_kick" in args:
             kwargs["anti_kick"] = bool(args["anti_kick"])
         if "anti_kick_interval" in args and args["anti_kick_interval"] is not None:
@@ -2758,7 +2861,7 @@ class LLMAgent(Plugin):
                 f"vclip={kwargs.get('vclip', 'config')}"
             )
             await asyncio.wait_for(bot.fly_to(x, y, z, timeout=45.0, **kwargs), timeout=50.0)
-        except TimeoutError:
+        except TimeoutError as error:
             if not kwargs.get("force_flight", True):
                 try:
                     await bot.send_input()
@@ -2769,7 +2872,10 @@ class LLMAgent(Plugin):
                         await bot.set_flying(False, bypass_permission=True)
                 except Exception:
                     pass
-            return "Failed to reach the flight target within 50 s"
+            detail = str(error).strip()
+            if detail:
+                return f"Flight navigation timed out: {detail}"
+            return "Failed to reach the flight target within 50 s; check get_status"
         except Exception as error:
             if not keep_flying and not kwargs.get("force_flight", True):
                 try:
@@ -2817,6 +2923,9 @@ class LLMAgent(Plugin):
             forwarded["allow_diagonal"] = args["allow_diagonal"]
         if "force_flight" in args:
             forwarded["force_flight"] = args["force_flight"]
+        for key in ("realtime", "planning_horizon"):
+            if key in args:
+                forwarded[key] = args[key]
         return await self._tool_fly_to(forwarded)
 
     def _deny(self, requester: str | None, action: str) -> str:
@@ -2846,6 +2955,92 @@ class LLMAgent(Plugin):
             pitch += bot.player.pitch
         await bot.send_look(yaw, pitch)
         return f"Facing yaw={yaw:.1f}, pitch={pitch:.1f}"
+
+    @staticmethod
+    def _format_item_stack(slot: int, item) -> str:
+        if getattr(item, "empty", False):
+            return f"slot {slot}: empty"
+        identifier = getattr(item, "identifier", None) or f"item#{getattr(item, 'item_id', '?')}"
+        return f"slot {slot}: {identifier} x{getattr(item, 'count', 0)}"
+
+    async def _tool_select_slot(self, args: dict) -> str:
+        bot = self.bot
+        if bot is None:
+            return "Not connected to a server"
+        try:
+            slot = int(args.get("slot"))
+        except (TypeError, ValueError):
+            return "Argument slot must be an integer from 0 to 8"
+        try:
+            await bot.select_hotbar_slot(slot)
+        except Exception as error:
+            return f"Slot selection failed: {error}"
+        return f"Selected hotbar slot {slot}"
+
+    async def _tool_get_inventory(self, args: dict) -> str:
+        bot = self.bot
+        if bot is None:
+            return "Not connected to a server"
+        raw_slot = args.get("slot")
+        if raw_slot is not None:
+            try:
+                slot = int(raw_slot)
+                item = bot.get_inventory_item(slot)
+            except (TypeError, ValueError) as error:
+                return f"Inventory lookup failed: {error}"
+            return self._format_item_stack(slot, item)
+        entries = [
+            self._format_item_stack(slot, bot.get_inventory_item(slot))
+            for slot in range(46)
+            if not bot.get_inventory_item(slot).empty
+        ]
+        if not entries:
+            return "Inventory is empty or has not been received yet"
+        held = getattr(bot, "selected_hotbar_slot", 0)
+        return f"Selected hotbar slot {held}\n" + "\n".join(entries)
+
+    async def _tool_inventory_action(self, args: dict) -> str:
+        bot = self.bot
+        if bot is None:
+            return "Not connected to a server"
+        action = str(args.get("action") or "").strip().lower()
+        try:
+            slot = int(args.get("slot"))
+            state_id = int(args.get("state_id", 0) or 0)
+        except (TypeError, ValueError):
+            return "Arguments slot and state_id must be integers"
+        try:
+            if action == "quick_move":
+                await bot.move_inventory_item(slot, state_id=state_id)
+            elif action == "drop":
+                await bot.drop_inventory_item(
+                    slot,
+                    whole_stack=bool(args.get("whole_stack", False)),
+                    state_id=state_id,
+                )
+            elif action == "click":
+                await bot.click_inventory(
+                    slot,
+                    button=int(args.get("button", 0) or 0),
+                    state_id=state_id,
+                )
+            else:
+                return "Argument action must be click, quick_move, or drop"
+        except (TypeError, ValueError) as error:
+            return f"Inventory action failed: {error}"
+        except Exception as error:
+            return f"Inventory action failed: {error}"
+        return f"Inventory action {action} sent for slot {slot}"
+
+    async def _tool_close_container(self, args: dict) -> str:
+        bot = self.bot
+        if bot is None:
+            return "Not connected to a server"
+        try:
+            await bot.close_container()
+        except Exception as error:
+            return f"Container close failed: {error}"
+        return "Container close sent"
 
     def _format_player_position(self, name: str, entity, bot) -> str:
         player = bot.player

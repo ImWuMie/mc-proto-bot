@@ -88,6 +88,15 @@ serverbound abilities packets. It temporarily enables only the local physics
 state, so `player.abilities` remains the server snapshot. Pass
 `force_flight=False` to use normal abilities-controlled flight.
 
+Flight navigation replans in rolling segments by default, so longer targets
+are planned against the latest position and chunk snapshot while the bot is
+moving. Use `realtime=False` for one full-route plan, or adjust the segment
+length with `planning_horizon` (default 8 blocks).
+
+The client only has the chunks currently sent by the server. The live
+`get_status` tool reports the loaded chunk bounds and approximate radius;
+`view_distance` and server chunk-send/unload policy determine that radius.
+
 For servers or proxies that kick idle flying players, the anti-kick heartbeat
 is enabled by default and can be configured locally:
 
@@ -126,6 +135,9 @@ held = bot.held_item
 await bot.click_slot(36, click_type="quick_move")
 await bot.drop_item(37, whole_stack=True)
 ```
+
+The bundled LLM agent exposes these operations as `select_slot`,
+`get_inventory`, `inventory_action`, and `close_container` tools.
 
 ### Events
 

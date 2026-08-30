@@ -698,6 +698,10 @@ class World:
             if builtin.exists():
                 self.block_states.load_table(builtin)
         self.chunks: dict[tuple[int, int], Chunk] = {}
+        # Navigation worker snapshots enable this so unknown chunks are not
+        # mistaken for empty air.  Live worlds keep vanilla-compatible air
+        # semantics for callers that inspect unloaded coordinates.
+        self.missing_chunks_solid = False
         self._entity_collision_provider: Callable[[AABB], list[AABB]] | None = None
 
     def set_entity_collision_provider(
@@ -755,7 +759,9 @@ class World:
 
     def get_state_id(self, x: int, y: int, z: int) -> int:
         chunk = self.chunks.get((x >> 4, z >> 4))
-        return 0 if chunk is None else chunk.get_state_id(x, y, z)
+        if chunk is None:
+            return -1 if self.missing_chunks_solid else 0
+        return chunk.get_state_id(x, y, z)
 
     def set_state_id(self, x: int, y: int, z: int, state_id: int) -> None:
         chunk = self.chunks.get((x >> 4, z >> 4))
