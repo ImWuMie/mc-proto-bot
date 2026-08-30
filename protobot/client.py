@@ -31,7 +31,6 @@ from .navigation import (
     NavigationPath,
     NavigationTimeout,
     PathNotFound,
-    PathWaypoint,
     Pathfinder,
 )
 from .physics import (
@@ -82,8 +81,8 @@ _PLAYER_INFO_GAME_MODE = 0x04
 _PLAYER_INFO_LISTED = 0x08
 _PLAYER_INFO_LATENCY = 0x10
 _PLAYER_INFO_DISPLAY_NAME = 0x20
-_PLAYER_INFO_LIST_ORDER = 0x40
-_PLAYER_INFO_HAT = 0x80
+_PLAYER_INFO_HAT = 0x40
+_PLAYER_INFO_LIST_ORDER = 0x80
 
 #: A player list arriving within this long of entering PLAY counts as the
 #: initial roster rather than people joining. Vanilla sends everyone who is
@@ -611,6 +610,45 @@ class Bot:
             if entry.name.lower() == wanted:
                 return entry
         return None
+
+    def find_player_entity(self, name: str) -> EntityState | None:
+        """Return the nearby entity matching a tab-list player name.
+
+        The tab list is the authoritative name-to-UUID mapping, while entity
+        spawn/move packets carry the position.  Keeping the lookup here lets
+        callers work for players who have not sent a chat message and avoids
+        making each plugin duplicate the UUID join logic.
+        """
+
+        entry = self.find_player(name)
+        if entry is None:
+            return None
+        wanted = entry.uuid
+        for entity in self.entities.values():
+            if entity.entity_uuid == wanted:
+                return entity
+        return None
+
+    def find_player_position(self, name: str) -> tuple[float, float, float] | None:
+        """Return a nearby tab-listed player's latest XYZ position."""
+
+        entity = self.find_player_entity(name)
+        return None if entity is None else entity.position
+
+    @property
+    def visible_players(self) -> tuple[tuple[PlayerListEntry, EntityState], ...]:
+        """Return tab-listed players whose entity position is currently known."""
+
+        entities = {
+            entity.entity_uuid: entity
+            for entity in self.entities.values()
+            if entity.entity_uuid is not None
+        }
+        return tuple(
+            (entry, entities[entry.uuid])
+            for entry in self.players.values()
+            if entry.name and entry.uuid in entities
+        )
 
     async def click_container(
         self,
@@ -1732,26 +1770,10 @@ class Bot:
                 self.anti_kick if anti_kick is None else anti_kick,
                 interval=anti_kick_interval,
             )
+        if not self.world_ready.is_set():
+            await self.wait_world(timeout=timeout)
         if not self.physics_state.flying:
             await self.set_flying(True, bypass_permission=bypass_permission)
-        # A player asking for a point directly above/below the bot should not
-        # pay the cost of a world-wide A* search (and this also works before
-        # the surrounding chunks have finished loading).
-        direct_distance = math.dist(
-            (self.physics_state.position.x, self.physics_state.position.y, self.physics_state.position.z),
-            (x, y, z),
-        )
-        if direct_distance <= 8.0:
-            direct_deadline = asyncio.get_running_loop().time() + min(timeout, 10.0)
-            direct_path = NavigationPath((PathWaypoint(Vec3(x, y, z)),), 0, direct_distance)
-            if await self._execute_flight_path(direct_path, direct_deadline, tolerance, tick_interval):
-                state = self.physics_state
-                if math.dist(
-                    (state.position.x, state.position.y, state.position.z),
-                    (x, y, z),
-                ) <= tolerance:
-                    await self._stop_flying_after_navigation(keep_flying)
-                    return self.physics_state
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         for attempt in range(replans + 1):
@@ -1844,11 +1866,13 @@ class Bot:
                 state = self.physics_state
                 delta = waypoint.position - state.position
                 distance = math.sqrt(delta.length_squared)
+                horizontal_distance = math.hypot(delta.x, delta.z)
                 if distance <= tolerance:
                     break
                 if loop.time() >= deadline:
                     return False
                 if waypoint.vclip:
+                    before = state.position
                     await self.send_position(
                         waypoint.position.x,
                         waypoint.position.y,
@@ -1857,17 +1881,32 @@ class Bot:
                         horizontal_collision=False,
                     )
                     await self.end_tick()
+                    after = self.physics_state.position
+                    progress = (before - after).length_squared
+                    if progress > 1.0e-6:
+                        stagnant_ticks = 0
+                    else:
+                        stagnant_ticks += 1
+                    if stagnant_ticks >= 20:
+                        return False
                     if tick_interval:
                         await asyncio.sleep(tick_interval)
                     continue
-                state.yaw = math.degrees(math.atan2(-delta.x, delta.z))
+                # Re-aim every tick, but damp the requested vector near a
+                # waypoint.  Full forward input while the predicted physics
+                # state is still carrying momentum causes overshoot and the
+                # old executor to alternate headings around the target.
+                if horizontal_distance > 1.0e-5:
+                    state.yaw = math.degrees(math.atan2(-delta.x, delta.z))
+                speed_scale = min(1.0, horizontal_distance / 2.0)
                 controls = MovementInput(
-                    forward=1.0,
+                    forward=speed_scale,
                     strafe=0.0,
                     jump=delta.y > 0.08,
                     sneak=delta.y < -0.08,
                 )
-                await self.send_look(state.yaw, state.pitch)
+                if horizontal_distance > 1.0e-5:
+                    await self.send_look(state.yaw, state.pitch)
                 await self.tick(controls, _navigation_tick=True)
                 if distance < best_distance - 0.01:
                     best_distance = distance
@@ -2800,11 +2839,20 @@ class Bot:
         if type_id < 0:
             raise ProtocolError(f"invalid entity-type registry ID {type_id}")
         position = tuple(reader.read_double() for _ in range(3))
-        velocity = reader.read_lp_vec3()
-        pitch = self._unpack_degrees(reader.read_byte())
-        yaw = self._unpack_degrees(reader.read_byte())
-        head_yaw = self._unpack_degrees(reader.read_byte())
-        data = reader.read_varint()
+        if self.version.protocol == 774:
+            # 1.21.11 keeps rotation/object-data before velocity; 26.1+
+            # moved velocity immediately after the position.
+            pitch = self._unpack_degrees(reader.read_byte())
+            yaw = self._unpack_degrees(reader.read_byte())
+            head_yaw = self._unpack_degrees(reader.read_byte())
+            data = reader.read_varint()
+            velocity = reader.read_lp_vec3()
+        else:
+            velocity = reader.read_lp_vec3()
+            pitch = self._unpack_degrees(reader.read_byte())
+            yaw = self._unpack_degrees(reader.read_byte())
+            head_yaw = self._unpack_degrees(reader.read_byte())
+            data = reader.read_varint()
         reader.expect_end()
         self._validate_finite((*position, *velocity), "entity position and velocity")
 

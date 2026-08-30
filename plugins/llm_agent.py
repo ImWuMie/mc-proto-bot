@@ -485,7 +485,7 @@ TOOLS: list[dict] = [
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Player name; omit to list all visible known players",
+                        "description": "Player name; omit to list all currently visible tab-listed players",
                     }
                 },
             },
@@ -2848,21 +2848,36 @@ class LLMAgent(Plugin):
         )
 
     def _find_player_entity(self, name: str):
-        """Find a player entity along name -> UUID (from chat) -> visible entity.
+        """Find a player entity through tab-list or chat name -> UUID mapping.
 
         Returns (entity, display name); (None, None) for a player never seen, and
         (None, display name) for one seen but out of range.
         """
         key = str(name).lower()
-        entry = self._known_players.get(key)
-        if entry is None:
-            return None, None
-        target_uuid, display = entry
+        cached = self._known_players.get(key)
         bot = self.bot
+        listed = (
+            bot.find_player(name)
+            if bot is not None and hasattr(bot, "find_player")
+            else None
+        )
+        target_uuid = (
+            str(listed.uuid)
+            if listed is not None
+            else (cached[0] if cached else None)
+        )
+        display = (
+            listed.name
+            if listed is not None and listed.name
+            else (cached[1] if cached else None)
+        )
+        if target_uuid is None or bot is None:
+            return None, display
         for entity in getattr(bot, "entities", {}).values():
-            if entity is not None and str(
-                getattr(entity, "entity_uuid", "")
-            ) == target_uuid:
+            if (
+                entity is not None
+                and str(getattr(entity, "entity_uuid", "")) == target_uuid
+            ):
                 return entity, display
         return None, display
 
@@ -2886,10 +2901,15 @@ class LLMAgent(Plugin):
                 return f"Player {name} is not visible nearby"
             return self._format_player_position(display, entity, bot)
         lines: list[str] = []
-        for known in sorted(self._known_players):
-            entity, display = self._find_player_entity(known)
-            if entity is not None:
-                lines.append(self._format_player_position(display, entity, bot))
+        for entry, entity in getattr(bot, "visible_players", ()):
+            lines.append(self._format_player_position(entry.name, entity, bot))
+        # Keep the chat-cache fallback for protocol versions without a usable
+        # player-info packet.
+        if not lines:
+            for known in sorted(self._known_players):
+                entity, display = self._find_player_entity(known)
+                if entity is not None and display:
+                    lines.append(self._format_player_position(display, entity, bot))
         if not lines:
             return "No visible players with known names"
         return "\n".join(lines)
