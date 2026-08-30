@@ -90,8 +90,10 @@ state, so `player.abilities` remains the server snapshot. Pass
 
 Flight navigation replans in rolling segments by default, so longer targets
 are planned against the latest position and chunk snapshot while the bot is
-moving. Use `realtime=False` for one full-route plan, or adjust the segment
-length with `planning_horizon` (default 8 blocks).
+moving. The next segment is precomputed in the background by default; set
+`lookahead=False` to disable that prefetch. Use `realtime=False` for one
+full-route plan, or adjust the segment length with `planning_horizon` (default
+8 blocks).
 
 The client only has the chunks currently sent by the server. The live
 `get_status` tool reports the loaded chunk bounds and approximate radius;

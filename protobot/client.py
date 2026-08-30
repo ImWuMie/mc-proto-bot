@@ -1876,6 +1876,7 @@ class Bot:
         y: float,
         z: float,
         *,
+        start: Vec3 | None = None,
         max_nodes: int,
         vclip: bool | None,
         vclip_up_limit: float | None,
@@ -1887,6 +1888,12 @@ class Bot:
             raise RuntimeError("flight path planning requires at least one decoded chunk")
         self._validate_finite((x, y, z), "flight target")
         state = self.physics_state
+        start_position = state.position if start is None else start
+        if not all(
+            math.isfinite(value)
+            for value in (start_position.x, start_position.y, start_position.z)
+        ):
+            raise ValueError("flight start coordinates must be finite")
         return await asyncio.to_thread(
             _find_flight_path,
             # A rolling flight planner must be able to cross the edge of the
@@ -1895,7 +1902,7 @@ class Bot:
             # the server to send the next chunk.  Any authoritative correction
             # is consumed by the next rolling plan.
             self._navigation_world_snapshot(missing_chunks_solid=False),
-            state.position,
+            start_position,
             Vec3(x, y, z),
             player_width=state.width,
             player_height=state.height,
@@ -1924,6 +1931,7 @@ class Bot:
             x,
             y,
             z,
+            start=None,
             max_nodes=max_nodes,
             vclip=vclip,
             vclip_up_limit=vclip_up_limit,
@@ -1953,6 +1961,7 @@ class Bot:
         force_flight: bool = True,
         realtime: bool = True,
         planning_horizon: float = 8.0,
+        lookahead: bool = True,
     ) -> PhysicsState:
         """Navigate to a 3D target using flight pathfinding.
 
@@ -1986,6 +1995,8 @@ class Bot:
         force_flight = True
         if not isinstance(realtime, bool):
             raise TypeError("realtime must be a bool")
+        if not isinstance(lookahead, bool):
+            raise TypeError("lookahead must be a bool")
         if not math.isfinite(planning_horizon) or planning_horizon <= 0.0:
             raise ValueError("planning_horizon must be a finite positive number")
         if anti_kick is not None and not isinstance(anti_kick, bool):
@@ -2021,9 +2032,26 @@ class Bot:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         attempt = 0
+        pending_plan: asyncio.Task[NavigationPath] | None = None
+        pending_plan_start: Vec3 | None = None
         try:
             while deadline > loop.time():
                 state = self.physics_state
+                if pending_plan is not None and pending_plan_start is not None:
+                    # Lookahead is speculative.  A server correction, a VClip
+                    # response, or a dynamic collision update can move the bot
+                    # away from the predicted segment endpoint.  Do not apply
+                    # a stale plan when the deviation is larger than one body
+                    # width; cancel it and calculate from the live position.
+                    deviation = math.sqrt(
+                        (state.position - pending_plan_start).length_squared
+                    )
+                    if deviation > max(1.0, state.width * 2.0):
+                        pending_plan.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await pending_plan
+                        pending_plan = None
+                        pending_plan_start = None
                 remaining_distance = math.dist(
                     (state.position.x, state.position.y, state.position.z),
                     (x, y, z),
@@ -2042,22 +2070,33 @@ class Bot:
                         roll_target.y,
                         roll_target.z,
                     )
-                self._navigation_planning = True
+                self._navigation_planning = pending_plan is None
                 try:
+                    if pending_plan is None:
+                        pending_plan = asyncio.create_task(
+                            self._plan_flight_path_async(
+                                plan_x,
+                                plan_y,
+                                plan_z,
+                                max_nodes=max_nodes,
+                                vclip=vclip,
+                                vclip_up_limit=vclip_up_limit,
+                                vclip_down_limit=vclip_down_limit,
+                                allow_diagonal=allow_diagonal,
+                            ),
+                            name="protobot-flight-plan",
+                        )
+                        pending_plan_start = state.position
                     path = await asyncio.wait_for(
-                        self._plan_flight_path_async(
-                            plan_x,
-                            plan_y,
-                            plan_z,
-                            max_nodes=max_nodes,
-                            vclip=vclip,
-                            vclip_up_limit=vclip_up_limit,
-                            vclip_down_limit=vclip_down_limit,
-                            allow_diagonal=allow_diagonal,
-                        ),
+                        asyncio.shield(pending_plan),
                         timeout=deadline - loop.time(),
                     )
+                    pending_plan = None
+                    pending_plan_start = None
                 except (asyncio.TimeoutError, PathNotFound) as error:
+                    if pending_plan is not None and pending_plan.done():
+                        pending_plan = None
+                        pending_plan_start = None
                     if isinstance(error, asyncio.TimeoutError):
                         raise NavigationTimeout("flight path planning timed out") from error
                     if not realtime or attempt >= replans:
@@ -2068,6 +2107,37 @@ class Bot:
                 finally:
                     self._navigation_planning = False
                 await self.events.emit("flight_path", path, attempt)
+
+                # Start the next rolling plan before executing this one.  The
+                # explicit start is the predicted end of the current segment,
+                # so the worker never reads live mutable physics state.
+                if realtime and lookahead and path.waypoints:
+                    segment_end = path.waypoints[-1].position
+                    remaining_after_segment = math.dist(
+                        (segment_end.x, segment_end.y, segment_end.z),
+                        (x, y, z),
+                    )
+                    if remaining_after_segment > tolerance:
+                        next_target = self._flight_roll_target(
+                            segment_end,
+                            Vec3(x, y, z),
+                            planning_horizon,
+                        )
+                        pending_plan = asyncio.create_task(
+                            self._plan_flight_path_async(
+                                next_target.x,
+                                next_target.y,
+                                next_target.z,
+                                start=segment_end,
+                                max_nodes=max_nodes,
+                                vclip=vclip,
+                                vclip_up_limit=vclip_up_limit,
+                                vclip_down_limit=vclip_down_limit,
+                                allow_diagonal=allow_diagonal,
+                            ),
+                            name="protobot-flight-lookahead",
+                        )
+                        pending_plan_start = segment_end
                 if await self._execute_flight_path(
                     path,
                     deadline,
@@ -2079,8 +2149,13 @@ class Bot:
                     if math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)) <= tolerance:
                         return self.physics_state
                     if realtime:
-                        attempt = 0
                         continue
+                if pending_plan is not None and not pending_plan.done():
+                    pending_plan.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await pending_plan
+                    pending_plan = None
+                    pending_plan_start = None
                 attempt += 1
                 if attempt > replans:
                     break
@@ -2091,6 +2166,11 @@ class Bot:
                 f"remaining distance is {math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)):.3f} blocks"
             )
         finally:
+            if pending_plan is not None and not pending_plan.done():
+                pending_plan.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pending_plan
+            pending_plan_start = None
             self._navigation_planning = False
             self._navigation_vclip_active = False
             self._navigation_vertical_active = False

@@ -420,6 +420,10 @@ TOOLS: list[dict] = [
                         "type": "number",
                         "description": "Rolling flight planning distance in blocks; default 8",
                     },
+                    "lookahead": {
+                        "type": "boolean",
+                        "description": "Precompute the next rolling segment while moving; default true",
+                    },
                 },
                 "required": ["x", "y", "z"],
             },
@@ -458,6 +462,7 @@ TOOLS: list[dict] = [
                     "force_flight": {"type": "boolean", "description": "Legacy option ignored; force flight is always enabled"},
                     "realtime": {"type": "boolean", "description": "Replan while moving; default true"},
                     "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 8"},
+                    "lookahead": {"type": "boolean", "description": "Precompute the next segment while moving; default true"},
                 },
                 "required": ["x", "y", "z"],
             },
@@ -488,6 +493,7 @@ TOOLS: list[dict] = [
                     "force_flight": {"type": "boolean", "description": "Legacy option ignored; force flight is always enabled"},
                     "realtime": {"type": "boolean", "description": "Replan while moving; default true"},
                     "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 8"},
+                    "lookahead": {"type": "boolean", "description": "Precompute the next segment while moving; default true"},
                 },
                 "required": ["coordinates"],
             },
@@ -2843,6 +2849,8 @@ class LLMAgent(Plugin):
             kwargs["allow_diagonal"] = bool(args["allow_diagonal"])
         if "realtime" in args:
             kwargs["realtime"] = bool(args["realtime"])
+        if "lookahead" in args:
+            kwargs["lookahead"] = bool(args["lookahead"])
         if "planning_horizon" in args and args["planning_horizon"] is not None:
             try:
                 kwargs["planning_horizon"] = float(args["planning_horizon"])
@@ -2907,7 +2915,7 @@ class LLMAgent(Plugin):
             forwarded["allow_diagonal"] = args["allow_diagonal"]
         if "force_flight" in args:
             forwarded["force_flight"] = args["force_flight"]
-        for key in ("realtime", "planning_horizon"):
+        for key in ("realtime", "planning_horizon", "lookahead"):
             if key in args:
                 forwarded[key] = args[key]
         return await self._tool_fly_to(forwarded)
