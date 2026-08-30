@@ -62,6 +62,7 @@ def load_session_config(data: dict) -> SessionConfig:
     server = data.get("server", {})
     login = data.get("login", {})
     session = data.get("session", {})
+    navigation = data.get("navigation", {})
     if not isinstance(server, dict) or not server.get("host"):
         raise ValueError("the config is missing server.host (the server address)")
 
@@ -84,6 +85,9 @@ def load_session_config(data: dict) -> SessionConfig:
         reconnect_delay=float(_get(session, "reconnect_delay", 5.0)),
         reconnect_max_attempts=_get(session, "reconnect_max_attempts", None),
         connect_timeout=float(_get(session, "connect_timeout", 30.0)),
+        vclip=bool(_get(navigation, "vclip", False)),
+        vclip_up_limit=float(_get(navigation, "vclip_up_limit", 0.0)),
+        vclip_down_limit=float(_get(navigation, "vclip_down_limit", 0.0)),
     )
 
 
@@ -366,6 +370,11 @@ async def run_setup(config_path: Path) -> int:
             "reconnect": True,
             "reconnect_delay": 5.0,
             "reconnect_max_attempts": None,
+        },
+        "navigation": {
+            "vclip": False,
+            "vclip_up_limit": 0.0,
+            "vclip_down_limit": 0.0,
         },
         "plugins": {"directory": "plugins", "disabled": [], "watch": True},
         "tui": {"enabled": True, "autostart": True},

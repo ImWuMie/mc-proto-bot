@@ -75,10 +75,38 @@ async def main():
     await bot.wait_world()
     await bot.walk_to(10.5, 20.5, sprint=True)          # straight-line walk
     await bot.navigate_to(50.0, -30.0, sprint=True)     # A* route with replanning
+    await bot.fly_to(50.0, 90.0, -30.0)                 # collision-aware 3D flight
+    await bot.fly_to(50.0, 10.0, -30.0, vclip=True)     # optional vertical clip
 
     await bot.close()
 
 asyncio.run(main())
+```
+
+VClip is disabled by default. Configure vertical clip distance locally in
+`config.yaml` (in blocks); the limits apply separately to upward and downward
+vertical wall passage:
+
+```yaml
+navigation:
+  vclip: true
+  vclip_up_limit: 3.0
+  vclip_down_limit: 2.0
+```
+
+Only vertical segments use VClip; horizontal segments continue to require
+clearance. `vclip_up_limit` and `vclip_down_limit` are cumulative distances for
+one continuous wall passage.
+
+The high-level inventory helpers expose the latest server snapshot and common
+player-container actions. Slots `0..8` are the hotbar; `36..44` are the
+corresponding player inventory slots.
+
+```python
+await bot.switch_hotbar_slot(2)
+held = bot.held_item
+await bot.click_slot(36, click_type="quick_move")
+await bot.drop_item(37, whole_stack=True)
 ```
 
 ### Events

@@ -26,6 +26,7 @@ class PathWaypoint:
 
     position: Vec3
     jump: bool = False
+    vclip: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +124,7 @@ class Pathfinder:
         start_node = self._start_node(start)
         goal_x, goal_z = math.floor(target.x), math.floor(target.z)
         serial = itertools.count()
-        frontier: list[tuple[float, int, tuple[int, int, int]]] = []
+        frontier: list[tuple[float, int, tuple[int, int, int, int, int]]] = []
         nodes = {start_node.key: start_node}
         costs = {start_node.key: 0.0}
         parents: dict[tuple[int, int, int], tuple[int, int, int]] = {}
@@ -179,13 +180,25 @@ class Pathfinder:
             key = parents[key]
         chain.reverse()
         waypoints: list[PathWaypoint] = []
+        # The search node is the cell center, while a spawned player may be
+        # anywhere in that cell.  Anchor off-center starts before following
+        # grid edges so the first edge is checked from the actual body.
+        anchor = start_node.position
+        if (
+            self._body_clear(start.x, start.y, start.z)
+            and (start - anchor).length_squared > 1.0e-8
+        ):
+            anchor_jump = anchor.y > start.y + self.step_height + 1.0e-7
+            if not self._transition_clear(start, anchor, anchor_jump):
+                raise PathNotFound("the starting position cannot reach its path grid cell")
+            waypoints.append(PathWaypoint(anchor, anchor_jump))
         for node in chain:
             waypoints.append(PathWaypoint(node.position, jumps[node.key]))
 
         # Finish at the caller's exact horizontal coordinate when the body can
         # occupy it.  Grid centers remain the fallback near obstructed edges.
         exact = Vec3(target.x, goal.y, target.z)
-        previous = start_node.position if not waypoints else waypoints[-1].position
+        previous = start if not waypoints else waypoints[-1].position
         exact_jump = exact.y > previous.y + self.step_height + 1.0e-7
         if (
             self._body_clear(exact.x, exact.y, exact.z)
@@ -364,6 +377,271 @@ class Pathfinder:
     @staticmethod
     def _horizontal_distance_squared(first: Vec3, second: Vec3) -> float:
         return (first.x - second.x) ** 2 + (first.z - second.z) ** 2
+
+    @staticmethod
+    def _finite_vec(value: Vec3) -> bool:
+        return all(math.isfinite(component) for component in (value.x, value.y, value.z))
+
+
+@dataclass(frozen=True, slots=True)
+class _FlightNode:
+    """A half-block resolution node used by :class:`FlightPathfinder`."""
+
+    x: int
+    y2: int
+    z: int
+    clip_depth: int = 0
+    clip_direction: int = 0
+
+    @property
+    def position(self) -> Vec3:
+        return Vec3(self.x + 0.5, self.y2 / 2.0, self.z + 0.5)
+
+    @property
+    def key(self) -> tuple[int, int, int, int, int]:
+        return self.x, self.y2, self.z, self.clip_depth, self.clip_direction
+
+
+class FlightPathfinder:
+    """A* planner for collision-aware free-flight routes.
+
+    Flight has no support or step constraints: every node only needs enough
+    empty volume for the player's body.  Half-block vertical nodes keep the
+    route useful for common creative-flight targets while still bounding the
+    search to a finite neighborhood around the request.
+    """
+
+    _CARDINAL = (
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    )
+    _DIAGONAL = tuple(
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+        if (dx, dy, dz) != (0, 0, 0)
+        and sum(value != 0 for value in (dx, dy, dz)) >= 2
+    )
+
+    def __init__(
+        self,
+        world: CollisionWorld,
+        *,
+        player_width: float = 0.6,
+        player_height: float = 1.8,
+        allow_diagonal: bool = True,
+        vclip: bool = False,
+        vclip_up_limit: float = 0.0,
+        vclip_down_limit: float = 0.0,
+    ) -> None:
+        if not all(
+            math.isfinite(value) and value > 0.0
+            for value in (player_width, player_height)
+        ):
+            raise ValueError("flight dimensions must be positive")
+        self.world = world
+        self.player_width = player_width
+        self.player_height = player_height
+        self.allow_diagonal = allow_diagonal
+        if not isinstance(vclip, bool):
+            raise TypeError("vclip must be a bool")
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in (vclip_up_limit, vclip_down_limit)
+        ):
+            raise ValueError("VClip limits must be finite and non-negative")
+        self.vclip = vclip
+        self.vclip_up_limit = vclip_up_limit
+        self.vclip_down_limit = vclip_down_limit
+
+    def find_path(
+        self,
+        start: Vec3,
+        target: Vec3,
+        *,
+        target_y_tolerance: float = 0.51,
+        max_nodes: int = 8192,
+    ) -> NavigationPath:
+        """Find a route through empty volume from ``start`` to ``target``."""
+
+        if max_nodes <= 0:
+            raise ValueError("max_nodes must be positive")
+        if not math.isfinite(target_y_tolerance) or target_y_tolerance < 0.0:
+            raise ValueError("target_y_tolerance must be finite and non-negative")
+        if not self._finite_vec(start) or not self._finite_vec(target):
+            raise ValueError("path endpoints must contain finite coordinates")
+        if not self._body_clear(start.x, start.y, start.z):
+            raise PathNotFound("the starting flight volume is obstructed")
+
+        start_node = _FlightNode(
+            math.floor(start.x),
+            round(start.y * 2.0),
+            math.floor(start.z),
+        )
+        goal_x, goal_z = math.floor(target.x), math.floor(target.z)
+        goal_y2 = round(target.y * 2.0)
+        # A finite envelope prevents an unreachable target from expanding the
+        # entire infinite airspace.  The margin permits routes around a wall.
+        margin = 16
+        max_delta = max(
+            abs(start_node.x - goal_x),
+            abs(start_node.y2 - goal_y2) // 2,
+            abs(start_node.z - goal_z),
+        ) + margin
+        serial = itertools.count()
+        frontier: list[tuple[float, int, tuple[int, int, int, int, int]]] = []
+        nodes = {start_node.key: start_node}
+        costs = {start_node.key: 0.0}
+        parents: dict[tuple[int, int, int, int, int], tuple[int, int, int, int, int]] = {}
+        heapq.heappush(frontier, (self._heuristic(start_node, target), next(serial), start_node.key))
+        explored = 0
+        goal: _FlightNode | None = None
+        while frontier and explored < max_nodes:
+            _, _, current_key = heapq.heappop(frontier)
+            current = nodes[current_key]
+            explored += 1
+            if (
+                current.x == goal_x
+                and current.z == goal_z
+                and abs(current.y2 / 2.0 - target.y) <= target_y_tolerance
+            ):
+                goal = current
+                break
+            offsets = self._CARDINAL + (self._DIAGONAL if self.allow_diagonal else ())
+            for dx, dy, dz in offsets:
+                position = Vec3(
+                    current.x + dx + 0.5,
+                    (current.y2 + dy) / 2.0,
+                    current.z + dz + 0.5,
+                )
+                body_clear = self._body_clear(position.x, position.y, position.z)
+                current_clear = self._body_clear(current.position.x, current.position.y, current.position.z)
+                vertical = dx == 0 and dz == 0 and dy != 0
+                clip_depth = 0
+                clip_direction = 0
+                vclip_edge = False
+                if not body_clear:
+                    if not self.vclip or not vertical:
+                        continue
+                    direction = 1 if dy > 0 else -1
+                    if current.clip_direction not in (0, direction):
+                        continue
+                    clip_depth = current.clip_depth + 1
+                    limit = self.vclip_up_limit if direction > 0 else self.vclip_down_limit
+                    if clip_depth * 0.5 > limit + 1.0e-7:
+                        continue
+                    clip_direction = direction
+                    vclip_edge = True
+                elif current.clip_depth and vertical and not current_clear:
+                    # Exiting a clipped volume is free; reset the accumulated
+                    # depth once the player's body is clear again.
+                    clip_depth = current.clip_depth
+                    clip_direction = 0
+                    vclip_edge = True
+                neighbor = _FlightNode(
+                    current.x + dx,
+                    current.y2 + dy,
+                    current.z + dz,
+                    clip_depth,
+                    clip_direction,
+                )
+                if (
+                    abs(neighbor.x - start_node.x) > max_delta
+                    or abs(neighbor.z - start_node.z) > max_delta
+                    or abs(neighbor.y2 / 2.0 - start.y) > max_delta
+                ):
+                    continue
+                position = neighbor.position
+                if not body_clear and not vclip_edge:
+                    continue
+                if not self._segment_clear(current.position, position) and not vclip_edge:
+                    continue
+                key = neighbor.key
+                new_cost = costs[current_key] + math.sqrt(dx * dx + (dy * 0.5) ** 2 + dz * dz)
+                if new_cost >= costs.get(key, math.inf):
+                    continue
+                costs[key] = new_cost
+                nodes[key] = neighbor
+                parents[key] = current_key
+                heapq.heappush(
+                    frontier,
+                    (new_cost + self._heuristic(neighbor, target), next(serial), key),
+                )
+
+        if goal is None:
+            raise PathNotFound(
+                f"no flight path to ({target.x:.3f}, {target.y:.3f}, {target.z:.3f}) "
+                f"after exploring {explored} nodes"
+            )
+        chain: list[_FlightNode] = []
+        key = goal.key
+        while key != start_node.key:
+            chain.append(nodes[key])
+            key = parents[key]
+        chain.reverse()
+        waypoints: list[PathWaypoint] = []
+        anchor = start_node.position
+        if (start - anchor).length_squared > 1.0e-8:
+            if not self._segment_clear(start, anchor):
+                raise PathNotFound("the starting position cannot reach its flight grid cell")
+            waypoints.append(PathWaypoint(anchor))
+        waypoints.extend(
+            PathWaypoint(node.position, vclip=node.clip_depth > 0)
+            for node in chain
+        )
+        exact = target
+        previous = chain[-1].position if chain else start
+        if (
+            self._body_clear(exact.x, exact.y, exact.z)
+            and self._segment_clear(previous, exact)
+            and (exact - previous).length_squared > 1.0e-8
+        ):
+            waypoints.append(PathWaypoint(exact))
+        return NavigationPath(tuple(waypoints), explored, costs[goal.key])
+
+    plan = find_path
+
+    def _body_clear(self, x: float, y: float, z: float) -> bool:
+        half = self.player_width / 2.0
+        epsilon = 1.0e-7
+        return self.world.no_collision(
+            AABB(
+                x - half + epsilon,
+                y + epsilon,
+                z - half + epsilon,
+                x + half - epsilon,
+                y + self.player_height - epsilon,
+                z + half - epsilon,
+            )
+        )
+
+    def _segment_clear(self, start: Vec3, end: Vec3) -> bool:
+        distance = math.sqrt((end - start).length_squared)
+        steps = max(1, math.ceil(distance * 8.0))
+        for index in range(steps + 1):
+            fraction = index / steps
+            point = Vec3(
+                start.x + (end.x - start.x) * fraction,
+                start.y + (end.y - start.y) * fraction,
+                start.z + (end.z - start.z) * fraction,
+            )
+            if not self._body_clear(point.x, point.y, point.z):
+                return False
+        return True
+
+    @staticmethod
+    def _heuristic(node: _FlightNode, target: Vec3) -> float:
+        position = node.position
+        return math.sqrt(
+            (position.x - target.x) ** 2
+            + (position.y - target.y) ** 2
+            + (position.z - target.z) ** 2
+        )
 
     @staticmethod
     def _finite_vec(value: Vec3) -> bool:

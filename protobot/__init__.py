@@ -30,6 +30,7 @@ from .modlist import (
     make_adapter,
 )
 from .navigation import (
+    FlightPathfinder,
     NavigationPath,
     NavigationTimeout,
     Pathfinder,
@@ -102,6 +103,7 @@ __all__ = [
     "EntityState",
     "EquipmentSlot",
     "ExposedFunction",
+    "FlightPathfinder",
     "ItemStack",
     "Loader",
     "LoginRejected",

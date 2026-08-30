@@ -11,6 +11,7 @@ concurrently; today the CLI creates one, but the interface is ready for more.
 from __future__ import annotations
 
 import asyncio
+import math
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -41,6 +42,9 @@ class SessionConfig:
     reconnect_delay: float = 5.0  # seconds between attempts
     reconnect_max_attempts: int | None = None  # None = reconnect forever
     connect_timeout: float = 30.0  # passed to connect(timeout=...)
+    vclip: bool = False
+    vclip_up_limit: float = 0.0
+    vclip_down_limit: float = 0.0
 
     def __post_init__(self) -> None:
         if not 1 <= self.port <= 65535:
@@ -61,6 +65,19 @@ class SessionConfig:
                 "the reconnect attempt limit cannot be negative, got "
                 f"{self.reconnect_max_attempts}"
             )
+        if not isinstance(self.vclip, bool):
+            raise ValueError("vclip must be a bool")
+        if (
+            not isinstance(self.vclip_up_limit, (int, float))
+            or not isinstance(self.vclip_down_limit, (int, float))
+            or isinstance(self.vclip_up_limit, bool)
+            or isinstance(self.vclip_down_limit, bool)
+            or not math.isfinite(self.vclip_up_limit)
+            or not math.isfinite(self.vclip_down_limit)
+            or self.vclip_up_limit < 0
+            or self.vclip_down_limit < 0
+        ):
+            raise ValueError("VClip limits must be non-negative")
 
 
 # Returns (username, access_token, profile_uuid) -- resolved fresh per attempt.
@@ -96,6 +113,9 @@ async def default_connector(
         access_token=access_token,
         profile_uuid=profile_uuid,
         timeout=config.connect_timeout,
+        vclip=config.vclip,
+        vclip_up_limit=config.vclip_up_limit,
+        vclip_down_limit=config.vclip_down_limit,
     )
 
 

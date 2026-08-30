@@ -25,7 +25,7 @@ from .errors import (
 )
 from .events import EventBus
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
-from .navigation import NavigationPath, NavigationTimeout, Pathfinder
+from .navigation import FlightPathfinder, NavigationPath, NavigationTimeout, Pathfinder
 from .physics import (
     AABB,
     BoatPhysicsEngine,
@@ -230,6 +230,9 @@ class Bot:
         block_state_table: str | None = None,
         physics_engine: PhysicsEngine | None = None,
         physics_attributes: PhysicsAttributes | None = None,
+        vclip: bool = False,
+        vclip_up_limit: float = 0.0,
+        vclip_down_limit: float = 0.0,
     ) -> None:
         if not 1 <= len(username) <= 16:
             raise ValueError("username must contain 1 to 16 characters")
@@ -321,6 +324,16 @@ class Bot:
         if physics_engine is not None and physics_attributes is not None:
             raise ValueError("pass either physics_engine or physics_attributes, not both")
         self.physics = physics_engine or PhysicsEngine(physics_attributes)
+        if not isinstance(vclip, bool):
+            raise TypeError("vclip must be a bool")
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in (vclip_up_limit, vclip_down_limit)
+        ):
+            raise ValueError("VClip limits must be finite and non-negative")
+        self.vclip = vclip
+        self.vclip_up_limit = vclip_up_limit
+        self.vclip_down_limit = vclip_down_limit
         self.boat_physics = BoatPhysicsEngine()
         self.physics_state = PhysicsState()
         self._last_sent_input_flags = 0
@@ -660,6 +673,154 @@ class Bot:
         )
         self.player.selected_hotbar_slot = slot
 
+    async def set_hotbar_slot(self, slot: int) -> None:
+        """Alias for :meth:`select_hotbar_slot` used by inventory clients."""
+
+        await self.select_hotbar_slot(slot)
+
+    async def switch_slot(self, slot: int) -> None:
+        """Select a hotbar slot and synchronize the carried-item packet."""
+
+        await self.select_hotbar_slot(slot)
+
+    async def switch_hotbar_slot(self, slot: int) -> None:
+        """Alias for :meth:`select_hotbar_slot`."""
+
+        await self.select_hotbar_slot(slot)
+
+    async def select_slot(self, slot: int) -> None:
+        """Short alias for selecting a zero-based hotbar slot."""
+
+        await self.select_hotbar_slot(slot)
+
+    async def set_selected_slot(self, slot: int) -> None:
+        """Set the currently held hotbar slot."""
+
+        await self.select_hotbar_slot(slot)
+
+    @property
+    def selected_hotbar_slot(self) -> int:
+        """The currently selected zero-based hotbar slot."""
+
+        return self.player.selected_hotbar_slot
+
+    @property
+    def held_item(self) -> ItemStack:
+        """The latest item snapshot for the currently selected hotbar slot."""
+
+        return self.get_inventory_item(36 + self.player.selected_hotbar_slot)
+
+    @property
+    def inventory(self) -> Mapping[int, ItemStack]:
+        """Return a read-only view of the latest player inventory snapshot."""
+
+        return self.player.inventory
+
+    def get_inventory_item(self, slot: int) -> ItemStack:
+        """Return a player inventory slot, or an empty stack when unknown."""
+
+        if not isinstance(slot, int) or isinstance(slot, bool):
+            raise TypeError("inventory slot must be an int")
+        if not 0 <= slot <= 45:
+            raise ValueError("inventory slot must be between 0 and 45")
+        return self.player.inventory.get(slot, ItemStack())
+
+    def inventory_item(self, slot: int) -> ItemStack:
+        """Alias for :meth:`get_inventory_item`."""
+
+        return self.get_inventory_item(slot)
+
+    def get_slot(self, slot: int) -> ItemStack:
+        """Short alias for :meth:`get_inventory_item`."""
+
+        return self.get_inventory_item(slot)
+
+    def get_inventory(self) -> Mapping[int, ItemStack]:
+        """Return the latest player inventory snapshot."""
+
+        return self.inventory
+
+    async def click_inventory(
+        self,
+        slot: int,
+        *,
+        button: int = 0,
+        click_type: str | int = "pickup",
+        state_id: int = 0,
+        changed_slots: Mapping[int, bytes] | None = None,
+        carried_item_data: bytes | None = None,
+    ) -> None:
+        """Click a player inventory slot through the player's container (0).
+
+        When a menu is open, callers should use :meth:`click_container` with
+        that menu's container id because slot numbering is menu-specific.
+        """
+
+        if not isinstance(slot, int) or isinstance(slot, bool):
+            raise TypeError("inventory slot must be an int")
+        if not 0 <= slot <= 45:
+            raise ValueError("inventory slot must be between 0 and 45")
+        await self.click_container(
+            slot,
+            button=button,
+            click_type=click_type,
+            container_id=0,
+            state_id=state_id,
+            changed_slots=changed_slots,
+            carried_item_data=carried_item_data,
+        )
+
+    async def move_inventory_item(
+        self,
+        slot: int,
+        *,
+        quick_move: bool = True,
+        state_id: int = 0,
+    ) -> None:
+        """Move an item between the container and player inventory."""
+
+        await self.click_inventory(
+            slot,
+            click_type="quick_move" if quick_move else "pickup",
+            state_id=state_id,
+        )
+
+    async def click_slot(self, slot: int, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        """Short alias for :meth:`click_inventory`."""
+
+        await self.click_inventory(slot, **kwargs)
+
+    async def transfer_inventory_item(
+        self,
+        slot: int,
+        *,
+        state_id: int = 0,
+    ) -> None:
+        """Quick-move an item to the other side of the current container."""
+
+        await self.move_inventory_item(slot, quick_move=True, state_id=state_id)
+
+    async def drop_inventory_item(
+        self,
+        slot: int,
+        *,
+        whole_stack: bool = False,
+        state_id: int = 0,
+    ) -> None:
+        """Drop one item (or the whole stack) from a player inventory slot."""
+
+        await self.click_inventory(
+            slot,
+            button=1 if whole_stack else 0,
+            click_type="throw",
+            state_id=state_id,
+        )
+
+    async def drop_item(self, slot: int, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        """Short alias for :meth:`drop_inventory_item`."""
+
+        await self.drop_inventory_item(slot, **kwargs)
+
     async def respawn(self) -> None:
         """Leave the death screen: Client Status with action 0 (perform respawn).
 
@@ -860,12 +1021,30 @@ class Bot:
             sprint=sprint,
         )
 
-    async def set_flying(self, enabled: bool) -> None:
-        """Enable or disable abilities flight and synchronize it to the server."""
+    async def set_flying(
+        self,
+        enabled: bool,
+        *,
+        bypass_permission: bool = False,
+    ) -> None:
+        """Enable or disable abilities flight and synchronize it to the server.
+
+        ``bypass_permission`` skips ProtoBot's local ``allow_flying`` guard.
+        This is useful for custom servers/proxies that grant flight through a
+        plugin but do not send the vanilla abilities flag.  The server remains
+        authoritative and may reject the packet or correct the player.
+        """
 
         self._require_play()
+        if not isinstance(bypass_permission, bool):
+            raise TypeError("bypass_permission must be a bool")
         abilities = self.player.abilities
-        if enabled and not abilities.allow_flying:
+        if (
+            enabled
+            and not abilities.allow_flying
+            and not self.physics_state.spectator
+            and not bypass_permission
+        ):
             raise RuntimeError("the server has not granted flight permission")
         if not enabled and self.physics_state.spectator:
             raise RuntimeError("spectator flight is locked")
@@ -1210,8 +1389,12 @@ class Bot:
             path = self.plan_path(x, z, y=y, max_nodes=max_nodes, max_drop=max_drop)
             await self.events.emit("path", path, attempt)
             if await self._execute_path(path, deadline, tolerance, sprint, tick_interval):
-                await self.tick(MovementInput())
-                return self.physics_state
+                state = self.physics_state
+                horizontal = math.hypot(x - state.position.x, z - state.position.z)
+                vertical = abs(y - state.position.y) if y is not None else 0.0
+                if horizontal <= tolerance and (y is None or vertical <= 0.55):
+                    await self.tick(MovementInput())
+                    return self.physics_state
 
         state = self.physics_state
         distance = math.hypot(x - state.position.x, z - state.position.z)
@@ -1219,6 +1402,167 @@ class Bot:
             f"navigate_to did not reach ({x:.3f}, {z:.3f}); "
             f"remaining horizontal distance is {distance:.3f} blocks"
         )
+
+    def plan_flight_path(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        *,
+        max_nodes: int = 8192,
+        allow_diagonal: bool = True,
+        vclip: bool | None = None,
+        vclip_up_limit: float | None = None,
+        vclip_down_limit: float | None = None,
+    ) -> NavigationPath:
+        """Plan a collision-aware route through free air volume."""
+
+        self._require_play()
+        if not self.world_ready.is_set():
+            raise RuntimeError("flight path planning requires at least one decoded chunk")
+        self._validate_finite((x, y, z), "flight target")
+        vclip = self.vclip if vclip is None else vclip
+        vclip_up_limit = self.vclip_up_limit if vclip_up_limit is None else vclip_up_limit
+        vclip_down_limit = self.vclip_down_limit if vclip_down_limit is None else vclip_down_limit
+        state = self.physics_state
+        planner = FlightPathfinder(
+            self.world,
+            player_width=state.width,
+            player_height=state.height,
+            allow_diagonal=allow_diagonal,
+            vclip=vclip,
+            vclip_up_limit=vclip_up_limit,
+            vclip_down_limit=vclip_down_limit,
+        )
+        return planner.find_path(
+            state.position,
+            Vec3(x, y, z),
+            max_nodes=max_nodes,
+        )
+
+    async def fly_to(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        *,
+        tolerance: float = 0.35,
+        timeout: float = 60.0,
+        max_nodes: int = 8192,
+        replans: int = 2,
+        tick_interval: float = 0.05,
+        bypass_permission: bool = True,
+        vclip: bool | None = None,
+        vclip_up_limit: float | None = None,
+        vclip_down_limit: float | None = None,
+    ) -> PhysicsState:
+        """Enable creative/spectator flight and navigate to a 3D target."""
+
+        self._require_play()
+        if not all(
+            math.isfinite(value)
+            for value in (x, y, z, tolerance, timeout, tick_interval)
+        ):
+            raise ValueError("flight navigation coordinates and limits must be finite")
+        if tolerance <= 0.0 or timeout <= 0.0:
+            raise ValueError("flight tolerance and timeout must be positive")
+        if tick_interval < 0.0 or replans < 0:
+            raise ValueError("flight tick interval and replans must be non-negative")
+        if not isinstance(bypass_permission, bool):
+            raise TypeError("bypass_permission must be a bool")
+        if not self.physics_state.flying:
+            await self.set_flying(True, bypass_permission=bypass_permission)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        for attempt in range(replans + 1):
+            if deadline <= loop.time():
+                break
+            path = self.plan_flight_path(
+                x,
+                y,
+                z,
+                max_nodes=max_nodes,
+                vclip=vclip,
+                vclip_up_limit=vclip_up_limit,
+                vclip_down_limit=vclip_down_limit,
+            )
+            await self.events.emit("flight_path", path, attempt)
+            if await self._execute_flight_path(path, deadline, tolerance, tick_interval):
+                state = self.physics_state
+                if math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)) <= tolerance:
+                    await self.tick(MovementInput())
+                    return self.physics_state
+        state = self.physics_state
+        raise NavigationTimeout(
+            f"fly_to did not reach ({x:.3f}, {y:.3f}, {z:.3f}); "
+            f"remaining distance is {math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)):.3f} blocks"
+        )
+
+    async def navigate_flying_to(self, x: float, y: float, z: float, **kwargs) -> PhysicsState:  # type: ignore[no-untyped-def]
+        """Alias for :meth:`fly_to`."""
+
+        return await self.fly_to(x, y, z, **kwargs)
+
+    async def navigate_to_flying(self, x: float, y: float, z: float, **kwargs) -> PhysicsState:  # type: ignore[no-untyped-def]
+        """Alias for :meth:`fly_to` using the navigation naming convention."""
+
+        return await self.fly_to(x, y, z, **kwargs)
+
+    async def flight_to(self, x: float, y: float, z: float, **kwargs) -> PhysicsState:  # type: ignore[no-untyped-def]
+        """Alias for :meth:`fly_to`."""
+
+        return await self.fly_to(x, y, z, **kwargs)
+
+    async def _execute_flight_path(
+        self,
+        path: NavigationPath,
+        deadline: float,
+        tolerance: float,
+        tick_interval: float,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        for waypoint in path:
+            stagnant_ticks = 0
+            best_distance = math.inf
+            while True:
+                state = self.physics_state
+                delta = waypoint.position - state.position
+                distance = math.sqrt(delta.length_squared)
+                if distance <= tolerance:
+                    break
+                if loop.time() >= deadline:
+                    return False
+                if waypoint.vclip:
+                    await self.send_position(
+                        waypoint.position.x,
+                        waypoint.position.y,
+                        waypoint.position.z,
+                        on_ground=False,
+                        horizontal_collision=False,
+                    )
+                    await self.end_tick()
+                    if tick_interval:
+                        await asyncio.sleep(tick_interval)
+                    continue
+                state.yaw = math.degrees(math.atan2(-delta.x, delta.z))
+                controls = MovementInput(
+                    forward=1.0,
+                    strafe=0.0,
+                    jump=delta.y > 0.08,
+                    sneak=delta.y < -0.08,
+                )
+                await self.send_look(state.yaw, state.pitch)
+                await self.tick(controls)
+                if distance < best_distance - 0.01:
+                    best_distance = distance
+                    stagnant_ticks = 0
+                else:
+                    stagnant_ticks += 1
+                if stagnant_ticks >= 30:
+                    return False
+                if tick_interval:
+                    await asyncio.sleep(tick_interval)
+        return True
 
     async def _execute_path(
         self,
@@ -2462,6 +2806,8 @@ class Bot:
     async def _handle_set_player_inventory(self, payload: bytes) -> None:
         reader = PacketReader(payload)
         slot = reader.read_varint()
+        if not 0 <= slot <= 45:
+            raise ProtocolError(f"invalid player inventory slot {slot}")
         try:
             item = self._read_item_stack(reader)
         except _UnsupportedItemComponents as error:
@@ -3125,6 +3471,9 @@ async def connect(
     block_state_table: str | None = None,
     physics_engine: PhysicsEngine | None = None,
     physics_attributes: PhysicsAttributes | None = None,
+    vclip: bool = False,
+    vclip_up_limit: float = 0.0,
+    vclip_down_limit: float = 0.0,
 ) -> Bot:
     """Connect a bot (offline or online) and return it after the initial spawn position."""
     if not math.isfinite(timeout) or timeout <= 0.0:
@@ -3157,6 +3506,9 @@ async def connect(
         block_state_table=block_state_table,
         physics_engine=physics_engine,
         physics_attributes=physics_attributes,
+        vclip=vclip,
+        vclip_up_limit=vclip_up_limit,
+        vclip_down_limit=vclip_down_limit,
     )
     try:
         await bot.start()

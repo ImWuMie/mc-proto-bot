@@ -75,11 +75,30 @@ async def main():
     await bot.wait_world()
     await bot.walk_to(10.5, 20.5, sprint=True)          # 直线行走
     await bot.navigate_to(50.0, -30.0, sprint=True)     # A* 路线 + 自动重规划
+    await bot.fly_to(50.0, 90.0, -30.0)                 # 碰撞感知的三维飞行
 
     await bot.close()
 
 asyncio.run(main())
 ```
+
+飞行寻路默认不会穿墙。需要使用上下 VClip 时，可以在 `config.yaml` 中配置
+本地限制（单位为方块）：
+
+```yaml
+navigation:
+  vclip: true
+  vclip_up_limit: 3.0
+  vclip_down_limit: 2.0
+```
+
+也可以只对某次调用开启：
+
+```python
+await bot.fly_to(50.0, 10.0, -30.0, vclip=True)
+```
+
+VClip 只放宽连续竖直段，横向穿墙仍然禁止；上下限制分别统计一次连续穿墙的距离。
 
 ### 事件订阅
 
