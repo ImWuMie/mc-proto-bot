@@ -122,8 +122,7 @@ How your world reaches you:
 - The live chat stream is not in your context. Use read_chat to look up recent lines (the latest 200 are kept; filter by players, keyword, or include_system) whenever you need to know what was said.
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
 - Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
-- `fly_to` uses the original flight physics by default while suppressing abilities packets; pass `force_flight=false` to use normal abilities-controlled flight.
-- If a flight tool reports `Flying is not enabled`, server correction, or missing flight authorization, do not retry the same XYZ target immediately and do not fall back to `navigate_to`; wait for the owner/server to grant flight and report the failure once.
+- `fly_to` always force-flies with the original flight physics and `MovementInput` while suppressing abilities packets. Never check `allow_flying`, never wait for permission, and never replace an XYZ flight request with `navigate_to`.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
@@ -370,7 +369,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "fly_to",
-            "description": "Navigate through 3D space to X/Y/Z using original flight physics while suppressing abilities packets; optional vertical VClip can pass through walls within configured limits",
+            "description": "Force-fly through 3D space to X/Y/Z using original flight physics and MovementInput without checking permission or sending abilities packets; optional vertical VClip can pass through walls within configured limits",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -391,7 +390,7 @@ TOOLS: list[dict] = [
                     },
                     "bypass_permission": {
                         "type": "boolean",
-                        "description": "Skip the local allow_flying check (default true); the server remains authoritative",
+                        "description": "Legacy compatibility option; force flight always ignores permission",
                     },
                     "keep_flying": {
                         "type": "boolean",
@@ -411,7 +410,7 @@ TOOLS: list[dict] = [
                     },
                     "force_flight": {
                         "type": "boolean",
-                        "description": "Use original flight physics while suppressing abilities packets; default true",
+                        "description": "Legacy compatibility option; force flight is always enabled",
                     },
                     "realtime": {
                         "type": "boolean",
@@ -430,7 +429,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "fly_to_bypass_permission",
-            "description": "Navigate through 3D space to X/Y/Z while explicitly bypassing the local flight-permission check; the server remains authoritative",
+            "description": "Force-fly through 3D space to X/Y/Z without checking or changing flight permission",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -456,7 +455,7 @@ TOOLS: list[dict] = [
                     "anti_kick": {"type": "boolean", "description": "Enable anti-kick flight heartbeats; omit for local config"},
                     "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
                     "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
-                    "force_flight": {"type": "boolean", "description": "Use original flight physics without abilities packets; default true"},
+                    "force_flight": {"type": "boolean", "description": "Legacy option ignored; force flight is always enabled"},
                     "realtime": {"type": "boolean", "description": "Replan while moving; default true"},
                     "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 8"},
                 },
@@ -486,7 +485,7 @@ TOOLS: list[dict] = [
                     "anti_kick": {"type": "boolean", "description": "Enable anti-kick flight heartbeats; omit for local config"},
                     "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
                     "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
-                    "force_flight": {"type": "boolean", "description": "Use original flight physics without abilities packets; default true"},
+                    "force_flight": {"type": "boolean", "description": "Legacy option ignored; force flight is always enabled"},
                     "realtime": {"type": "boolean", "description": "Replan while moving; default true"},
                     "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 8"},
                 },
@@ -844,10 +843,6 @@ SENT_ECHO_WINDOW = 10.0
 #: Send-dedupe window (seconds) and how many recent lines it compares
 SENT_DEDUPE_WINDOW = 120.0
 SENT_DEDUPE_MAX = 5
-# A server-side flight denial is stable for a short period.  Suppress repeated
-# tool calls and accidental XYZ -> ground-navigation fallbacks during that
-# window; a later call can retry after permissions change.
-FLIGHT_REJECT_COOLDOWN = 20.0
 #: How many recent messages survive an auto compact
 COMPACT_KEEP_TAIL = 10
 #: Hard cap on conversation length, in case compaction keeps failing
@@ -962,9 +957,6 @@ class LLMAgent(Plugin):
         self._connected_at: float | None = None  # When this connection came up
         self._sent_recent: list[tuple[float, str]] = []  # Recent sends (time, text)
         self._flight_target_in_progress: tuple[float, float, float] | None = None
-        self._flight_rejected_target: tuple[float, float, float] | None = None
-        self._flight_rejected_until = 0.0
-        self._flight_rejected_reason = ""
         self._post_json = _http_post_json  # Tests swap in a fake
         # QQ bridge state: the botpy client runs in its own daemon thread with
         # its own loop; messages cross into the agent queue thread-safely.
@@ -2511,18 +2503,8 @@ class LLMAgent(Plugin):
         mode_names = {0: "survival", 1: "creative", 2: "adventure", 3: "spectator"}
         mode = mode_names.get(getattr(session, "game_mode", -1), "?")
         lines.append(f"Dimension: {dimension}  Game mode: {mode}")
-        abilities = getattr(player, "abilities", None)
-        if abilities is not None:
-            local_flying = bool(getattr(getattr(bot, "physics_state", None), "flying", False))
-            server_flying = bool(getattr(abilities, "flying", False))
-            allow_flying = bool(getattr(abilities, "allow_flying", False))
-            corrections = int(getattr(bot, "_flight_correction_count", 0) or 0)
-            lines.append(
-                f"Flight: local={'on' if local_flying else 'off'}, "
-                f"server_flying={'on' if server_flying else 'off'}, "
-                f"server_allow_flying={'yes' if allow_flying else 'no'}, "
-                f"recent_corrections={corrections}"
-            )
+        local_flying = bool(getattr(getattr(bot, "physics_state", None), "flying", False))
+        lines.append(f"Forced flight predictor: {'on' if local_flying else 'off'}")
         # Health is only accurate once the server has sent set_health (releases
         # with an unverified packet id keep the initial values).
         health = getattr(player, "health", None)
@@ -2833,9 +2815,12 @@ class LLMAgent(Plugin):
         except (TypeError, ValueError):
             return "Arguments x/y/z must be numbers"
 
-        kwargs: dict[str, object] = {
-            "bypass_permission": bool(args.get("bypass_permission", True)),
-        }
+        target = (x, y, z)
+        if self._flight_target_in_progress is not None:
+            active = self._flight_target_in_progress
+            if math.dist(active, target) <= 1.0:
+                return "A flight navigation to this target is already in progress"
+        kwargs: dict[str, object] = {"force_flight": True, "bypass_permission": True}
         keep_flying = bool(args.get("keep_flying", False))
         if "vclip" in args:
             kwargs["vclip"] = bool(args["vclip"])
@@ -2848,8 +2833,6 @@ class LLMAgent(Plugin):
         kwargs["keep_flying"] = keep_flying
         if "allow_diagonal" in args:
             kwargs["allow_diagonal"] = bool(args["allow_diagonal"])
-        if "force_flight" in args:
-            kwargs["force_flight"] = bool(args["force_flight"])
         if "realtime" in args:
             kwargs["realtime"] = bool(args["realtime"])
         if "planning_horizon" in args and args["planning_horizon"] is not None:
@@ -2864,6 +2847,7 @@ class LLMAgent(Plugin):
                 kwargs["anti_kick_interval"] = float(args["anti_kick_interval"])
             except (TypeError, ValueError):
                 return "Argument anti_kick_interval must be a number"
+        self._flight_target_in_progress = target
         try:
             log.info(
                 f"[LLM] flight navigation requested: X={x:.1f} Y={y:.1f} Z={z:.1f} "
@@ -2871,31 +2855,14 @@ class LLMAgent(Plugin):
             )
             await asyncio.wait_for(bot.fly_to(x, y, z, timeout=45.0, **kwargs), timeout=50.0)
         except TimeoutError as error:
-            if not kwargs.get("force_flight", True):
-                try:
-                    await bot.send_input()
-                except Exception:
-                    pass
-                try:
-                    if not bot.physics_state.spectator:
-                        await bot.set_flying(False, bypass_permission=True)
-                except Exception:
-                    pass
             detail = str(error).strip()
             if detail:
                 return f"Flight navigation timed out: {detail}"
             return "Failed to reach the flight target within 50 s; check get_status"
         except Exception as error:
-            if not keep_flying and not kwargs.get("force_flight", True):
-                try:
-                    await bot.stop_flying()
-                except Exception:
-                    pass
-            try:
-                await bot.set_anti_kick(False)
-            except Exception:
-                pass
             return f"Flight navigation failed: {error}"
+        finally:
+            self._flight_target_in_progress = None
         player = bot.player
         log.info(
             f"[LLM] flight navigation finished: X={player.x:.1f} Y={player.y:.1f} Z={player.z:.1f}"

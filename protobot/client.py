@@ -416,10 +416,6 @@ class Bot:
         self._navigation_claimed = False
         self._force_flight_active = False
         self._force_flight_previous = False
-        self._flight_correction_count = 0
-        self._flight_correction_window = 0.0
-        self._flight_server_rejected = False
-        self._last_sent_position: Vec3 | None = None
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -1057,7 +1053,6 @@ class Bot:
         self.physics_state.position = Vec3(x, y, z)
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
-        self._last_sent_position = self.physics_state.position
         packet_y = self._anti_kick_wire_y(y)
         payload = (
             PacketWriter()
@@ -1088,7 +1083,6 @@ class Bot:
         self.physics_state.yaw, self.physics_state.pitch = yaw, pitch
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
-        self._last_sent_position = self.physics_state.position
         packet_y = self._anti_kick_wire_y(y)
         payload = (
             PacketWriter()
@@ -1923,10 +1917,11 @@ class Bot:
     ) -> PhysicsState:
         """Navigate to a 3D target using flight pathfinding.
 
-        ``force_flight`` temporarily enables only the local flight predictor
-        and runs the normal vanilla movement-input path.  It never changes or
-        sends the serverbound abilities packet, which is useful when the
-        server does not advertise vanilla ``allow_flying``.
+        Flight navigation always enables only the local predictor and runs the
+        normal vanilla movement-input path.  It never checks or changes the
+        server abilities snapshot and never sends a serverbound abilities
+        packet.  The ``force_flight`` argument is retained for API
+        compatibility and is ignored.
         """
 
         self._require_play()
@@ -1947,6 +1942,9 @@ class Bot:
             raise TypeError("keep_flying must be a bool")
         if not isinstance(force_flight, bool):
             raise TypeError("force_flight must be a bool")
+        # This compatibility flag no longer selects a permission-aware path:
+        # every fly_to call is local-only forced flight.
+        force_flight = True
         if not isinstance(realtime, bool):
             raise TypeError("realtime must be a bool")
         if not math.isfinite(planning_horizon) or planning_horizon <= 0.0:
@@ -1967,14 +1965,12 @@ class Bot:
                 )
             if not self.world_ready.is_set():
                 await self.wait_world(timeout=timeout)
-            if not force_flight and not self.physics_state.flying:
-                await self.set_flying(True, bypass_permission=bypass_permission)
-            if force_flight and not self._force_flight_active:
+            # Always use local-only flight.  Do not inspect allow_flying and do
+            # not emit the abilities packet even when callers pass the legacy
+            # force_flight=False/bypass_permission=False options.
+            if not self._force_flight_active:
                 self._force_flight_active = True
                 self._force_flight_previous = self.physics_state.flying
-                self._flight_correction_count = 0
-                self._flight_correction_window = time.monotonic()
-                self._flight_server_rejected = False
                 self._set_physics_flying(True)
                 force_started = True
         except BaseException:
@@ -2046,11 +2042,6 @@ class Bot:
                     if realtime:
                         attempt = 0
                         continue
-                if self._flight_server_rejected:
-                    raise NavigationTimeout(
-                        "server repeatedly corrected flight movement; "
-                        "the server has not authorized flying"
-                    )
                 attempt += 1
                 if attempt > replans:
                     break
@@ -2082,8 +2073,6 @@ class Bot:
                 self._set_physics_flying(
                     True if keep_flying else previous_flying
                 )
-                self._flight_correction_count = 0
-                self._flight_correction_window = 0.0
             return
         if keep_flying or not self.physics_state.flying or self.physics_state.spectator:
             return
@@ -2208,8 +2197,6 @@ class Bot:
                 if horizontal_distance > 1.0e-5:
                     await self.send_look(state.yaw, state.pitch)
                 await self.tick(controls, _navigation_tick=True)
-                if self._flight_server_rejected:
-                    return False
                 if distance < best_distance - 0.01:
                     best_distance = distance
                     stagnant_ticks = 0
@@ -2317,10 +2304,6 @@ class Bot:
         self._navigation_planning = False
         self._navigation_claimed = False
         self._force_flight_active = False
-        self._flight_correction_count = 0
-        self._flight_correction_window = 0.0
-        self._flight_server_rejected = False
-        self._last_sent_position = None
         self._next_anti_kick = 0.0
         self._anti_kick_last_packet_y = None
         self._last_sent_input_flags = 0
@@ -4073,7 +4056,6 @@ class Bot:
             if relative & (1 << (index + 5)):
                 velocity[index] += rotated_current[index]
 
-        previous_position = self.physics_state.position
         self.player.x, self.player.y, self.player.z = position
         self.player.velocity_x, self.player.velocity_y, self.player.velocity_z = velocity
         self.player.yaw, self.player.pitch = yaw, pitch
@@ -4084,30 +4066,11 @@ class Bot:
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
         if self._force_flight_active:
-            # A server correction is expected when the server rejects flight;
-            # keep the local predictor aligned with that correction instead of
-            # continuing from a stale airborne point.
+            # Keep forced local flight active after any authoritative position
+            # sync.  This packet is not interpreted as a permission decision.
             self.physics_state.on_ground = False
             self.physics_state.flying = True
             self.physics_state.velocity = Vec3(*velocity)
-            correction_reference = self._last_sent_position or previous_position
-            correction_distance_squared = (
-                self.physics_state.position - correction_reference
-            ).length_squared
-            # Clientbound player-position packets are authoritative correction
-            # or teleport packets.  Count each one during forced navigation:
-            # after the first large reset, a server may keep sending smaller
-            # packets that would otherwise evade a distance-only threshold.
-            now = time.monotonic()
-            if now - self._flight_correction_window > 3.0:
-                self._flight_correction_window = now
-                self._flight_correction_count = 0
-            self._flight_correction_count += 1
-            if self._flight_correction_count >= 3:
-                self._flight_server_rejected = True
-            if correction_distance_squared > 0.25:
-                await self.events.emit("flight_correction", previous_position, self.physics_state.position)
-            self._last_sent_position = None
         await self.send_raw(
             self.version.packets.serverbound_teleport_confirm,
             PacketWriter().write_varint(teleport_id).to_bytes(),
