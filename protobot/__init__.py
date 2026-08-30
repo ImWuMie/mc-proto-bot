@@ -35,6 +35,7 @@ from .navigation import (
     NavigationTimeout,
     Pathfinder,
     PathNotFound,
+    PathNode,
     PathWaypoint,
 )
 from .physics import (
@@ -113,6 +114,7 @@ __all__ = [
     "NavigationTimeout",
     "OnlineModeRequired",
     "PathNotFound",
+    "PathNode",
     "PathWaypoint",
     "Pathfinder",
     "PayloadResponse",

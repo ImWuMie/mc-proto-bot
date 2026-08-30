@@ -416,6 +416,9 @@ class Bot:
         self._navigation_claimed = False
         self._force_flight_active = False
         self._force_flight_previous = False
+        self._navigation_vclip_active = False
+        self._navigation_vertical_active = False
+        self._position_update_serial = 0
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -1312,6 +1315,8 @@ class Bot:
         else:
             self._anti_kick_last_packet_y = None
             self._next_anti_kick = 0.0
+            self._navigation_vclip_active = False
+            self._navigation_vertical_active = False
 
     def _anti_kick_wire_y(self, current_y: float) -> float:
         """Return Meteor-style packet anti-kick Y without changing local state.
@@ -1325,6 +1330,29 @@ class Bot:
         """
 
         if not self.anti_kick or not self.physics_state.flying:
+            return current_y
+        if self._navigation_vclip_active or self._navigation_vertical_active:
+            # A VClip waypoint is intentionally inside a collision volume;
+            # rewriting its Y would turn the one-shot clip into a repeated
+            # collision/teleport loop.  The same applies to ordinary vertical
+            # steering: anti-kick must not fight a deliberate ascent/descent.
+            self._anti_kick_last_packet_y = current_y
+            return current_y
+        # Never send a synthetic Y that puts the player's body into a roof or
+        # another collision box.  This is especially important when the bot is
+        # flying immediately below a ceiling: Meteor's -0.03130 packet is only
+        # useful in open air.
+        half = self.physics_state.width / 2.0
+        body = AABB(
+            self.physics_state.position.x - half + 1.0e-7,
+            current_y + 1.0e-7,
+            self.physics_state.position.z - half + 1.0e-7,
+            self.physics_state.position.x + half - 1.0e-7,
+            current_y + self.physics_state.height - 1.0e-7,
+            self.physics_state.position.z + half - 1.0e-7,
+        )
+        if not self.world.no_collision(body):
+            self._anti_kick_last_packet_y = current_y
             return current_y
         now = asyncio.get_running_loop().time()
         if now < self._next_anti_kick:
@@ -1340,6 +1368,10 @@ class Bot:
             packet_y = last_y - 0.03130
         else:
             self._anti_kick_last_packet_y = current_y
+        candidate = body.move(0.0, packet_y - current_y, 0.0)
+        if not self.world.no_collision(candidate):
+            self._anti_kick_last_packet_y = current_y
+            return current_y
         self._next_anti_kick = now + self.anti_kick_interval
         return packet_y
 
@@ -2060,6 +2092,8 @@ class Bot:
             )
         finally:
             self._navigation_planning = False
+            self._navigation_vclip_active = False
+            self._navigation_vertical_active = False
             await self._stop_flying_after_navigation(
                 keep_flying, force_flight=force_flight
             )
@@ -2136,38 +2170,84 @@ class Bot:
         tick_interval: float,
     ) -> bool:
         loop = asyncio.get_running_loop()
-        for waypoint in path:
+        waypoint_index = 0
+        while waypoint_index < len(path.waypoints):
+            waypoint = path.waypoints[waypoint_index]
+            # Grid/clearance waypoints must be reached more precisely than the
+            # final user target.  Accepting a 0.35-block error at a wall top can
+            # leave the feet below the clearance plane, so the next horizontal
+            # edge collides forever before VClip even starts.
+            is_last_waypoint = waypoint_index == len(path.waypoints) - 1
+            waypoint_tolerance = tolerance if is_last_waypoint else min(tolerance, 0.1)
+            horizontal_tolerance = (
+                tolerance
+                if is_last_waypoint
+                else max(waypoint_tolerance, self.physics_state.width / 2.0)
+            )
             stagnant_ticks = 0
             best_distance = math.inf
             vertical_mode = 0
+            initial_vertical_error = waypoint.position.y - self.physics_state.position.y
+            vertical_direction = (
+                1 if initial_vertical_error > 1.0e-7
+                else (-1 if initial_vertical_error < -1.0e-7 else 0)
+            )
             while True:
                 state = self.physics_state
                 delta = waypoint.position - state.position
                 distance = math.sqrt(delta.length_squared)
                 horizontal_distance = math.hypot(delta.x, delta.z)
-                if distance <= tolerance:
+                if vertical_direction > 0:
+                    vertical_reached = -waypoint_tolerance <= delta.y <= 0.0
+                elif vertical_direction < 0:
+                    vertical_reached = 0.0 <= delta.y <= waypoint_tolerance
+                else:
+                    vertical_reached = abs(delta.y) <= waypoint_tolerance
+                if horizontal_distance <= horizontal_tolerance and vertical_reached:
                     break
                 if loop.time() >= deadline:
                     return False
-                if waypoint.vclip:
-                    before = state.position
-                    await self.send_position(
-                        waypoint.position.x,
-                        waypoint.position.y,
-                        waypoint.position.z,
-                        on_ground=False,
-                        horizontal_collision=False,
-                    )
-                    await self.end_tick()
+                if waypoint.operation == "vclip":
+                    # VClip is a one-shot position action, not a normal
+                    # physics waypoint.  Re-sending it every tick can pin the
+                    # bot in the wall and lets anti-kick rewrite the packet Y
+                    # into a ceiling.  Suspend synthetic anti-kick while the
+                    # exact clip packet is sent, then let rolling planning
+                    # validate the resulting server position.
+                    self._navigation_vclip_active = True
+                    try:
+                        before = state.position
+                        before_serial = self._position_update_serial
+                        await self.send_position(
+                            waypoint.position.x,
+                            waypoint.position.y,
+                            waypoint.position.z,
+                            on_ground=False,
+                            horizontal_collision=False,
+                        )
+                        await self.end_tick()
+                    finally:
+                        self._navigation_vclip_active = False
+                    # Give the server one tick to accept/correct the clip before
+                    # resuming normal physics and anti-kick packets.
+                    await asyncio.sleep(min(0.25, max(0.05, tick_interval)))
                     after = self.physics_state.position
-                    progress = (before - after).length_squared
-                    if progress > 1.0e-6:
-                        stagnant_ticks = 0
-                    else:
-                        stagnant_ticks += 1
-                    if stagnant_ticks >= 20:
+                    if self._position_update_serial != before_serial:
+                        # The server answered the clip.  A correction means
+                        # the one-shot position was rejected; let realtime
+                        # planning retry from the authoritative position.
+                        if (
+                            (after - waypoint.position).length_squared
+                            > waypoint_tolerance * waypoint_tolerance
+                        ):
+                            return False
+                    if (
+                        (after - waypoint.position).length_squared
+                        <= waypoint_tolerance * waypoint_tolerance
+                    ):
+                        break
+                    if (before - after).length_squared <= 1.0e-6:
                         return False
-                    await asyncio.sleep(tick_interval if tick_interval else 0)
                     continue
                 # Re-aim every tick, but damp the requested vector near a
                 # waypoint.  Full forward input while the predicted physics
@@ -2176,8 +2256,8 @@ class Bot:
                 if horizontal_distance > 1.0e-5:
                     state.yaw = math.degrees(math.atan2(-delta.x, delta.z))
                 vertical_error = delta.y
-                vertical_deadband = max(0.15, tolerance * 0.5)
-                vertical_start = max(0.35, tolerance)
+                vertical_deadband = max(0.04, waypoint_tolerance * 0.5)
+                vertical_start = max(0.1, waypoint_tolerance)
                 if vertical_mode > 0:
                     if vertical_error <= vertical_deadband:
                         vertical_mode = 0
@@ -2188,22 +2268,32 @@ class Bot:
                     vertical_mode = 1
                 elif vertical_error < -vertical_start:
                     vertical_mode = -1
+                self._navigation_vertical_active = (
+                    waypoint.operation == "fly" and vertical_mode != 0
+                )
                 if vertical_mode == 0 and abs(vertical_error) <= vertical_start:
                     # Creative flight has vertical inertia.  Clearing it in
                     # the target band prevents alternating jump/sneak packets
                     # and leaves the bot level while it finishes horizontally.
                     state.velocity = Vec3(state.velocity.x, 0.0, state.velocity.z)
-                speed_scale = min(1.0, horizontal_distance / 2.0)
+                if horizontal_distance <= horizontal_tolerance:
+                    state.velocity = Vec3(0.0, state.velocity.y, 0.0)
+                    speed_scale = 0.0
+                else:
+                    speed_scale = min(1.0, horizontal_distance / 2.0)
                 controls = MovementInput(
                     forward=speed_scale,
                     strafe=0.0,
-                    jump=vertical_mode > 0,
-                    sneak=vertical_mode < 0,
+                    jump=vertical_mode > 0 and waypoint.operation == "fly",
+                    sneak=vertical_mode < 0 and waypoint.operation == "fly",
                     sprint=True,
                 )
                 if horizontal_distance > 1.0e-5:
                     await self.send_look(state.yaw, state.pitch)
-                await self.tick(controls, _navigation_tick=True)
+                try:
+                    await self.tick(controls, _navigation_tick=True)
+                finally:
+                    self._navigation_vertical_active = False
                 if distance < best_distance - 0.01:
                     best_distance = distance
                     stagnant_ticks = 0
@@ -2216,6 +2306,7 @@ class Bot:
                 # empty).  Always yield once so the reader task can process
                 # chunk data and position corrections, even at interval=0.
                 await asyncio.sleep(tick_interval if tick_interval else 0)
+            waypoint_index += 1
         return True
 
     async def _execute_path(
@@ -2262,7 +2353,10 @@ class Bot:
                 if horizontal > tolerance:
                     state.yaw = math.degrees(math.atan2(-dx, dz))
                     await self.send_look(state.yaw, state.pitch)
-                jump = waypoint.jump and state.position.y < waypoint.position.y - 0.05
+                jump = (
+                    waypoint.operation == "jump"
+                    and state.position.y < waypoint.position.y - 0.05
+                )
                 await self.tick(
                     MovementInput(
                         forward=1.0 if horizontal > tolerance else 0.0,
@@ -2311,6 +2405,8 @@ class Bot:
         self._navigation_planning = False
         self._navigation_claimed = False
         self._force_flight_active = False
+        self._navigation_vclip_active = False
+        self._navigation_vertical_active = False
         self._next_anti_kick = 0.0
         self._anti_kick_last_packet_y = None
         self._last_sent_input_flags = 0
@@ -4078,6 +4174,7 @@ class Bot:
             self.physics_state.on_ground = False
             self.physics_state.flying = True
             self.physics_state.velocity = Vec3(*velocity)
+        self._position_update_serial += 1
         await self.send_raw(
             self.version.packets.serverbound_teleport_confirm,
             PacketWriter().write_varint(teleport_id).to_bytes(),

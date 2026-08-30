@@ -22,11 +22,45 @@ class NavigationTimeout(ProtoBotError, TimeoutError):
 
 @dataclass(frozen=True, slots=True)
 class PathWaypoint:
-    """One feet position in a planned route."""
+    """One node in a planned route.
+
+    ``operation`` names the edge operation used to reach this node from the
+    previous node: ``walk``, ``jump``, ``fly``, or ``vclip``.  The legacy
+    ``jump``/``vclip`` flags remain available for callers that constructed
+    waypoints before the explicit operation field was added.
+    """
 
     position: Vec3
     jump: bool = False
     vclip: bool = False
+    operation: str = ""
+
+    def __post_init__(self) -> None:
+        operation = self.operation.strip().lower() if self.operation else ""
+        if not operation:
+            if self.vclip:
+                operation = "vclip"
+            elif self.jump:
+                operation = "jump"
+            else:
+                operation = "fly"
+        if operation not in {"walk", "jump", "fly", "vclip"}:
+            raise ValueError(
+                "waypoint operation must be one of walk, jump, fly, or vclip"
+            )
+        object.__setattr__(self, "operation", operation)
+        object.__setattr__(self, "jump", self.jump or operation == "jump")
+        object.__setattr__(self, "vclip", self.vclip or operation == "vclip")
+
+    @property
+    def action(self) -> str:
+        """Alias for :attr:`operation` used by node-oriented clients."""
+
+        return self.operation
+
+
+# Node-oriented name for callers that prefer graph terminology.
+PathNode = PathWaypoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +76,18 @@ class NavigationPath:
 
     def __iter__(self):  # type: ignore[no-untyped-def]
         return iter(self.waypoints)
+
+    @property
+    def nodes(self) -> tuple[PathWaypoint, ...]:
+        """The planned nodes, named explicitly for graph-oriented callers."""
+
+        return self.waypoints
+
+    @property
+    def operations(self) -> tuple[str, ...]:
+        """Operations for each node, in path order."""
+
+        return tuple(node.operation for node in self.waypoints)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +174,7 @@ class Pathfinder:
         nodes = {start_node.key: start_node}
         costs = {start_node.key: 0.0}
         parents: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-        jumps: dict[tuple[int, int, int], bool] = {}
+        operations: dict[tuple[int, int, int], str] = {}
         heapq.heappush(
             frontier,
             (
@@ -163,7 +209,7 @@ class Pathfinder:
                 costs[key] = new_cost
                 nodes[key] = neighbor
                 parents[key] = current_key
-                jumps[key] = requires_jump
+                operations[key] = "jump" if requires_jump else "walk"
                 priority = new_cost + self._heuristic(neighbor, target, match_target_y)
                 heapq.heappush(frontier, (priority, next(serial), key))
 
@@ -191,9 +237,17 @@ class Pathfinder:
             anchor_jump = anchor.y > start.y + self.step_height + 1.0e-7
             if not self._transition_clear(start, anchor, anchor_jump):
                 raise PathNotFound("the starting position cannot reach its path grid cell")
-            waypoints.append(PathWaypoint(anchor, anchor_jump))
+            waypoints.append(
+                PathWaypoint(anchor, anchor_jump, operation="jump" if anchor_jump else "walk")
+            )
         for node in chain:
-            waypoints.append(PathWaypoint(node.position, jumps[node.key]))
+            operation = operations[node.key]
+            waypoints.append(
+                PathWaypoint(
+                    node.position,
+                    operation=operation,
+                )
+            )
 
         # Finish at the caller's exact horizontal coordinate when the body can
         # occupy it.  Grid centers remain the fallback near obstructed edges.
@@ -206,7 +260,9 @@ class Pathfinder:
             and self._transition_clear(previous, exact, exact_jump)
             and self._horizontal_distance_squared(previous, exact) > 1.0e-8
         ):
-            waypoints.append(PathWaypoint(exact, exact_jump))
+            waypoints.append(
+                PathWaypoint(exact, exact_jump, operation="jump" if exact_jump else "walk")
+            )
 
         return NavigationPath(tuple(waypoints), explored, costs[goal.key])
 
@@ -475,16 +531,22 @@ class FlightPathfinder:
             raise ValueError("target_y_tolerance must be finite and non-negative")
         if not self._finite_vec(start) or not self._finite_vec(target):
             raise ValueError("path endpoints must contain finite coordinates")
-        if not self._body_clear(start.x, start.y, start.z):
+        start_obstructed = not self._body_clear(start.x, start.y, start.z)
+        if start_obstructed and not self.vclip:
             raise PathNotFound("the starting flight volume is obstructed")
 
         start_node = _FlightNode(
             math.floor(start.x),
             round(start.y * 2.0),
             math.floor(start.z),
+            # A previous VClip may leave the rolling-planner start inside a
+            # wall.  Seed a clipped state so the first vertical clear node can
+            # exit the volume instead of rejecting the whole replan.
+            clip_depth=1 if start_obstructed else 0,
         )
         goal_x, goal_z = math.floor(target.x), math.floor(target.z)
         goal_y2 = round(target.y * 2.0)
+        target_clear = self._body_clear(target.x, target.y, target.z)
         # A finite envelope prevents an unreachable target from expanding the
         # entire infinite airspace.  The margin permits routes around a wall.
         margin = 16
@@ -498,6 +560,7 @@ class FlightPathfinder:
         nodes = {start_node.key: start_node}
         costs = {start_node.key: 0.0}
         parents: dict[tuple[int, int, int, int, int], tuple[int, int, int, int, int]] = {}
+        operations: dict[tuple[int, int, int, int, int], str] = {}
         heapq.heappush(frontier, (self._heuristic(start_node, target), next(serial), start_node.key))
         explored = 0
         goal: _FlightNode | None = None
@@ -509,6 +572,14 @@ class FlightPathfinder:
                 current.x == goal_x
                 and current.z == goal_z
                 and abs(current.y2 / 2.0 - target.y) <= target_y_tolerance
+                # Never finish a normal flight target while the planner's
+                # body is still inside a block.  Clipped terminal nodes are
+                # valid only when the requested target itself is obstructed.
+                and (not target_clear or self._body_clear(
+                    current.position.x,
+                    current.position.y,
+                    current.position.z,
+                ))
             ):
                 goal = current
                 break
@@ -537,10 +608,10 @@ class FlightPathfinder:
                         continue
                     clip_direction = direction
                     vclip_edge = True
-                elif current.clip_depth and vertical and not current_clear:
-                    # Exiting a clipped volume is free; reset the accumulated
-                    # depth once the player's body is clear again.
-                    clip_depth = current.clip_depth
+                elif current.clip_depth and vertical and body_clear and not current_clear:
+                    # Exiting a clipped volume is still a VClip edge, but the
+                    # accumulated depth must reset once the body is clear.
+                    clip_depth = 0
                     clip_direction = 0
                     vclip_edge = True
                 neighbor = _FlightNode(
@@ -568,6 +639,7 @@ class FlightPathfinder:
                 costs[key] = new_cost
                 nodes[key] = neighbor
                 parents[key] = current_key
+                operations[key] = "vclip" if vclip_edge else "fly"
                 heapq.heappush(
                     frontier,
                     (new_cost + self._heuristic(neighbor, target), next(serial), key),
@@ -589,9 +661,13 @@ class FlightPathfinder:
         if (start - anchor).length_squared > 1.0e-8:
             if not self._segment_clear(start, anchor):
                 raise PathNotFound("the starting position cannot reach its flight grid cell")
-            waypoints.append(PathWaypoint(anchor))
+            waypoints.append(PathWaypoint(anchor, operation="fly"))
         waypoints.extend(
-            PathWaypoint(node.position, vclip=node.clip_depth > 0)
+            PathWaypoint(
+                node.position,
+                vclip=operations[node.key] == "vclip",
+                operation=operations[node.key],
+            )
             for node in chain
         )
         exact = target
@@ -601,7 +677,7 @@ class FlightPathfinder:
             and self._segment_clear(previous, exact)
             and (exact - previous).length_squared > 1.0e-8
         ):
-            waypoints.append(PathWaypoint(exact))
+            waypoints.append(PathWaypoint(exact, operation="fly"))
         return NavigationPath(
             tuple(self._simplify_waypoints(waypoints, start=start)),
             explored,
@@ -661,7 +737,10 @@ class FlightPathfinder:
             current_position = origin
             farthest = index
             for candidate in range(index + 1, len(waypoints)):
-                if any(item.vclip for item in waypoints[index : candidate + 1]):
+                if any(
+                    item.operation == "vclip"
+                    for item in waypoints[index : candidate + 1]
+                ):
                     break
                 if not self._segment_clear(
                     current_position,

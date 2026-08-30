@@ -141,6 +141,11 @@ await bot.drop_item(37, whole_stack=True)
 The bundled LLM agent exposes these operations as `select_slot`,
 `get_inventory`, `inventory_action`, and `close_container` tools.
 
+Navigation paths are node-oriented. Each `PathWaypoint` exposes an
+`operation`/`action` value describing the edge from the previous node:
+`walk`, `jump`, `fly`, or `vclip`. Use `path.nodes` and `path.operations` when
+an integration needs to inspect or execute the route one operation at a time.
+
 ### Events
 
 ```python
