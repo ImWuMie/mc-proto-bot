@@ -82,8 +82,8 @@ async def main():
 asyncio.run(main())
 ```
 
-`fly_to` 到达目标后默认会关闭创造飞行。需要继续悬停时传入
-`keep_flying=True`，也可以稍后调用 `await bot.stop_flying()` 手动关闭。
+`fly_to` 默认使用原版飞行物理，但会屏蔽 abilities 发包。它只临时开启本地
+物理状态，`player.abilities` 仍保持服务端快照。传入 `force_flight=False` 可改用正常 abilities 控制的飞行。
 
 如果服务器或代理会踢出长时间悬停的玩家，可以在本地配置 anti-kick：
 

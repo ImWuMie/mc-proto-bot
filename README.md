@@ -83,8 +83,10 @@ async def main():
 asyncio.run(main())
 ```
 
-`fly_to` disables creative flight after it reaches the target. Pass
-`keep_flying=True` to remain airborne, or call `await bot.stop_flying()` later.
+`fly_to` uses the original flight physics by default while suppressing
+serverbound abilities packets. It temporarily enables only the local physics
+state, so `player.abilities` remains the server snapshot. Pass
+`force_flight=False` to use normal abilities-controlled flight.
 
 For servers or proxies that kick idle flying players, the anti-kick heartbeat
 is enabled by default and can be configured locally:

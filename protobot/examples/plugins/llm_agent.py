@@ -122,7 +122,7 @@ How your world reaches you:
 - The live chat stream is not in your context. Use read_chat to look up recent lines (the latest 200 are kept; filter by players, keyword, or include_system) whenever you need to know what was said.
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
 - Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
-- `fly_to` stops creative flight after arrival by default; pass `keep_flying=true` only when the bot should remain airborne for another action.
+- `fly_to` uses the original flight physics by default while suppressing abilities packets; pass `force_flight=false` to use normal abilities-controlled flight.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
@@ -369,7 +369,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "fly_to",
-            "description": "Navigate through 3D space to X/Y/Z using flight; optional vertical VClip can pass through walls within configured limits",
+            "description": "Navigate through 3D space to X/Y/Z using original flight physics while suppressing abilities packets; optional vertical VClip can pass through walls within configured limits",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -408,6 +408,10 @@ TOOLS: list[dict] = [
                         "type": "boolean",
                         "description": "Allow diagonal flight path segments; default true",
                     },
+                    "force_flight": {
+                        "type": "boolean",
+                        "description": "Use original flight physics while suppressing abilities packets; default true",
+                    },
                 },
                 "required": ["x", "y", "z"],
             },
@@ -443,6 +447,7 @@ TOOLS: list[dict] = [
                     "anti_kick": {"type": "boolean", "description": "Enable anti-kick flight heartbeats; omit for local config"},
                     "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
                     "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
+                    "force_flight": {"type": "boolean", "description": "Use original flight physics without abilities packets; default true"},
                 },
                 "required": ["x", "y", "z"],
             },
@@ -470,6 +475,7 @@ TOOLS: list[dict] = [
                     "anti_kick": {"type": "boolean", "description": "Enable anti-kick flight heartbeats; omit for local config"},
                     "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
                     "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
+                    "force_flight": {"type": "boolean", "description": "Use original flight physics without abilities packets; default true"},
                 },
                 "required": ["coordinates"],
             },
@@ -2737,6 +2743,8 @@ class LLMAgent(Plugin):
         kwargs["keep_flying"] = keep_flying
         if "allow_diagonal" in args:
             kwargs["allow_diagonal"] = bool(args["allow_diagonal"])
+        if "force_flight" in args:
+            kwargs["force_flight"] = bool(args["force_flight"])
         if "anti_kick" in args:
             kwargs["anti_kick"] = bool(args["anti_kick"])
         if "anti_kick_interval" in args and args["anti_kick_interval"] is not None:
@@ -2751,18 +2759,19 @@ class LLMAgent(Plugin):
             )
             await asyncio.wait_for(bot.fly_to(x, y, z, timeout=45.0, **kwargs), timeout=50.0)
         except TimeoutError:
-            try:
-                await bot.send_input()
-            except Exception:
-                pass
-            try:
-                if not bot.physics_state.spectator:
-                    await bot.set_flying(False, bypass_permission=True)
-            except Exception:
-                pass
+            if not kwargs.get("force_flight", True):
+                try:
+                    await bot.send_input()
+                except Exception:
+                    pass
+                try:
+                    if not bot.physics_state.spectator:
+                        await bot.set_flying(False, bypass_permission=True)
+                except Exception:
+                    pass
             return "Failed to reach the flight target within 50 s"
         except Exception as error:
-            if not keep_flying:
+            if not keep_flying and not kwargs.get("force_flight", True):
                 try:
                     await bot.stop_flying()
                 except Exception:
@@ -2806,6 +2815,8 @@ class LLMAgent(Plugin):
                 forwarded[key] = args[key]
         if "allow_diagonal" in args:
             forwarded["allow_diagonal"] = args["allow_diagonal"]
+        if "force_flight" in args:
+            forwarded["force_flight"] = args["force_flight"]
         return await self._tool_fly_to(forwarded)
 
     def _deny(self, requester: str | None, action: str) -> str:

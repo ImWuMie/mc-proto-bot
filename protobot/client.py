@@ -408,6 +408,7 @@ class Bot:
         self.boat_physics = BoatPhysicsEngine()
         self.physics_state = PhysicsState()
         self._navigation_active = False
+        self._force_flight_active = False
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -1236,6 +1237,15 @@ class Bot:
 
     def _set_local_flying(self, enabled: bool) -> None:
         self.player.abilities.flying = enabled
+        self._set_physics_flying(enabled)
+
+    def _set_physics_flying(self, enabled: bool) -> None:
+        """Toggle only the local predictor's flight state.
+
+        Forced navigation uses this instead of :meth:`_set_local_flying` so
+        the server-provided abilities snapshot is left untouched.
+        """
+
         self.physics_state.flying = enabled
         if enabled:
             self.physics_state.gliding = False
@@ -1243,6 +1253,11 @@ class Bot:
             self.player.gliding = False
 
     async def _send_flying_state(self) -> None:
+        if self._force_flight_active:
+            # Forced navigation deliberately keeps the server's abilities
+            # snapshot untouched, even if another local state transition tries
+            # to synchronize flight while the route is running.
+            return
         flags = 0x02 if self.player.abilities.flying else 0x00
         await self.send_raw(
             self.version.packets.serverbound_player_abilities,
@@ -1367,6 +1382,7 @@ class Bot:
             self.physics_state.spectator
             and self.player.abilities.allow_flying
             and not self.physics_state.flying
+            and not self._force_flight_active
         ):
             # Spectator flight is locked on by ClientPlayerEntity before it
             # applies movement input.
@@ -1379,8 +1395,14 @@ class Bot:
         self.player.velocity_y = velocity.y
         self.player.velocity_z = velocity.z
         if self.physics_state.flying != was_flying:
-            self.player.abilities.flying = self.physics_state.flying
-            await self._send_flying_state()
+            if self._force_flight_active:
+                # Vanilla physics can turn flight off after touching ground;
+                # forced navigation keeps the local predictor airborne without
+                # changing or synchronizing the server abilities flags.
+                self._set_physics_flying(True)
+            else:
+                self.player.abilities.flying = self.physics_state.flying
+                await self._send_flying_state()
         if send_input:
             await self._sync_input(
                 forward=controls.forward > 0,
@@ -1742,8 +1764,15 @@ class Bot:
         anti_kick: bool | None = None,
         anti_kick_interval: float | None = None,
         allow_diagonal: bool = True,
+        force_flight: bool = True,
     ) -> PhysicsState:
-        """Enable creative/spectator flight and navigate to a 3D target."""
+        """Navigate to a 3D target using flight pathfinding.
+
+        ``force_flight`` temporarily enables only the local flight predictor
+        and runs the normal vanilla movement-input path.  It never changes or
+        sends the serverbound abilities packet, which is useful when the
+        server does not advertise vanilla ``allow_flying``.
+        """
 
         self._require_play()
         if not all(
@@ -1759,6 +1788,8 @@ class Bot:
             raise TypeError("bypass_permission must be a bool")
         if not isinstance(keep_flying, bool):
             raise TypeError("keep_flying must be a bool")
+        if not isinstance(force_flight, bool):
+            raise TypeError("force_flight must be a bool")
         if anti_kick is not None and not isinstance(anti_kick, bool):
             raise TypeError("anti_kick must be a bool or None")
         if anti_kick_interval is not None and (
@@ -1772,7 +1803,7 @@ class Bot:
             )
         if not self.world_ready.is_set():
             await self.wait_world(timeout=timeout)
-        if not self.physics_state.flying:
+        if not force_flight and not self.physics_state.flying:
             await self.set_flying(True, bypass_permission=bypass_permission)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -1794,27 +1825,49 @@ class Bot:
                     timeout=deadline - loop.time(),
                 )
             except (asyncio.TimeoutError, PathNotFound) as error:
-                await self._stop_flying_after_navigation(keep_flying)
+                await self._stop_flying_after_navigation(
+                    keep_flying, force_flight=force_flight
+                )
                 if isinstance(error, asyncio.TimeoutError):
                     raise NavigationTimeout("flight path planning timed out") from error
                 raise
             await self.events.emit("flight_path", path, attempt)
-            if await self._execute_flight_path(path, deadline, tolerance, tick_interval):
+            if await self._execute_flight_path(
+                path,
+                deadline,
+                tolerance,
+                tick_interval,
+                force_flight=force_flight,
+            ):
                 state = self.physics_state
                 if math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)) <= tolerance:
-                    await self._stop_flying_after_navigation(keep_flying)
+                    await self._stop_flying_after_navigation(
+                        keep_flying, force_flight=force_flight
+                    )
                     return self.physics_state
         state = self.physics_state
-        await self._stop_flying_after_navigation(keep_flying)
+        await self._stop_flying_after_navigation(
+            keep_flying, force_flight=force_flight
+        )
         raise NavigationTimeout(
             f"fly_to did not reach ({x:.3f}, {y:.3f}, {z:.3f}); "
             f"remaining distance is {math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)):.3f} blocks"
         )
 
-    async def _stop_flying_after_navigation(self, keep_flying: bool) -> None:
+    async def _stop_flying_after_navigation(
+        self,
+        keep_flying: bool,
+        *,
+        force_flight: bool = False,
+    ) -> None:
         """Leave creative flight off after a completed navigation task."""
 
-        if keep_flying or not self.physics_state.flying or self.physics_state.spectator:
+        if (
+            force_flight
+            or keep_flying
+            or not self.physics_state.flying
+            or self.physics_state.spectator
+        ):
             return
         self._set_local_flying(False)
         await self._send_flying_state()
@@ -1840,15 +1893,24 @@ class Bot:
         deadline: float,
         tolerance: float,
         tick_interval: float,
+        *,
+        force_flight: bool = False,
     ) -> bool:
         if self._navigation_active:
             raise RuntimeError("another navigation task is already running")
         self._navigation_active = True
+        previous_flying = self.physics_state.flying
+        if force_flight:
+            self._force_flight_active = True
+            self._set_physics_flying(True)
         try:
             return await self._execute_flight_path_unlocked(
                 path, deadline, tolerance, tick_interval
             )
         finally:
+            if force_flight:
+                self._force_flight_active = False
+                self._set_physics_flying(previous_flying)
             self._navigation_active = False
 
     async def _execute_flight_path_unlocked(
@@ -2010,6 +2072,7 @@ class Bot:
         self.registries = RegistryStore()
         self.physics_state = PhysicsState()
         self._navigation_active = False
+        self._force_flight_active = False
         self._next_anti_kick = 0.0
         self._anti_kick_direction = 1.0
         self._last_sent_input_flags = 0
@@ -2374,7 +2437,10 @@ class Bot:
         self.player.abilities = abilities
         self.physics_state.allow_flying = abilities.allow_flying
         self.physics_state.fly_speed = abilities.fly_speed
-        self._set_local_flying(abilities.flying)
+        if self._force_flight_active:
+            self._set_physics_flying(True)
+        else:
+            self._set_local_flying(abilities.flying)
         await self.events.emit("abilities", abilities)
 
     async def _handle_system_chat(self, payload: bytes) -> None:
