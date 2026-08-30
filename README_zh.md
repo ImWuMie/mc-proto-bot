@@ -83,11 +83,17 @@ asyncio.run(main())
 ```
 
 `fly_to` 默认使用原版飞行物理，但会屏蔽 abilities 发包。它只临时开启本地
-物理状态，`player.abilities` 仍保持服务端快照。传入 `force_flight=False` 可改用正常 abilities 控制的飞行。
+物理状态，`player.abilities` 仍保持服务端快照。旧版参数 `force_flight` 和
+`bypass_permission` 仍可传入，但不会检查权限，也不会发送 abilities 包。
 
 飞行寻路默认使用滚动即时规划：每次只规划前方一小段，飞行过程中根据最新坐标
 和区块快照继续规划。传入 `realtime=False` 可改为一次性规划整条路径，或用
 `planning_horizon` 调整分段长度（默认 8 格）。
+
+`timeout` 限制整次飞行操作的总时间，包括等待区块、寻路、预取下一段和移动；
+`planning_timeout` 限制每次后台 A* 规划的最长等待时间（默认
+`min(timeout, 10)` 秒）。任一超时都会抛出 `NavigationTimeout`，并清理未完成的
+预取任务和本地飞行状态。
 
 客户端只拥有服务器当前下发的区块。`get_status` 会显示已加载区块边界和估算半径；
 实际范围由服务器 `view_distance` 以及区块发送/卸载策略共同决定。

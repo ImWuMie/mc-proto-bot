@@ -1962,6 +1962,7 @@ class Bot:
         realtime: bool = True,
         planning_horizon: float = 8.0,
         lookahead: bool = True,
+        planning_timeout: float | None = None,
     ) -> PhysicsState:
         """Navigate to a 3D target using flight pathfinding.
 
@@ -1969,7 +1970,9 @@ class Bot:
         normal vanilla movement-input path.  It never checks or changes the
         server abilities snapshot and never sends a serverbound abilities
         packet.  The ``force_flight`` argument is retained for API
-        compatibility and is ignored.
+        compatibility and is ignored.  ``timeout`` is the overall operation
+        deadline; ``planning_timeout`` bounds each individual worker-thread
+        path plan and defaults to ``min(timeout, 10.0)``.
         """
 
         self._require_play()
@@ -1999,6 +2002,10 @@ class Bot:
             raise TypeError("lookahead must be a bool")
         if not math.isfinite(planning_horizon) or planning_horizon <= 0.0:
             raise ValueError("planning_horizon must be a finite positive number")
+        if planning_timeout is None:
+            planning_timeout = min(timeout, 10.0)
+        if not math.isfinite(planning_timeout) or planning_timeout <= 0.0:
+            raise ValueError("planning_timeout must be a finite positive number")
         if anti_kick is not None and not isinstance(anti_kick, bool):
             raise TypeError("anti_kick must be a bool or None")
         if anti_kick_interval is not None and (
@@ -2006,6 +2013,8 @@ class Bot:
         ):
             raise ValueError("anti_kick_interval must be at least 0.2 seconds")
         self._navigation_claimed = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         force_started = False
         try:
             if anti_kick is not None or anti_kick_interval is not None:
@@ -2014,7 +2023,17 @@ class Bot:
                     interval=anti_kick_interval,
                 )
             if not self.world_ready.is_set():
-                await self.wait_world(timeout=timeout)
+                remaining = deadline - loop.time()
+                if remaining <= 0.0:
+                    raise NavigationTimeout(
+                        "flight navigation timed out before world data was ready"
+                    )
+                try:
+                    await self.wait_world(timeout=remaining)
+                except asyncio.TimeoutError as error:
+                    raise NavigationTimeout(
+                        "flight navigation timed out before world data was ready"
+                    ) from error
             # Always use local-only flight.  Do not inspect allow_flying and do
             # not emit the abilities packet even when callers pass the legacy
             # force_flight=False/bypass_permission=False options.
@@ -2029,11 +2048,27 @@ class Bot:
                 self._set_physics_flying(self._force_flight_previous)
             self._navigation_claimed = False
             raise
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
         attempt = 0
         pending_plan: asyncio.Task[NavigationPath] | None = None
         pending_plan_start: Vec3 | None = None
+
+        async def clear_pending_plan() -> None:
+            """Cancel and retrieve a speculative plan without masking navigation errors."""
+
+            nonlocal pending_plan, pending_plan_start
+            task = pending_plan
+            pending_plan = None
+            pending_plan_start = None
+            if task is None:
+                return
+            if not task.done():
+                task.cancel()
+            # A completed lookahead may carry PathNotFound (or another worker
+            # exception).  Retrieve it during cleanup so it cannot become an
+            # unhandled task warning or replace the original navigation error.
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+
         try:
             while deadline > loop.time():
                 state = self.physics_state
@@ -2047,11 +2082,7 @@ class Bot:
                         (state.position - pending_plan_start).length_squared
                     )
                     if deviation > max(1.0, state.width * 2.0):
-                        pending_plan.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await pending_plan
-                        pending_plan = None
-                        pending_plan_start = None
+                        await clear_pending_plan()
                 remaining_distance = math.dist(
                     (state.position.x, state.position.y, state.position.z),
                     (x, y, z),
@@ -2087,18 +2118,29 @@ class Bot:
                             name="protobot-flight-plan",
                         )
                         pending_plan_start = state.position
+                    remaining = deadline - loop.time()
+                    if remaining <= 0.0:
+                        raise NavigationTimeout(
+                            "flight navigation deadline expired while planning"
+                        )
+                    deadline_limited_plan = remaining <= planning_timeout
+                    plan_timeout = min(planning_timeout, remaining)
                     path = await asyncio.wait_for(
                         asyncio.shield(pending_plan),
-                        timeout=deadline - loop.time(),
+                        timeout=plan_timeout,
                     )
                     pending_plan = None
                     pending_plan_start = None
                 except (asyncio.TimeoutError, PathNotFound) as error:
-                    if pending_plan is not None and pending_plan.done():
-                        pending_plan = None
-                        pending_plan_start = None
+                    await clear_pending_plan()
                     if isinstance(error, asyncio.TimeoutError):
-                        raise NavigationTimeout("flight path planning timed out") from error
+                        if deadline_limited_plan or deadline - loop.time() <= 0.0:
+                            raise NavigationTimeout(
+                                "flight navigation deadline expired while planning"
+                            ) from error
+                        raise NavigationTimeout(
+                            f"flight segment planning exceeded {planning_timeout:.3g} seconds"
+                        ) from error
                     if not realtime or attempt >= replans:
                         raise
                     attempt += 1
@@ -2150,12 +2192,7 @@ class Bot:
                         return self.physics_state
                     if realtime:
                         continue
-                if pending_plan is not None and not pending_plan.done():
-                    pending_plan.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await pending_plan
-                    pending_plan = None
-                    pending_plan_start = None
+                await clear_pending_plan()
                 attempt += 1
                 if attempt > replans:
                     break
@@ -2166,11 +2203,7 @@ class Bot:
                 f"remaining distance is {math.dist((state.position.x, state.position.y, state.position.z), (x, y, z)):.3f} blocks"
             )
         finally:
-            if pending_plan is not None and not pending_plan.done():
-                pending_plan.cancel()
-                with suppress(asyncio.CancelledError):
-                    await pending_plan
-            pending_plan_start = None
+            await clear_pending_plan()
             self._navigation_planning = False
             self._navigation_vclip_active = False
             self._navigation_vertical_active = False

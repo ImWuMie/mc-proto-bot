@@ -376,6 +376,14 @@ TOOLS: list[dict] = [
                     "x": {"type": "number", "description": "Target X coordinate"},
                     "y": {"type": "number", "description": "Target Y coordinate"},
                     "z": {"type": "number", "description": "Target Z coordinate"},
+                    "timeout": {
+                        "type": "number",
+                        "description": "Total flight navigation timeout in seconds; default 60",
+                    },
+                    "planning_timeout": {
+                        "type": "number",
+                        "description": "Maximum time for each background path plan in seconds; default 10",
+                    },
                     "vclip": {
                         "type": "boolean",
                         "description": "Enable vertical-only wall clipping; default uses local navigation.vclip config",
@@ -440,6 +448,8 @@ TOOLS: list[dict] = [
                     "x": {"type": "number", "description": "Target X coordinate"},
                     "y": {"type": "number", "description": "Target Y coordinate"},
                     "z": {"type": "number", "description": "Target Z coordinate"},
+                    "timeout": {"type": "number", "description": "Total flight navigation timeout in seconds; default 60"},
+                    "planning_timeout": {"type": "number", "description": "Maximum time for each path plan in seconds; default 10"},
                     "vclip": {
                         "type": "boolean",
                         "description": "Enable vertical-only wall clipping; default uses local navigation.vclip config",
@@ -480,6 +490,8 @@ TOOLS: list[dict] = [
                         "type": "string",
                         "description": "Three coordinates in X Y Z order; spaces, commas, and signed values are accepted",
                     },
+                    "timeout": {"type": "number", "description": "Total flight navigation timeout in seconds; default 60"},
+                    "planning_timeout": {"type": "number", "description": "Maximum time for each path plan in seconds; default 10"},
                     "vclip": {
                         "type": "boolean",
                         "description": "Enable vertical-only wall clipping; default uses local navigation.vclip config",
@@ -2120,10 +2132,22 @@ class LLMAgent(Plugin):
                     arguments = json.loads(function.get("arguments") or "{}")
                 except (TypeError, json.JSONDecodeError):
                     arguments = {}
+                tool_timeout = max(
+                    10.0, min(float(settings.get("timeout", 120.0)), 60.0)
+                )
+                if tool_name in {"fly_to", "fly_to_bypass_permission", "fly_to_xyz"}:
+                    try:
+                        requested_timeout = float(arguments.get("timeout", 60.0))
+                    except (TypeError, ValueError):
+                        requested_timeout = 60.0
+                    if math.isfinite(requested_timeout) and requested_timeout > 0.0:
+                        # The movement tool owns its own deadline.  Keep the
+                        # dispatcher alive slightly longer so a valid custom
+                        # timeout is not cut off by the generic 60-second cap.
+                        tool_timeout = max(tool_timeout, requested_timeout + 5.0)
                 try:
                     result = await asyncio.wait_for(
-                        self._run_tool(tool_name, arguments),
-                        timeout=max(10.0, min(float(settings.get("timeout", 120.0)), 60.0)),
+                        self._run_tool(tool_name, arguments), timeout=tool_timeout
                     )
                 except asyncio.TimeoutError:
                     result = f"Tool {tool_name} timed out; the movement was cancelled"
@@ -2835,6 +2859,19 @@ class LLMAgent(Plugin):
             if math.dist(active, target) <= 1.0:
                 return "A flight navigation to this target is already in progress"
         kwargs: dict[str, object] = {"force_flight": True, "bypass_permission": True}
+        try:
+            timeout = float(args.get("timeout", 60.0))
+            planning_timeout = float(args.get("planning_timeout", 10.0))
+        except (TypeError, ValueError):
+            return "Arguments timeout and planning_timeout must be numbers"
+        if (
+            not math.isfinite(timeout)
+            or not math.isfinite(planning_timeout)
+            or timeout <= 0.0
+            or planning_timeout <= 0.0
+        ):
+            return "Arguments timeout and planning_timeout must be positive"
+        kwargs["planning_timeout"] = planning_timeout
         keep_flying = bool(args.get("keep_flying", False))
         if "vclip" in args:
             kwargs["vclip"] = bool(args["vclip"])
@@ -2869,7 +2906,10 @@ class LLMAgent(Plugin):
                 f"[LLM] flight navigation requested: X={x:.1f} Y={y:.1f} Z={z:.1f} "
                 f"vclip={kwargs.get('vclip', 'config')}"
             )
-            await asyncio.wait_for(bot.fly_to(x, y, z, timeout=45.0, **kwargs), timeout=50.0)
+            await asyncio.wait_for(
+                bot.fly_to(x, y, z, timeout=timeout, **kwargs),
+                timeout=max(10.0, timeout + 5.0),
+            )
         except TimeoutError as error:
             detail = str(error).strip()
             if detail:
@@ -2915,7 +2955,7 @@ class LLMAgent(Plugin):
             forwarded["allow_diagonal"] = args["allow_diagonal"]
         if "force_flight" in args:
             forwarded["force_flight"] = args["force_flight"]
-        for key in ("realtime", "planning_horizon", "lookahead"):
+        for key in ("realtime", "planning_horizon", "lookahead", "timeout", "planning_timeout"):
             if key in args:
                 forwarded[key] = args[key]
         return await self._tool_fly_to(forwarded)

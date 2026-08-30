@@ -85,8 +85,9 @@ asyncio.run(main())
 
 `fly_to` uses the original flight physics by default while suppressing
 serverbound abilities packets. It temporarily enables only the local physics
-state, so `player.abilities` remains the server snapshot. Pass
-`force_flight=False` to use normal abilities-controlled flight.
+state, so `player.abilities` remains the server snapshot. The legacy
+`force_flight` and `bypass_permission` flags are accepted for compatibility but
+do not perform an abilities check or send an abilities packet.
 
 Flight navigation replans in rolling segments by default, so longer targets
 are planned against the latest position and chunk snapshot while the bot is
@@ -94,6 +95,12 @@ moving. The next segment is precomputed in the background by default; set
 `lookahead=False` to disable that prefetch. Use `realtime=False` for one
 full-route plan, or adjust the segment length with `planning_horizon` (default
 8 blocks).
+
+`timeout` bounds the complete flight operation, including waiting for initial
+world data, planning, lookahead, and movement. Each individual background A*
+plan is bounded by `planning_timeout` (default: `min(timeout, 10)` seconds).
+When either deadline expires, `NavigationTimeout` is raised and any pending
+lookahead task is cancelled and retrieved before flight state is cleaned up.
 
 The client only has the chunks currently sent by the server. The live
 `get_status` tool reports the loaded chunk bounds and approximate radius;
