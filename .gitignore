@@ -11,6 +11,7 @@ build/
 auth_cache.json
 config.yaml
 protobot-live.log
+botpy.log
 .claude/settings.local.json
 
 # LLM 智能体插件数据（llm_agent.json 含 api_key，切勿提交）

@@ -1,2 +1,0 @@
-2026-08-29 18:16:32,484	[ERROR]	(robot.py:63)update_access_token	[botpy] 获取token失败，请检查appid和secret填写是否正确！
-2026-08-29 18:18:35,106	[ERROR]	(http.py:76)_handle_response	[botpy] 接口请求异常，请求连接: https://api.sgroup.qq.com/v2/users/00000000000000000000000000000000/messages, 错误代码: 400, 返回内容: {'message': '请求的资源不存在(用户/群已注销)', 'code': 11255, 'err_code': 40011028, 'trace_id': '373e42f755a4b90e6f07ebc2f233c980'}, trace_id:373e42f755a4b90e6f07ebc2f233c980
