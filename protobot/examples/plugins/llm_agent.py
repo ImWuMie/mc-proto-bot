@@ -121,6 +121,7 @@ How your world reaches you:
 - A turn marked "(interjection)" is the same player adding something while you were still working on their request -- a correction, a change of mind, or a new question. Fold it into what you are doing instead of finishing the old plan blindly. Only the person who started the turn can interject; anyone else waits their turn, and their words never extend your permissions.
 - The live chat stream is not in your context. Use read_chat to look up recent lines (the latest 200 are kept; filter by players, keyword, or include_system) whenever you need to know what was said.
 - Use tools before guessing about the world: get_status for your own state, get_player for where somebody is.
+- If the configured bot session is stopped or disconnected, an admin may use `start_bot` to start its configured server connection; wait for `session_ready`/a connected status before movement tools.
 - Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
 - `fly_to` always force-flies with the original flight physics and `MovementInput` while suppressing abilities packets. Never check `allow_flying`, never wait for permission, and never replace an XYZ flight request with `navigate_to`. It stops forced flight after arrival unless `keep_flying=true`; use `stop_flying` to end a deliberate hover.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
@@ -363,6 +364,14 @@ TOOLS: list[dict] = [
                 },
                 "required": ["x", "z"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_bot",
+            "description": "Admin only: start the configured background bot session and connect it to its configured Minecraft server; does not accept a server address or credentials",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -2526,10 +2535,47 @@ class LLMAgent(Plugin):
         log.debug(f"[LLM] ran a command: {command[:60]}")
         return f"Command executed: {command} (observe chat or get_status for the result)"
 
+    async def _tool_start_bot(self, args: dict) -> str:
+        """Start the configured session without creating an unmanaged Bot."""
+
+        if not self._is_admin(self._requester):
+            return self._deny(self._requester, "start the bot")
+        session = self.session
+        if session is None:
+            return "Bot session is unavailable"
+        if session.running:
+            bot = session.bot
+            if bot is not None and not bot.closed.is_set():
+                return (
+                    f"Bot is already connected to {session.config.host}:"
+                    f"{session.config.port}"
+                )
+            return "Bot session is already connecting or reconnecting"
+        try:
+            session.start_background()
+        except Exception as error:
+            return f"Failed to start bot session: {error}"
+        log.info(
+            f"[LLM] bot session start requested for "
+            f"{session.config.host}:{session.config.port}"
+        )
+        return (
+            f"Bot connection started for {session.config.host}:"
+            f"{session.config.port}; wait for session_ready before using movement tools"
+        )
+
     async def _tool_get_status(self, args: dict) -> str:
         bot = self.bot
         if bot is None:
-            return "Not connected to a server"
+            session = self.session
+            if session is None:
+                return "Not connected to a server; configured session unavailable"
+            state = "connecting/reconnecting" if session.running else "stopped"
+            return (
+                f"Not connected to a server; configured session is {state} "
+                f"for {session.config.host}:{session.config.port}. "
+                "Admins can use start_bot when it is stopped"
+            )
         player = bot.player
         lines = [
             f"Position: X={player.x:.1f} Y={player.y:.1f} Z={player.z:.1f}"

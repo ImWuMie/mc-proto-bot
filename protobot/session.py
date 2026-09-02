@@ -169,6 +169,45 @@ class BotSession:
         self._tick_interval = tick_interval
         self._heartbeat_ticks = heartbeat_ticks
         self._wait_world_timeout = wait_world_timeout
+        self._run_task: asyncio.Task | None = None
+
+    @property
+    def running(self) -> bool:
+        """Whether this session currently owns a live run task."""
+
+        task = self._run_task
+        return task is not None and not task.done()
+
+    @property
+    def run_task(self) -> asyncio.Task | None:
+        """The current session task, if started in the current event loop."""
+
+        return self._run_task
+
+    def start_background(self) -> asyncio.Task:
+        """Start this session on the current event loop and return its task."""
+
+        if self.running:
+            task = self._run_task
+            assert task is not None
+            return task
+        task = asyncio.create_task(self.run(), name="protobot-session-background")
+        self._run_task = task
+        task.add_done_callback(self._consume_background_result)
+        return task
+
+    @staticmethod
+    def _consume_background_result(task: asyncio.Task) -> None:
+        """Retrieve and log failures from a fire-and-forget session start."""
+
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            log_error(f"background bot session stopped with an error: {error}")
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -176,6 +215,14 @@ class BotSession:
     async def run(self) -> None:
         # Clear the stop flag so a session can be started again after a stop
         # (the TUI's ``.run`` command relies on this).
+        current = asyncio.current_task()
+        if (
+            self._run_task is not None
+            and self._run_task is not current
+            and self.running
+        ):
+            raise RuntimeError("bot session is already running")
+        self._run_task = current
         self._stop.clear()
         if self._plugins is not None:
             self._plugins.bind_session_all(self)
@@ -186,8 +233,8 @@ class BotSession:
             pass  # graceful: the per-attempt finally already closed the bot
         finally:
             await self.events.emit("session_stop")
-            if self._plugins is not None:
-                self._plugins.unbind_session_all(self)
+            if self._run_task is current:
+                self._run_task = None
 
     async def _run_attempts(self) -> None:
         attempt = 1

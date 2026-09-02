@@ -86,6 +86,11 @@ asyncio.run(main())
 物理状态，`player.abilities` 仍保持服务端快照。旧版参数 `force_flight` 和
 `bypass_permission` 仍可传入，但不会检查权限，也不会发送 abilities 包。
 
+可选的 `no_fall` 插件会把所有玩家和载具移动包的 on-ground 位强制改为
+`false`。它只修改线上包，本地物理仍记录真实落地状态。插件被发现时默认开启，
+可编辑 `plugins/no_fall.json`，也可以使用 LLM 工具 `no_fall_status` 和
+`no_fall_set` 切换。
+
 飞行寻路默认使用滚动即时规划：每次只规划前方一小段，飞行过程中根据最新坐标
 和区块快照继续规划。传入 `realtime=False` 可改为一次性规划整条路径，或用
 `planning_horizon` 调整分段长度（默认 8 格）。
@@ -416,7 +421,8 @@ class HelloReply(Plugin):
 动作——发消息、执行命令、行走/寻路、转头（绝对/相对）、查询玩家位置、
 查看游戏状态、自检运行状态（`get_system_info`：模型、上下文占用、连接时长、
 插件与任务数）、开关/修改(patch)/读取/删除插件、编写新插件、管理定时任务、
-把聊天交给一个什么都没有的**副 AI**，以及维护**按服务器分开的 Markdown 记忆**
+用仅管理员可调用的 `start_bot` 启动配置中的 bot 会话、把聊天交给一个什么都没有的
+**副 AI**，以及维护**按服务器分开的 Markdown 记忆**
 （`MEMORY.md`，可多文件）并自主更新。
 
 **首次运行**会自动生成 `plugins/llm_agent.json`——填好端点与密钥后保存一次
@@ -772,7 +778,7 @@ protobot-export-block-states reports/blocks.json --output data/blocks-26.2.json.
 | `tui.py` | Textual 全屏 TUI（可选 `tui` extra）与普通日志降级 |
 | `data/` | 内置各版本方块状态表 |
 | `cli.py` | 诊断控制台命令 |
-| `plugins/` | 示例插件（chat_logger、llm_agent、scheduler、fishing、respawn） |
+| `plugins/` | 示例插件（chat_logger、llm_agent、scheduler、fishing、no_fall、respawn） |
 | `config.yaml` | 本地配置文件（首次启动向导生成，不入库） |
 
 ## 开发

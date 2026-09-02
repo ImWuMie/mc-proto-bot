@@ -31,6 +31,7 @@ EXAMPLE_PLUGINS = (
     "chat_logger.py",
     "fishing.py",
     "llm_agent.py",
+    "no_fall.py",
     "respawn.py",
     "scheduler.py",
 )

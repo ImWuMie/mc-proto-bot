@@ -601,7 +601,6 @@ class PluginManager:
     async def enable_all(self) -> None:
         """Run ``on_enable`` in load order; hook failures are logged, not fatal."""
         self._current_bot = None
-        self._current_session = None
         for plugin in self._order:
             await self._enable_one(plugin)
 
@@ -627,7 +626,24 @@ class PluginManager:
             plugin.bot = None
         self._current_bot = None
 
+    def attach_session(self, session: BotSession) -> None:
+        """Register the configured session before plugins are enabled.
+
+        Unlike :meth:`bind_session_all`, this only records the session. Each
+        plugin receives and binds it once from ``_enable_one``. This lets an
+        enabled administrative plugin start an idle session without duplicate
+        lifecycle subscriptions.
+        """
+
+        if self._current_session is not None and self._current_session is not session:
+            raise PluginError("[plugin] another bot session is already attached")
+        self._current_session = session
+
     def bind_session_all(self, session: BotSession) -> None:
+        if self._current_session is session:
+            return
+        if self._current_session is not None:
+            self.unbind_session_all(self._current_session)
         self._current_session = session
         for plugin in self._order:
             plugin.session = session

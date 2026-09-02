@@ -350,7 +350,7 @@ if _TEXTUAL:  # pragma: no cover - class bodies skipped without Textual
         @property
         def started(self) -> bool:
             task = self.session_task
-            return task is not None and not task.done()
+            return self.session.running or (task is not None and not task.done())
 
         def _refresh_status(self) -> None:
             if not self.is_running:  # timer can outlive the screen by a tick

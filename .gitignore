@@ -30,5 +30,8 @@ plugins/fishing.json
 # 自动重生插件设置（运行时自动生成）
 plugins/respawn.json
 
+# No-fall plugin settings (generated at runtime)
+plugins/no_fall.json
+
 /run/
 /plugins/llm/

@@ -424,6 +424,7 @@ class Bot:
         self._navigation_claimed = False
         self._force_flight_active = False
         self._force_flight_previous = False
+        self._no_fall = False
         self._navigation_vclip_active = False
         self._navigation_vertical_active = False
         self._position_update_serial = 0
@@ -1235,6 +1236,18 @@ class Bot:
         if self.player.abilities.flying:
             self.player.abilities.flying = False
             await self._send_flying_state()
+
+    def set_no_fall(self, enabled: bool) -> None:
+        """Force the on-ground bit off in all outgoing movement packets.
+
+        This is deliberately a wire-only setting: the local physics predictor
+        keeps its real ``on_ground`` and fall-distance state, while the server
+        receives ``on_ground=false`` for player and vehicle movement packets.
+        """
+
+        if not isinstance(enabled, bool):
+            raise TypeError("no_fall enabled must be a bool")
+        self._no_fall = enabled
 
     async def set_anti_kick(
         self,
@@ -2611,7 +2624,8 @@ class Bot:
         await self._open_login_connection(host, port, host)
 
     def _movement_flags(self) -> int:
-        return int(self.player.on_ground) | (int(self.player.horizontal_collision) << 1)
+        on_ground = False if self._no_fall else self.player.on_ground
+        return int(on_ground) | (int(self.player.horizontal_collision) << 1)
 
     @staticmethod
     def _input_flags(*values: bool) -> int:
@@ -3295,7 +3309,7 @@ class Bot:
             .write_double(vehicle.z)
             .write_float(vehicle.yaw)
             .write_float(vehicle.pitch)
-            .write_bool(vehicle.on_ground)
+            .write_bool(False if self._no_fall else vehicle.on_ground)
             .to_bytes()
         )
         await self.send_raw(self.version.packets.serverbound_move_vehicle, payload)

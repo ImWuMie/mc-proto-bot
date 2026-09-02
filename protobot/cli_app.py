@@ -542,6 +542,10 @@ async def run_bot_session(args: argparse.Namespace) -> int:
         ),
         plugin_manager=manager,
     )
+    # Register the configured session before enabling plugins so administrative
+    # tools can start it while the TUI is idle. Actual event binding still
+    # happens once per plugin during enable_all().
+    manager.attach_session(session)
 
     watcher = PluginWatcher(manager) if plugin_config.watch else None
     watcher_task: asyncio.Task | None = None
@@ -570,6 +574,8 @@ async def run_bot_session(args: argparse.Namespace) -> int:
                 session.request_stop()
                 if app.session_task is not None:
                     await app.session_task
+                elif session.run_task is not None:
+                    await session.run_task
                 set_sink(None)  # Back to plain print
                 await _stop_watcher(watcher, watcher_task)
                 watcher_task = None

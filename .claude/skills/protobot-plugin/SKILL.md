@@ -164,7 +164,8 @@ mod-loader events; ordinary plugins do not need them.
 - Chat: `await self.bot.send_message(text)` / `await self.bot.send_command(cmd)` (leading `/` stripped)
 - Movement: `await self.bot.tick(MovementInput())` (one 20 Hz physics tick),
   `walk_to(x, z, sprint=False)`, `navigate_to(x, z, sprint=False)` (A*),
-  `set_flying(flag)`, `start_gliding()`
+  `set_flying(flag)`, `start_gliding()`, `set_no_fall(flag)` (wire-only:
+  force `on_ground=false` in every outgoing player/vehicle movement packet)
 - Interaction: `click_container(slot, ...)`, `close_container()`, `use_item()`,
   `select_hotbar_slot(slot)`
 - Respawn: `await self.bot.respawn()` — leave the death screen (Client Status,
