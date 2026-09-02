@@ -141,7 +141,9 @@ navigation:
 
 Only vertical segments use VClip; horizontal segments continue to require
 clearance. `vclip_up_limit` and `vclip_down_limit` are cumulative distances for
-one continuous wall passage.
+one continuous wall passage. Consecutive half-block VClip search nodes in one
+vertical passage are merged into a single endpoint action, so execution sends
+one clip position packet for that passage instead of one packet per node.
 
 The high-level inventory helpers expose the latest server snapshot and common
 player-container actions. Slots `0..8` are the hotbar; `36..44` are the

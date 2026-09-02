@@ -678,6 +678,7 @@ class FlightPathfinder:
             and (exact - previous).length_squared > 1.0e-8
         ):
             waypoints.append(PathWaypoint(exact, operation="fly"))
+        waypoints = self._merge_vclip_waypoints(waypoints)
         return NavigationPath(
             tuple(self._simplify_waypoints(waypoints, start=start)),
             explored,
@@ -713,6 +714,50 @@ class FlightPathfinder:
             if not self._body_clear(point.x, point.y, point.z):
                 return False
         return True
+
+    @staticmethod
+    def _merge_vclip_waypoints(waypoints: list[PathWaypoint]) -> list[PathWaypoint]:
+        """Coalesce one continuous vertical VClip passage into one action.
+
+        The A* grid uses half-block nodes so it can search precisely around
+        collision boundaries.  Sending every one of those nodes is unnecessary
+        and produces a burst of position packets.  A VClip action is already a
+        one-shot position move, so consecutive nodes on the same vertical line
+        and in the same direction can safely use the last node as their single
+        endpoint.  Direction changes and any intervening flight node remain
+        separate actions.
+        """
+
+        if len(waypoints) < 2:
+            return waypoints
+        merged: list[PathWaypoint] = []
+        vclip_direction = 0
+        epsilon = 1.0e-7
+        for waypoint in waypoints:
+            if not merged or waypoint.operation != "vclip":
+                merged.append(waypoint)
+                vclip_direction = 0
+                continue
+            previous = merged[-1]
+            if previous.operation != "vclip":
+                merged.append(waypoint)
+                vclip_direction = 0
+                continue
+            delta_y = waypoint.position.y - previous.position.y
+            direction = 1 if delta_y > epsilon else (-1 if delta_y < -epsilon else 0)
+            same_vertical_line = (
+                abs(waypoint.position.x - previous.position.x) <= epsilon
+                and abs(waypoint.position.z - previous.position.z) <= epsilon
+            )
+            if same_vertical_line and direction and (
+                vclip_direction in (0, direction)
+            ):
+                merged[-1] = waypoint
+                vclip_direction = direction
+                continue
+            merged.append(waypoint)
+            vclip_direction = direction
+        return merged
 
     def _simplify_waypoints(
         self,
