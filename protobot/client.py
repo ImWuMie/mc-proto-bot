@@ -207,6 +207,7 @@ def _find_flight_path(
     vclip_up_limit: float,
     vclip_down_limit: float,
     max_nodes: int,
+    allow_blocked_target: bool = True,
 ) -> NavigationPath:
     planner = FlightPathfinder(
         world,
@@ -217,7 +218,12 @@ def _find_flight_path(
         vclip_up_limit=vclip_up_limit,
         vclip_down_limit=vclip_down_limit,
     )
-    return planner.find_path(start, target, max_nodes=max_nodes)
+    return planner.find_path(
+        start,
+        target,
+        max_nodes=max_nodes,
+        allow_blocked_target=allow_blocked_target,
+    )
 
 
 class _UnsupportedItemComponents(Exception):
@@ -1909,6 +1915,7 @@ class Bot:
         vclip_up_limit: float | None,
         vclip_down_limit: float | None,
         allow_diagonal: bool = True,
+        allow_blocked_target: bool = True,
     ) -> NavigationPath:
         self._require_play()
         if not self.world_ready.is_set():
@@ -1938,6 +1945,7 @@ class Bot:
             vclip_up_limit=self.vclip_up_limit if vclip_up_limit is None else vclip_up_limit,
             vclip_down_limit=self.vclip_down_limit if vclip_down_limit is None else vclip_down_limit,
             max_nodes=max_nodes,
+            allow_blocked_target=allow_blocked_target,
         )
 
     async def plan_flight_path_async(
@@ -2141,6 +2149,12 @@ class Bot:
                                 vclip_up_limit=vclip_up_limit,
                                 vclip_down_limit=vclip_down_limit,
                                 allow_diagonal=allow_diagonal,
+                                # A rolling segment must end outside a block;
+                                # otherwise the next plan starts inside glass
+                                # and repeats the same VClip boundary forever.
+                                allow_blocked_target=not (
+                                    realtime and remaining_distance > planning_horizon
+                                ),
                             ),
                             name="protobot-flight-plan",
                         )
@@ -2210,6 +2224,7 @@ class Bot:
                                 vclip_up_limit=vclip_up_limit,
                                 vclip_down_limit=vclip_down_limit,
                                 allow_diagonal=allow_diagonal,
+                                allow_blocked_target=False,
                             ),
                             name="protobot-flight-lookahead",
                         )

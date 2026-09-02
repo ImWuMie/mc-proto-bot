@@ -522,6 +522,7 @@ class FlightPathfinder:
         *,
         target_y_tolerance: float = 0.51,
         max_nodes: int = 8192,
+        allow_blocked_target: bool = True,
     ) -> NavigationPath:
         """Find a route through empty volume from ``start`` to ``target``."""
 
@@ -535,6 +536,29 @@ class FlightPathfinder:
         if start_obstructed and not self.vclip:
             raise PathNotFound("the starting flight volume is obstructed")
 
+        # Rolling flight planning can place an intermediate target inside a
+        # glass/wall block (for example, exactly at the horizon boundary).
+        # Treating that blocked point as a valid goal stops VClip in the wall,
+        # forcing the next rolling plan to start from inside the same block.
+        # Extend a blocked vertical target to the first clear half-block beyond
+        # it, so one VClip action exits the obstruction before the next segment.
+        search_target = target
+        target_clear = self._body_clear(target.x, target.y, target.z)
+        if not target_clear and not allow_blocked_target:
+            direction = 1 if target.y > start.y else (-1 if target.y < start.y else 0)
+            if direction:
+                limit = self.vclip_up_limit if direction > 0 else self.vclip_down_limit
+                scan_steps = max(1, math.ceil((limit + 2.0) * 2.0))
+                for step in range(1, scan_steps + 1):
+                    candidate = Vec3(
+                        target.x,
+                        target.y + direction * step * 0.5,
+                        target.z,
+                    )
+                    if self._body_clear(candidate.x, candidate.y, candidate.z):
+                        search_target = candidate
+                        break
+
         start_node = _FlightNode(
             math.floor(start.x),
             round(start.y * 2.0),
@@ -544,9 +568,8 @@ class FlightPathfinder:
             # exit the volume instead of rejecting the whole replan.
             clip_depth=1 if start_obstructed else 0,
         )
-        goal_x, goal_z = math.floor(target.x), math.floor(target.z)
-        goal_y2 = round(target.y * 2.0)
-        target_clear = self._body_clear(target.x, target.y, target.z)
+        goal_x, goal_z = math.floor(search_target.x), math.floor(search_target.z)
+        goal_y2 = round(search_target.y * 2.0)
         # A finite envelope prevents an unreachable target from expanding the
         # entire infinite airspace.  The margin permits routes around a wall.
         margin = 16
@@ -561,7 +584,10 @@ class FlightPathfinder:
         costs = {start_node.key: 0.0}
         parents: dict[tuple[int, int, int, int, int], tuple[int, int, int, int, int]] = {}
         operations: dict[tuple[int, int, int, int, int], str] = {}
-        heapq.heappush(frontier, (self._heuristic(start_node, target), next(serial), start_node.key))
+        heapq.heappush(
+            frontier,
+            (self._heuristic(start_node, search_target), next(serial), start_node.key),
+        )
         explored = 0
         goal: _FlightNode | None = None
         while frontier and explored < max_nodes:
@@ -571,15 +597,19 @@ class FlightPathfinder:
             if (
                 current.x == goal_x
                 and current.z == goal_z
-                and abs(current.y2 / 2.0 - target.y) <= target_y_tolerance
+                and abs(current.y2 / 2.0 - search_target.y) <= target_y_tolerance
                 # Never finish a normal flight target while the planner's
                 # body is still inside a block.  Clipped terminal nodes are
-                # valid only when the requested target itself is obstructed.
-                and (not target_clear or self._body_clear(
-                    current.position.x,
-                    current.position.y,
-                    current.position.z,
-                ))
+                # not valid goals: rolling targets may land inside glass or a
+                # wall, but VClip must continue until the body is clear.
+                and (
+                    self._body_clear(
+                        current.position.x,
+                        current.position.y,
+                        current.position.z,
+                    )
+                    or (allow_blocked_target and not target_clear)
+                )
             ):
                 goal = current
                 break
@@ -642,7 +672,11 @@ class FlightPathfinder:
                 operations[key] = "vclip" if vclip_edge else "fly"
                 heapq.heappush(
                     frontier,
-                    (new_cost + self._heuristic(neighbor, target), next(serial), key),
+                    (
+                        new_cost + self._heuristic(neighbor, search_target),
+                        next(serial),
+                        key,
+                    ),
                 )
 
         if goal is None:
