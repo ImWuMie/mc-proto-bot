@@ -492,8 +492,8 @@ class FlightPathfinder:
         player_height: float = 1.8,
         allow_diagonal: bool = True,
         vclip: bool = True,
-        vclip_up_limit: float = 0.0,
-        vclip_down_limit: float = 0.0,
+        vclip_up_limit: float = 3.0,
+        vclip_down_limit: float = 2.0,
     ) -> None:
         if not all(
             math.isfinite(value) and value > 0.0

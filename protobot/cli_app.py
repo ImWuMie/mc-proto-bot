@@ -86,8 +86,8 @@ def load_session_config(data: dict) -> SessionConfig:
         reconnect_max_attempts=_get(session, "reconnect_max_attempts", None),
         connect_timeout=float(_get(session, "connect_timeout", 30.0)),
         vclip=bool(_get(navigation, "vclip", True)),
-        vclip_up_limit=float(_get(navigation, "vclip_up_limit", 0.0)),
-        vclip_down_limit=float(_get(navigation, "vclip_down_limit", 0.0)),
+        vclip_up_limit=float(_get(navigation, "vclip_up_limit", 3.0)),
+        vclip_down_limit=float(_get(navigation, "vclip_down_limit", 2.0)),
         anti_kick=bool(_get(navigation, "anti_kick", True)),
         anti_kick_interval=float(_get(navigation, "anti_kick_interval", 1.0)),
     )
@@ -375,8 +375,8 @@ async def run_setup(config_path: Path) -> int:
         },
         "navigation": {
             "vclip": True,
-            "vclip_up_limit": 0.0,
-            "vclip_down_limit": 0.0,
+            "vclip_up_limit": 3.0,
+            "vclip_down_limit": 2.0,
             "anti_kick": True,
             "anti_kick_interval": 1.0,
         },

@@ -43,8 +43,8 @@ class SessionConfig:
     reconnect_max_attempts: int | None = None  # None = reconnect forever
     connect_timeout: float = 30.0  # passed to connect(timeout=...)
     vclip: bool = True
-    vclip_up_limit: float = 0.0
-    vclip_down_limit: float = 0.0
+    vclip_up_limit: float = 3.0
+    vclip_down_limit: float = 2.0
     anti_kick: bool = True
     anti_kick_interval: float = 1.0
 

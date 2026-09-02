@@ -294,8 +294,8 @@ class Bot:
         physics_engine: PhysicsEngine | None = None,
         physics_attributes: PhysicsAttributes | None = None,
         vclip: bool = True,
-        vclip_up_limit: float = 0.0,
-        vclip_down_limit: float = 0.0,
+        vclip_up_limit: float = 3.0,
+        vclip_down_limit: float = 2.0,
         anti_kick: bool = True,
         anti_kick_interval: float = 1.0,
     ) -> None:
@@ -2176,6 +2176,13 @@ class Bot:
                 finally:
                     self._navigation_planning = False
                 await self.events.emit("flight_path", path, attempt)
+                operation_log = ",".join(path.operations[:32])
+                if len(path.operations) > 32:
+                    operation_log += ",..."
+                log_debug(
+                    f"[flight] planned {len(path.waypoints)} node(s): "
+                    f"{operation_log or 'none'}"
+                )
 
                 # Start the next rolling plan before executing this one.  The
                 # explicit start is the predicted end of the current segment,
@@ -2343,7 +2350,11 @@ class Bot:
                     vertical_reached = 0.0 <= delta.y <= waypoint_tolerance
                 else:
                     vertical_reached = abs(delta.y) <= waypoint_tolerance
-                if horizontal_distance <= horizontal_tolerance and vertical_reached:
+                if (
+                    waypoint.operation != "vclip"
+                    and horizontal_distance <= horizontal_tolerance
+                    and vertical_reached
+                ):
                     break
                 if loop.time() >= deadline:
                     return False
@@ -2370,6 +2381,12 @@ class Bot:
                         self._navigation_vclip_active = False
                     # Give the server one tick to accept/correct the clip before
                     # resuming normal physics and anti-kick packets.
+                    log_debug(
+                        f"[flight] execute vclip node "
+                        f"X={waypoint.position.x:.2f} "
+                        f"Y={waypoint.position.y:.2f} "
+                        f"Z={waypoint.position.z:.2f}"
+                    )
                     await asyncio.sleep(min(0.25, max(0.05, tick_interval)))
                     after = self.physics_state.position
                     if self._position_update_serial != before_serial:
@@ -4425,8 +4442,8 @@ async def connect(
     physics_engine: PhysicsEngine | None = None,
     physics_attributes: PhysicsAttributes | None = None,
     vclip: bool = True,
-    vclip_up_limit: float = 0.0,
-    vclip_down_limit: float = 0.0,
+    vclip_up_limit: float = 3.0,
+    vclip_down_limit: float = 2.0,
     anti_kick: bool = True,
     anti_kick_interval: float = 1.0,
 ) -> Bot:
