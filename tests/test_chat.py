@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import unittest
 import uuid
 from unittest.mock import patch
@@ -201,17 +202,25 @@ class PlayerCertificateTests(unittest.IsolatedAsyncioTestCase):
             self.skipTest("cryptography extra is not installed")
 
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        private_der = private_key.private_bytes(
+            serialization.Encoding.DER,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        public_der = private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
         response = {
             "keyPair": {
-                "privateKey": private_key.private_bytes(
-                    serialization.Encoding.PEM,
-                    serialization.PrivateFormat.PKCS8,
-                    serialization.NoEncryption(),
-                ).decode("ascii"),
-                "publicKey": private_key.public_key().public_bytes(
-                    serialization.Encoding.PEM,
-                    serialization.PublicFormat.SubjectPublicKeyInfo,
-                ).decode("ascii"),
+                # Mojang's endpoint uses these PKCS#1-looking labels around
+                # PKCS#8/SPKI DER, which strict PEM loaders reject.
+                "privateKey": "-----BEGIN RSA PRIVATE KEY-----\n"
+                + base64.b64encode(private_der).decode("ascii")
+                + "\n-----END RSA PRIVATE KEY-----\n",
+                "publicKey": "-----BEGIN RSA PUBLIC KEY-----\n"
+                + base64.b64encode(public_der).decode("ascii")
+                + "\n-----END RSA PUBLIC KEY-----\n",
             },
             "publicKeySignatureV2": "c2lnbmF0dXJl",
             "expiresAt": "2099-01-01T00:00:00Z",

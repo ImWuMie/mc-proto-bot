@@ -235,6 +235,25 @@ def _parse_iso_instant_ms(value: object, field_name: str) -> int:
     return int(instant.timestamp() * 1000)
 
 
+def _decode_pem_body(value: str, field_name: str) -> bytes:
+    """Decode PEM while ignoring Mojang's historically inaccurate labels."""
+
+    lines = value.replace("\\n", "\n").strip().splitlines()
+    encoded = "".join(
+        line.strip() for line in lines if not line.strip().startswith("-----")
+    )
+    if not encoded:
+        raise AuthenticationError(
+            f"Minecraft player certificate has an empty {field_name}"
+        )
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as error:
+        raise AuthenticationError(
+            f"Minecraft player certificate has invalid {field_name} encoding"
+        ) from error
+
+
 async def fetch_player_certificate(
     access_token: str,
     services_url: str = "https://api.minecraftservices.com",
@@ -274,18 +293,21 @@ async def fetch_player_certificate(
 
     crypto = _ensure_cryptography()
     try:
-        private_key = crypto["serialization"].load_pem_private_key(
-            private_pem.encode("ascii"), password=None
+        # The live endpoint labels these as RSA PRIVATE/PUBLIC KEY while the
+        # DER bodies use PKCS#8/SPKI. DER loaders inspect the structure instead
+        # of trusting that legacy PEM label.
+        private_key = crypto["serialization"].load_der_private_key(
+            _decode_pem_body(private_pem, "private key"), password=None
         )
-        public_key = crypto["serialization"].load_pem_public_key(
-            public_pem.encode("ascii")
+        public_key = crypto["serialization"].load_der_public_key(
+            _decode_pem_body(public_pem, "public key")
         )
         public_key_der = public_key.public_bytes(
             crypto["serialization"].Encoding.DER,
             crypto["serialization"].PublicFormat.SubjectPublicKeyInfo,
         )
         key_signature = base64.b64decode(signature_b64, validate=True)
-    except (ValueError, TypeError, UnicodeEncodeError) as error:
+    except (ValueError, TypeError) as error:
         raise AuthenticationError(
             "Minecraft returned an invalid player certificate"
         ) from error
