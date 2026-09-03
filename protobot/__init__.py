@@ -4,9 +4,11 @@ __version__ = "1.2.6"
 
 from .auth import (
     MinecraftProfile,
+    PlayerCertificate,
     authorization_code_login,
     authorization_url,
     device_code_login,
+    fetch_player_certificate,
     join_session_server,
     minecraft_sha1_digest,
     refresh_login,
@@ -152,9 +154,11 @@ __all__ = [
     "resolve_minecraft_srv",
     "minecraft_sha1_digest",
     "MinecraftProfile",
+    "PlayerCertificate",
     "authorization_code_login",
     "authorization_url",
     "device_code_login",
+    "fetch_player_certificate",
     "join_session_server",
     "log",
     "refresh_login",

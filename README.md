@@ -951,7 +951,7 @@ artifacts). Offline mode stays dependency-free in the wheel -- `[online]` and
 ## Notes and limitations
 
 - **Online & offline mode.** Offline mode has zero third-party dependencies. For online-mode servers, install `protobot[online]` (requires `cryptography`).
-- **Chat sending is unsigned.** `send_message()` works on servers that do not enforce secure chat (most plugin servers). A server with `enforce-secure-profile=true` will drop or reject the message — signing requires the account's local chat keypair, which a bot holding only an access token cannot access. Commands are unaffected: `send_command()` uses the plain command packet.
+- **Secure chat is supported for online accounts.** ProtoBot fetches the account's ephemeral player certificate, registers a fresh chat session, signs `send_message()` payloads, tracks last-seen acknowledgements, and refreshes the certificate while connected. Offline-mode connections keep the unsigned fallback. `send_command()` continues to use the plain command packet.
 - Physics prediction mirrors vanilla 26.2 defaults; servers with heavy movement anti-cheat customisation may still issue corrections.
 - `python -m compileall protobot plugins run_bot.py` is the standing sanity check.
 

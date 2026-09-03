@@ -16,6 +16,10 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from types import TracebackType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .auth import PlayerCertificate
 
 from .errors import (
     ConnectionClosed,
@@ -27,6 +31,7 @@ from .errors import (
 from .events import EventBus
 from .log import debug as log_debug
 from .log import error as log_error
+from .log import warn as log_warn
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
 from .navigation import (
     FlightPathfinder,
@@ -151,6 +156,82 @@ _CONTAINER_CLICK_TYPES = {
 _INTERACTION_HANDS = {"main_hand": 0, "mainhand": 0, "off_hand": 1, "offhand": 1}
 _CLIENTBOUND_CONFIGURATION_TRANSFER = 0x0B
 DEFAULT_MINECRAFT_PORT = 25565
+_LAST_SEEN_MESSAGE_COUNT = 20
+_CHAT_ACKNOWLEDGEMENT_THRESHOLD = 64
+
+
+@dataclass(frozen=True, slots=True)
+class _LastSeenUpdate:
+    offset: int
+    acknowledged: bytes
+    signatures: tuple[bytes, ...]
+    checksum: int
+
+
+class _LastSeenMessagesTracker:
+    """Track signed player chat using vanilla's 20-entry acknowledgement window."""
+
+    def __init__(self) -> None:
+        self._tracked: list[bytes | None] = [None] * _LAST_SEEN_MESSAGE_COUNT
+        self._tail = 0
+        self._offset = 0
+        self._last_tracked: bytes | None = None
+
+    @property
+    def offset(self) -> int:
+        return self._offset
+
+    def add_pending(self, signature: bytes, *, shown: bool = True) -> bool:
+        if len(signature) != 256:
+            raise ValueError("chat signatures must contain exactly 256 bytes")
+        signature = bytes(signature)
+        if signature == self._last_tracked:
+            return False
+        self._last_tracked = signature
+        self._tracked[self._tail] = signature if shown else None
+        self._tail = (self._tail + 1) % _LAST_SEEN_MESSAGE_COUNT
+        self._offset += 1
+        return True
+
+    def take_offset(self) -> int:
+        offset = self._offset
+        self._offset = 0
+        return offset
+
+    @staticmethod
+    def _signature_hash(signature: bytes) -> int:
+        """Match Java ``Arrays.hashCode(byte[])`` including signed bytes."""
+
+        result = 1
+        for value in signature:
+            signed_value = value if value < 128 else value - 256
+            result = (31 * result + signed_value) & 0xFFFFFFFF
+        return result - (1 << 32) if result >= 1 << 31 else result
+
+    def generate_update(self) -> _LastSeenUpdate:
+        """Generate vanilla's offset, bit set, signed entries, and checksum."""
+
+        offset = self.take_offset()
+        acknowledged = 0
+        signatures: list[bytes] = []
+        for bit in range(_LAST_SEEN_MESSAGE_COUNT):
+            index = (self._tail + bit) % _LAST_SEEN_MESSAGE_COUNT
+            signature = self._tracked[index]
+            if signature is not None:
+                acknowledged |= 1 << bit
+                signatures.append(signature)
+        checksum = 1
+        for signature in signatures:
+            checksum = (31 * checksum + self._signature_hash(signature)) & 0xFFFFFFFF
+        checksum &= 0xFF
+        if checksum == 0:
+            checksum = 1
+        return _LastSeenUpdate(
+            offset,
+            acknowledged.to_bytes(3, "little"),
+            tuple(signatures),
+            checksum,
+        )
 
 
 def _parse_chat_text(text: str) -> object:
@@ -282,6 +363,7 @@ class Bot:
         access_token: str | None = None,
         profile_uuid: str | uuid.UUID | None = None,
         session_server: str = "https://sessionserver.mojang.com",
+        minecraft_services: str = "https://api.minecraftservices.com",
         loader: Loader | str = Loader.VANILLA,
         mods: Mapping[str, str] | None = None,
         loader_protocol: int = 0,
@@ -333,7 +415,20 @@ class Bot:
             self.uuid = offline_uuid(username)
         self.access_token = access_token
         self.session_server = session_server
+        if not isinstance(minecraft_services, str) or not minecraft_services:
+            raise ValueError("minecraft_services must be a non-empty string")
+        self.minecraft_services = minecraft_services
         self.session_id: uuid.UUID | None = None
+        self._authenticated_connection = False
+        self._chat_certificate: PlayerCertificate | None = None
+        self._chat_certificate_error: str | None = None
+        self._chat_session_id: uuid.UUID | None = None
+        self._chat_message_index = 0
+        self._chat_send_lock = asyncio.Lock()
+        self._chat_certificate_refresh_task: (
+            asyncio.Task[PlayerCertificate] | None
+        ) = None
+        self._next_chat_certificate_refresh_ms = 0
         self.connect_timeout = connect_timeout
         if isinstance(velocity_secret, str):
             velocity_secret = velocity_secret.encode("utf-8")
@@ -431,6 +526,7 @@ class Bot:
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
+        self._last_seen_messages = _LastSeenMessagesTracker()
 
     async def __aenter__(self) -> Bot:
         if self.state is ConnectionState.DISCONNECTED and not self.closed.is_set():
@@ -464,6 +560,83 @@ class Bot:
             self.handshake_host or self.host,
         )
         self._reader_task = asyncio.create_task(self._read_loop(), name=f"protobot:{self.username}")
+
+    async def _prepare_chat_certificate(self) -> None:
+        if not self.access_token:
+            return
+        from .auth import fetch_player_certificate
+
+        try:
+            self._chat_certificate = await fetch_player_certificate(
+                self.access_token, self.minecraft_services
+            )
+            self._chat_certificate_error = None
+            self._next_chat_certificate_refresh_ms = (
+                self._chat_certificate.refreshed_after_ms
+            )
+        except Exception as error:
+            self._chat_certificate = None
+            self._chat_certificate_error = str(error)
+            self._next_chat_certificate_refresh_ms = int(time.time() * 1000) + 60_000
+            log_warn(f"[chat] secure-chat certificate unavailable: {error}")
+
+    async def _activate_chat_session(self) -> None:
+        certificate = self._chat_certificate
+        if certificate is None or not self._authenticated_connection:
+            return
+        if certificate.expired:
+            self._chat_certificate = None
+            self._chat_certificate_error = "the Mojang player certificate has expired"
+            return
+        async with self._chat_send_lock:
+            session_id = uuid.uuid4()
+            payload = (
+                PacketWriter()
+                .write_uuid(session_id)
+                .write_long(certificate.expires_at_ms)
+                .write_bytes(certificate.public_key_der)
+                .write_bytes(certificate.key_signature)
+                .to_bytes()
+            )
+            await self.send_raw(
+                self.version.packets.serverbound_chat_session_update, payload
+            )
+            self._chat_session_id = session_id
+            self._chat_message_index = 0
+
+    async def _refresh_chat_certificate_if_due(self) -> None:
+        task = self._chat_certificate_refresh_task
+        if (
+            task is None
+            and self._authenticated_connection
+            and self.access_token is not None
+            and int(time.time() * 1000) >= self._next_chat_certificate_refresh_ms
+        ):
+            from .auth import fetch_player_certificate
+
+            task = asyncio.create_task(
+                fetch_player_certificate(
+                    self.access_token or "", self.minecraft_services
+                ),
+                name=f"protobot-chat-certificate:{self.username}",
+            )
+            self._chat_certificate_refresh_task = task
+            self._next_chat_certificate_refresh_ms = int(time.time() * 1000) + 3_600_000
+        if task is None or not task.done():
+            return
+
+        self._chat_certificate_refresh_task = None
+        try:
+            self._chat_certificate = task.result()
+            self._chat_certificate_error = None
+            self._next_chat_certificate_refresh_ms = (
+                self._chat_certificate.refreshed_after_ms
+            )
+            await self._activate_chat_session()
+        except Exception as error:
+            self._chat_certificate_error = str(error)
+            self._next_chat_certificate_refresh_ms = int(time.time() * 1000) + 60_000
+            log_warn(f"[chat] secure-chat certificate refresh failed: {error}")
 
     async def _resolve_endpoint(self, host: str, port: int) -> tuple[str, int]:
         """Apply Minecraft SRV redirection the way a vanilla client does.
@@ -568,6 +741,14 @@ class Bot:
             closed_task.cancel()
 
     async def close(self) -> None:
+        certificate_task, self._chat_certificate_refresh_task = (
+            self._chat_certificate_refresh_task,
+            None,
+        )
+        if certificate_task is not None:
+            certificate_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await certificate_task
         task, self._reader_task = self._reader_task, None
         current = asyncio.current_task()
         if task is not None and task is not current:
@@ -1011,14 +1192,10 @@ class Bot:
         await self.send_raw(self.version.packets.serverbound_chat_command, payload)
 
     async def send_message(self, message: str) -> None:
-        """Send a chat message without a signature.
+        """Send chat, signing it when an online account certificate is active.
 
-        The packet carries the timestamp, salt, an empty last-seen offset and
-        acknowledgement bitset, and a zero checksum, but no signature. Servers
-        that do not enforce secure chat (most plugin servers) accept this;
-        a server with ``enforce-secure-profile=true`` will drop or reject it,
-        since signing requires the account's local chat keypair, which a bot
-        holding only an access token does not have.
+        Online bots automatically fetch and register a Mojang player
+        certificate. Offline bots retain the protocol's unsigned fallback.
         """
 
         self._require_play()
@@ -1028,22 +1205,80 @@ class Bot:
             raise ValueError("message must not be empty")
         if len(message) > 256:
             raise ValueError("message exceeds the 256 character chat limit")
-        payload = (
-            PacketWriter()
-            .write_string(message, max_chars=256)
-            .write_long(int(time.time() * 1000))
-            .write_unsigned_long(secrets.randbits(64))
-            .write_bool(False)  # no message signature
-            .write_varint(0)  # last-seen offset: nothing acknowledged
-            .write_raw(b"\x00\x00\x00")  # fixed 20-bit acknowledged bitset
-            .write_unsigned_byte(0)  # last-seen checksum (unused without a session)
-            .to_bytes()
-        )
-        await self.send_raw(self.version.packets.serverbound_chat, payload)
+        async with self._chat_send_lock:
+            if self.session.enforces_secure_chat and (
+                self._chat_certificate is None or self._chat_session_id is None
+            ):
+                detail = self._chat_certificate_error or (
+                    "no online account token was supplied"
+                )
+                raise OnlineModeRequired(
+                    "the server enforces secure chat, but no Mojang player "
+                    f"certificate is active: {detail}"
+                )
+            update = self._last_seen_messages.generate_update()
+            timestamp_ms = int(time.time() * 1000)
+            salt = secrets.randbits(64)
+            signature = self._sign_chat_message(
+                message,
+                timestamp_ms=timestamp_ms,
+                salt=salt,
+                last_seen=update.signatures,
+            )
+            writer = (
+                PacketWriter()
+                .write_string(message, max_chars=256)
+                .write_long(timestamp_ms)
+                .write_unsigned_long(salt)
+                .write_bool(signature is not None)
+            )
+            if signature is not None:
+                writer.write_raw(signature)
+            payload = (
+                writer.write_varint(update.offset)
+                .write_raw(update.acknowledged)
+                .write_unsigned_byte(update.checksum)
+                .to_bytes()
+            )
+            await self.send_raw(self.version.packets.serverbound_chat, payload)
         # Let plugins see what this bot said, whoever sent it: the server
         # echoes chat back as ``player_chat``, and without this a plugin
         # cannot tell its own words (or another plugin's) from a stranger's.
         await self.events.emit("chat_sent", message)
+
+    def _sign_chat_message(
+        self,
+        message: str,
+        *,
+        timestamp_ms: int,
+        salt: int,
+        last_seen: tuple[bytes, ...],
+    ) -> bytes | None:
+        certificate = self._chat_certificate
+        session_id = self._chat_session_id
+        if certificate is None or session_id is None:
+            return None
+        if certificate.expired:
+            raise OnlineModeRequired("the Mojang player certificate has expired")
+
+        content = message.encode("utf-8")
+        signed = (
+            PacketWriter()
+            .write_int(1)
+            .write_uuid(self.uuid)
+            .write_uuid(session_id)
+            .write_int(self._chat_message_index)
+            .write_unsigned_long(salt)
+            .write_long(timestamp_ms // 1000)
+            .write_int(len(content))
+            .write_raw(content)
+            .write_int(len(last_seen))
+        )
+        for signature in last_seen:
+            signed.write_raw(signature)
+        signature = certificate.sign(signed.to_bytes())
+        self._chat_message_index += 1
+        return signature
 
     def load_block_state_report(self, report: str) -> int:
         """Install a Mojang ``blocks.json`` report for collision prediction."""
@@ -1525,6 +1760,7 @@ class Bot:
         """
 
         self._require_play()
+        await self._refresh_chat_certificate_if_due()
         controls = controls or MovementInput()
         if (
             self._navigation_claimed
@@ -2576,6 +2812,8 @@ class Bot:
         self.player = PlayerState()
         self.session = WorldSessionState()
         self.session_id = None
+        self._chat_session_id = None
+        self._chat_message_index = 0
         self.entities.clear()
         self.players.clear()
         self._roster_synced = False
@@ -2595,6 +2833,7 @@ class Bot:
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
+        self._last_seen_messages = _LastSeenMessagesTracker()
 
     async def _handle_transfer(self, payload: bytes) -> None:
         reader = PacketReader(payload)
@@ -2615,6 +2854,7 @@ class Bot:
         await self._connection.close()
         self._connection = ProtocolConnection(max_packet_size=max_packet_size)
         self._reset_server_state()
+        self._authenticated_connection = False
         self.state = ConnectionState.DISCONNECTED
         self.host = host
         self.port = port
@@ -2739,6 +2979,7 @@ class Bot:
 
         shared_secret = secrets.token_bytes(16)
 
+        authenticated = False
         if should_authenticate:
             if not self.access_token:
                 raise OnlineModeRequired(
@@ -2748,12 +2989,16 @@ class Bot:
             from .auth import join_session_server, minecraft_sha1_digest
 
             server_hash = minecraft_sha1_digest(server_id, shared_secret, public_key)
-            await join_session_server(
-                self.access_token,
-                self.uuid,
-                server_hash,
-                self.session_server,
+            await asyncio.gather(
+                join_session_server(
+                    self.access_token,
+                    self.uuid,
+                    server_hash,
+                    self.session_server,
+                ),
+                self._prepare_chat_certificate(),
             )
+            authenticated = True
 
         from .auth import rsa_encrypt
 
@@ -2768,6 +3013,7 @@ class Bot:
         )
         await self.send_raw(0x01, response)
         self._connection.enable_encryption(shared_secret)
+        self._authenticated_connection = authenticated
 
     def _velocity_forwarding_payload(self) -> bytes:
         """Build Velocity modern-forwarding v1 data and its HMAC signature."""
@@ -2806,6 +3052,7 @@ class Bot:
         elif packet.packet_id == 0x03:
             await self.send_raw(0x03)
             self.state = ConnectionState.PLAY
+            await self._activate_chat_session()
             self.ready.set()
             await self.events.emit("ready", self)
         elif packet.packet_id == 0x04:
@@ -2934,6 +3181,7 @@ class Bot:
         elif packet.packet_id == ids.clientbound_set_player_inventory:
             await self._handle_set_player_inventory(packet.payload)
         elif packet.packet_id == ids.clientbound_start_configuration:
+            await self._send_chat_acknowledgement()
             await self.send_raw(ids.serverbound_configuration_acknowledged)
             self._reset_server_state()
             self.state = ConnectionState.CONFIGURATION
@@ -3022,8 +3270,7 @@ class Bot:
         reader.read_varint()  # global index
         sender = reader.read_uuid()
         reader.read_varint()  # per-sender index
-        if reader.read_bool():
-            reader.read_raw(256)  # message signature
+        signature = reader.read_raw(256) if reader.read_bool() else None
         content = reader.read_string(max_chars=256)
         reader.read_long()  # timestamp
         reader.read_long()  # salt
@@ -3048,8 +3295,29 @@ class Bot:
         target_name = read_anonymous_nbt(reader) if reader.read_bool() else None
         reader.expect_end()
 
+        # Mark the message before dispatch. A plugin commonly replies from its
+        # event handler, and that reply must already acknowledge this message.
+        if signature is not None:
+            added = self._last_seen_messages.add_pending(signature)
+            if (
+                added
+                and self._last_seen_messages.offset
+                > _CHAT_ACKNOWLEDGEMENT_THRESHOLD
+            ):
+                await self._send_chat_acknowledgement()
         message = unsigned_content if unsigned_content is not None else _parse_chat_text(content)
         await self.events.emit("player_chat", sender, name, message, chat_type_id, target_name)
+
+    async def _send_chat_acknowledgement(self) -> None:
+        """Flush pending signed-chat offsets without sending a chat message."""
+
+        async with self._chat_send_lock:
+            offset = self._last_seen_messages.take_offset()
+            if offset:
+                await self.send_raw(
+                    self.version.packets.serverbound_chat_ack,
+                    PacketWriter().write_varint(offset).to_bytes(),
+                )
 
     async def _handle_profileless_chat(self, payload: bytes) -> None:
         """Decode a profileless (unsigned) chat message and emit ``player_chat``.
@@ -4453,6 +4721,7 @@ async def connect(
     access_token: str | None = None,
     profile_uuid: str | uuid.UUID | None = None,
     session_server: str = "https://sessionserver.mojang.com",
+    minecraft_services: str = "https://api.minecraftservices.com",
     loader: Loader | str = Loader.VANILLA,
     mods: Mapping[str, str] | None = None,
     loader_protocol: int = 0,
@@ -4490,6 +4759,7 @@ async def connect(
         access_token=access_token,
         profile_uuid=profile_uuid,
         session_server=session_server,
+        minecraft_services=minecraft_services,
         loader=loader,
         mods=mods,
         loader_protocol=loader_protocol,

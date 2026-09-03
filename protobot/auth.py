@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import time
@@ -11,7 +12,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from .errors import AuthenticationError, OnlineModeRequired
@@ -44,7 +46,6 @@ _XBL_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
 _XSTS_AUTH_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
 _MC_LOGIN_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
 _MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
-
 # Refresh a little early so a token cannot expire mid-handshake.
 _TOKEN_EXPIRY_MARGIN = 60.0
 
@@ -92,7 +93,8 @@ def _ensure_cryptography():
         }
     except ImportError as error:
         raise OnlineModeRequired(
-            "Online mode encryption requires the 'cryptography' package. "
+            "Online-mode encryption and secure chat require the 'cryptography' "
+            "package. "
             "Install it via: pip install protobot[online] (or pip install cryptography)"
         ) from error
 
@@ -102,6 +104,34 @@ def rsa_encrypt(der_public_key: bytes, data: bytes) -> bytes:
     crypto = _ensure_cryptography()
     public_key = crypto["serialization"].load_der_public_key(der_public_key)
     return public_key.encrypt(data, crypto["padding"].PKCS1v15())
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerCertificate:
+    """Mojang-certified RSA key pair used by secure player chat."""
+
+    private_key: Any = field(repr=False)
+    public_key_der: bytes
+    key_signature: bytes
+    expires_at_ms: int
+    refreshed_after_ms: int
+
+    @property
+    def expired(self) -> bool:
+        return int(time.time() * 1000) >= self.expires_at_ms
+
+    def sign(self, payload: bytes) -> bytes:
+        crypto = _ensure_cryptography()
+        signature = self.private_key.sign(
+            payload,
+            crypto["padding"].PKCS1v15(),
+            crypto["hashes"].SHA256(),
+        )
+        if len(signature) != 256:
+            raise AuthenticationError(
+                "Minecraft chat certificates must use a 2048-bit RSA key"
+            )
+        return signature
 
 
 class StreamCipher:
@@ -164,6 +194,125 @@ def _http_post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str
         return error.code, parsed
     except urllib.error.URLError as error:
         raise AuthenticationError(f"HTTP request to {url} failed: {error}") from error
+
+
+def _http_post_empty_json(
+    url: str, *, headers: dict[str, str] | None = None
+) -> tuple[int, dict[str, Any] | str]:
+    req_headers = {"Content-Type": "application/json", "User-Agent": "ProtoBot"}
+    if headers:
+        req_headers.update(headers)
+    request = urllib.request.Request(url, data=b"", headers=req_headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=15.0) as response:
+            raw = response.read()
+            if not raw:
+                return response.status, {}
+            try:
+                return response.status, json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return response.status, raw.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        raw = error.read()
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except Exception:
+            parsed = raw.decode("utf-8", errors="replace")
+        return error.code, parsed
+    except urllib.error.URLError as error:
+        raise AuthenticationError(f"HTTP request to {url} failed: {error}") from error
+
+
+def _parse_iso_instant_ms(value: object, field_name: str) -> int:
+    if not isinstance(value, str):
+        raise AuthenticationError(f"player certificate has no valid {field_name}")
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise AuthenticationError(
+            f"player certificate contains invalid {field_name}: {value!r}"
+        ) from error
+    return int(instant.timestamp() * 1000)
+
+
+async def fetch_player_certificate(
+    access_token: str,
+    services_url: str = "https://api.minecraftservices.com",
+) -> PlayerCertificate:
+    """Fetch the account's ephemeral Mojang-certified secure-chat key pair."""
+
+    if not access_token:
+        raise ValueError("access_token must not be empty")
+    endpoint = f"{services_url.rstrip('/')}/player/certificates"
+    status, response = await asyncio.to_thread(
+        _http_post_empty_json,
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+    )
+    if status != 200 or not isinstance(response, dict):
+        detail = (
+            response.get("errorMessage", response.get("error", response))
+            if isinstance(response, dict)
+            else response
+        )
+        raise AuthenticationError(
+            f"Minecraft player certificate request failed (HTTP {status}): {detail}"
+        )
+
+    key_pair = response.get("keyPair")
+    if not isinstance(key_pair, dict):
+        raise AuthenticationError("Minecraft player certificate has no keyPair")
+    private_pem = key_pair.get("privateKey")
+    public_pem = key_pair.get("publicKey")
+    signature_b64 = response.get("publicKeySignatureV2")
+    certificate_fields = (private_pem, public_pem, signature_b64)
+    if not all(isinstance(value, str) and value for value in certificate_fields):
+        raise AuthenticationError("Minecraft player certificate is incomplete")
+
+    crypto = _ensure_cryptography()
+    try:
+        private_key = crypto["serialization"].load_pem_private_key(
+            private_pem.encode("ascii"), password=None
+        )
+        public_key = crypto["serialization"].load_pem_public_key(
+            public_pem.encode("ascii")
+        )
+        public_key_der = public_key.public_bytes(
+            crypto["serialization"].Encoding.DER,
+            crypto["serialization"].PublicFormat.SubjectPublicKeyInfo,
+        )
+        key_signature = base64.b64decode(signature_b64, validate=True)
+    except (ValueError, TypeError, UnicodeEncodeError) as error:
+        raise AuthenticationError(
+            "Minecraft returned an invalid player certificate"
+        ) from error
+
+    private_public_der = private_key.public_key().public_bytes(
+        crypto["serialization"].Encoding.DER,
+        crypto["serialization"].PublicFormat.SubjectPublicKeyInfo,
+    )
+    if private_public_der != public_key_der:
+        raise AuthenticationError(
+            "Minecraft player certificate key pair does not match"
+        )
+    if len(public_key_der) > 512 or not 0 < len(key_signature) <= 4096:
+        raise AuthenticationError("Minecraft player certificate exceeds protocol limits")
+
+    certificate = PlayerCertificate(
+        private_key=private_key,
+        public_key_der=public_key_der,
+        key_signature=key_signature,
+        expires_at_ms=_parse_iso_instant_ms(response.get("expiresAt"), "expiresAt"),
+        refreshed_after_ms=_parse_iso_instant_ms(
+            response.get("refreshedAfter"), "refreshedAfter"
+        ),
+    )
+    if certificate.expired:
+        raise AuthenticationError("Minecraft returned an expired player certificate")
+    return certificate
 
 
 def _http_get_json(url: str, *, headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any] | str]:
