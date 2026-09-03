@@ -95,16 +95,17 @@ local physics continues to track real landings. It is enabled by default when
 discovered and can be toggled in `plugins/no_fall.json` or with the LLM tools
 `no_fall_status` and `no_fall_set`.
 
-Flight navigation replans in rolling segments by default, so longer targets
-are planned against the latest position and chunk snapshot while the bot is
-moving. The next segment is precomputed in the background by default; set
-`lookahead=False` to disable that prefetch. Use `realtime=False` for one
-full-route plan, or adjust the segment length with `planning_horizon` (default
-8 blocks).
+Flight navigation is path-quality-first by default. It plans the complete
+route on a worker thread before moving, scores turns, vertical changes, and
+VClip actions in addition to geometric distance, and compresses clear flight
+segments into continuous steering operations. Use `realtime=True` to opt into
+rolling planning when navigating beyond the loaded world; its segment length
+is controlled by `planning_horizon` (default 32 blocks), and `lookahead=False`
+disables background prefetch.
 
-`timeout` bounds the complete flight operation, including waiting for initial
-world data, planning, lookahead, and movement. Each individual background A*
-plan is bounded by `planning_timeout` (default: `min(timeout, 10)` seconds).
+`timeout` bounds the complete flight operation (default 180 seconds), including
+waiting for initial world data, planning, lookahead, and movement. Each individual background A*
+plan is bounded by `planning_timeout` (default: `min(timeout, 30)` seconds).
 When either deadline expires, `NavigationTimeout` is raised and any pending
 lookahead task is cancelled and retrieved before flight state is cleaned up.
 

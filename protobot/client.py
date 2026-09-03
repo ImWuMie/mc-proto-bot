@@ -2165,6 +2165,7 @@ class Bot:
         vclip_down_limit: float | None,
         allow_diagonal: bool = True,
         allow_blocked_target: bool = True,
+        allow_unknown_chunks: bool = False,
     ) -> NavigationPath:
         self._require_play()
         if not self.world_ready.is_set():
@@ -2179,12 +2180,9 @@ class Bot:
             raise ValueError("flight start coordinates must be finite")
         return await asyncio.to_thread(
             _find_flight_path,
-            # A rolling flight planner must be able to cross the edge of the
-            # currently received chunk set.  Treating every unknown chunk as
-            # a full cube deadlocks the client: it cannot move far enough for
-            # the server to send the next chunk.  Any authoritative correction
-            # is consumed by the next rolling plan.
-            self._navigation_world_snapshot(missing_chunks_solid=False),
+            self._navigation_world_snapshot(
+                missing_chunks_solid=not allow_unknown_chunks
+            ),
             start_position,
             Vec3(x, y, z),
             player_width=state.width,
@@ -2230,8 +2228,8 @@ class Bot:
         z: float,
         *,
         tolerance: float = 0.35,
-        timeout: float = 60.0,
-        max_nodes: int = 8192,
+        timeout: float = 180.0,
+        max_nodes: int = 65536,
         replans: int = 2,
         tick_interval: float = 0.05,
         bypass_permission: bool = True,
@@ -2243,8 +2241,8 @@ class Bot:
         anti_kick_interval: float | None = None,
         allow_diagonal: bool = True,
         force_flight: bool = True,
-        realtime: bool = True,
-        planning_horizon: float = 8.0,
+        realtime: bool = False,
+        planning_horizon: float = 32.0,
         lookahead: bool = True,
         planning_timeout: float | None = None,
     ) -> PhysicsState:
@@ -2255,8 +2253,11 @@ class Bot:
         server abilities snapshot and never sends a serverbound abilities
         packet.  The ``force_flight`` argument is retained for API
         compatibility and is ignored.  ``timeout`` is the overall operation
-        deadline; ``planning_timeout`` bounds each individual worker-thread
-        path plan and defaults to ``min(timeout, 10.0)``.
+        deadline.  By default the worker plans the complete route before
+        movement starts, prioritizing route continuity over startup latency.
+        ``realtime=True`` opts into rolling planning for worlds where the full
+        route is not loaded.  ``planning_timeout`` bounds each worker-thread
+        plan and defaults to ``min(timeout, 30.0)``.
         """
 
         self._require_play()
@@ -2271,6 +2272,12 @@ class Bot:
             raise ValueError("flight tolerance and timeout must be positive")
         if tick_interval < 0.0 or replans < 0:
             raise ValueError("flight tick interval and replans must be non-negative")
+        if (
+            not isinstance(max_nodes, int)
+            or isinstance(max_nodes, bool)
+            or max_nodes <= 0
+        ):
+            raise ValueError("max_nodes must be a positive integer")
         if not isinstance(bypass_permission, bool):
             raise TypeError("bypass_permission must be a bool")
         if not isinstance(keep_flying, bool):
@@ -2287,7 +2294,7 @@ class Bot:
         if not math.isfinite(planning_horizon) or planning_horizon <= 0.0:
             raise ValueError("planning_horizon must be a finite positive number")
         if planning_timeout is None:
-            planning_timeout = min(timeout, 10.0)
+            planning_timeout = min(timeout, 30.0)
         if not math.isfinite(planning_timeout) or planning_timeout <= 0.0:
             raise ValueError("planning_timeout must be a finite positive number")
         if anti_kick is not None and not isinstance(anti_kick, bool):
@@ -2404,6 +2411,10 @@ class Bot:
                                 allow_blocked_target=not (
                                     realtime and remaining_distance > planning_horizon
                                 ),
+                                # Complete plans must never pretend unknown
+                                # chunks are clear.  Rolling plans may advance
+                                # into them so the server can stream more data.
+                                allow_unknown_chunks=realtime,
                             ),
                             name="protobot-flight-plan",
                         )
@@ -2444,7 +2455,8 @@ class Bot:
                     operation_log += ",..."
                 log_debug(
                     f"[flight] planned {len(path.waypoints)} node(s): "
-                    f"{operation_log or 'none'}"
+                    f"{operation_log or 'none'} "
+                    f"cost={path.cost:.3f} explored={path.explored_nodes}"
                 )
 
                 # Start the next rolling plan before executing this one.  The
@@ -2474,6 +2486,7 @@ class Bot:
                                 vclip_down_limit=vclip_down_limit,
                                 allow_diagonal=allow_diagonal,
                                 allow_blocked_target=False,
+                                allow_unknown_chunks=True,
                             ),
                             name="protobot-flight-lookahead",
                         )

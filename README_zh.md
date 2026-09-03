@@ -91,13 +91,15 @@ asyncio.run(main())
 可编辑 `plugins/no_fall.json`，也可以使用 LLM 工具 `no_fall_status` 和
 `no_fall_set` 切换。
 
-飞行寻路默认使用滚动即时规划：每次只规划前方一小段，飞行过程中根据最新坐标
-和区块快照继续规划。传入 `realtime=False` 可改为一次性规划整条路径，或用
-`planning_horizon` 调整分段长度（默认 8 格）。
+飞行寻路默认以路径质量优先：先在工作线程计算完整路线，再开始移动。路线成本除
+几何距离外还会考虑转弯、升降和 VClip，并把无遮挡的飞行段压缩为连续操作。
+只有需要飞出已加载世界时才建议显式传入 `realtime=True` 使用滚动规划；此时可用
+`planning_horizon` 调整分段长度（默认 32 格），用 `lookahead=False` 关闭后台预取。
 
-`timeout` 限制整次飞行操作的总时间，包括等待区块、寻路、预取下一段和移动；
+`timeout` 限制整次飞行操作的总时间（默认 180 秒），包括等待区块、寻路、
+预取下一段和移动；
 `planning_timeout` 限制每次后台 A* 规划的最长等待时间（默认
-`min(timeout, 10)` 秒）。任一超时都会抛出 `NavigationTimeout`，并清理未完成的
+`min(timeout, 30)` 秒）。任一超时都会抛出 `NavigationTimeout`，并清理未完成的
 预取任务和本地飞行状态。
 
 客户端只拥有服务器当前下发的区块。`get_status` 会显示已加载区块边界和估算半径；

@@ -448,6 +448,9 @@ class _FlightNode:
     z: int
     clip_depth: int = 0
     clip_direction: int = 0
+    move_x: int = 0
+    move_y: int = 0
+    move_z: int = 0
 
     @property
     def position(self) -> Vec3:
@@ -483,6 +486,13 @@ class FlightPathfinder:
         if (dx, dy, dz) != (0, 0, 0)
         and sum(value != 0 for value in (dx, dy, dz)) >= 2
     )
+    # Route cost deliberately favors stable, executable paths over the route
+    # that merely has the shortest geometric length.  The Euclidean heuristic
+    # remains admissible because every quality term is non-negative.
+    _TURN_PENALTY = 0.45
+    _VERTICAL_PENALTY = 0.08
+    _VCLIP_ENTRY_PENALTY = 2.0
+    _VCLIP_DISTANCE_PENALTY = 0.25
 
     def __init__(
         self,
@@ -559,6 +569,20 @@ class FlightPathfinder:
                         search_target = candidate
                         break
 
+        # Open-air flight should not enter the half-block A* grid at all.  In
+        # addition to being exact, this turns long visible routes into one
+        # continuous steering operation instead of thousands of grid nodes.
+        if (
+            not start_obstructed
+            and target_clear
+            and self._segment_clear(start, target)
+        ):
+            distance = math.sqrt((target - start).length_squared)
+            waypoints = () if distance <= 1.0e-8 else (
+                PathWaypoint(target, operation="fly"),
+            )
+            return NavigationPath(waypoints, 0, distance)
+
         start_node = _FlightNode(
             math.floor(start.x),
             round(start.y * 2.0),
@@ -579,19 +603,30 @@ class FlightPathfinder:
             abs(start_node.z - goal_z),
         ) + margin
         serial = itertools.count()
-        frontier: list[tuple[float, int, tuple[int, int, int, int, int]]] = []
+        frontier: list[
+            tuple[float, float, int, tuple[int, int, int, int, int]]
+        ] = []
         nodes = {start_node.key: start_node}
         costs = {start_node.key: 0.0}
-        parents: dict[tuple[int, int, int, int, int], tuple[int, int, int, int, int]] = {}
+        parents: dict[
+            tuple[int, int, int, int, int], tuple[int, int, int, int, int]
+        ] = {}
         operations: dict[tuple[int, int, int, int, int], str] = {}
         heapq.heappush(
             frontier,
-            (self._heuristic(start_node, search_target), next(serial), start_node.key),
+            (
+                self._heuristic(start_node, search_target),
+                0.0,
+                next(serial),
+                start_node.key,
+            ),
         )
         explored = 0
         goal: _FlightNode | None = None
         while frontier and explored < max_nodes:
-            _, _, current_key = heapq.heappop(frontier)
+            _, queued_cost, _, current_key = heapq.heappop(frontier)
+            if queued_cost > costs.get(current_key, math.inf) + 1.0e-9:
+                continue
             current = nodes[current_key]
             explored += 1
             if (
@@ -650,6 +685,9 @@ class FlightPathfinder:
                     current.z + dz,
                     clip_depth,
                     clip_direction,
+                    dx,
+                    dy,
+                    dz,
                 )
                 if (
                     abs(neighbor.x - start_node.x) > max_delta
@@ -663,7 +701,14 @@ class FlightPathfinder:
                 if not self._segment_clear(current.position, position) and not vclip_edge:
                     continue
                 key = neighbor.key
-                new_cost = costs[current_key] + math.sqrt(dx * dx + (dy * 0.5) ** 2 + dz * dz)
+                edge_cost = self._flight_edge_cost(
+                    current,
+                    dx,
+                    dy,
+                    dz,
+                    vclip_edge=vclip_edge,
+                )
+                new_cost = costs[current_key] + edge_cost
                 if new_cost >= costs.get(key, math.inf):
                     continue
                 costs[key] = new_cost
@@ -674,6 +719,7 @@ class FlightPathfinder:
                     frontier,
                     (
                         new_cost + self._heuristic(neighbor, search_target),
+                        new_cost,
                         next(serial),
                         key,
                     ),
@@ -720,6 +766,42 @@ class FlightPathfinder:
         )
 
     plan = find_path
+
+    @classmethod
+    def _flight_edge_cost(
+        cls,
+        current: _FlightNode,
+        dx: int,
+        dy: int,
+        dz: int,
+        *,
+        vclip_edge: bool,
+    ) -> float:
+        """Score an edge by distance plus route-quality penalties."""
+
+        vertical = dy * 0.5
+        distance = math.sqrt(dx * dx + vertical * vertical + dz * dz)
+        cost = distance + abs(vertical) * cls._VERTICAL_PENALTY
+        previous = (current.move_x, current.move_y, current.move_z)
+        if previous != (0, 0, 0):
+            previous_vertical = previous[1] * 0.5
+            previous_length = math.sqrt(
+                previous[0] * previous[0]
+                + previous_vertical * previous_vertical
+                + previous[2] * previous[2]
+            )
+            cosine = (
+                previous[0] * dx
+                + previous_vertical * vertical
+                + previous[2] * dz
+            ) / (previous_length * distance)
+            cosine = max(-1.0, min(1.0, cosine))
+            cost += cls._TURN_PENALTY * (1.0 - cosine)
+        if vclip_edge:
+            cost += abs(vertical) * cls._VCLIP_DISTANCE_PENALTY
+            if current.clip_depth == 0:
+                cost += cls._VCLIP_ENTRY_PENALTY
+        return cost
 
     def _body_clear(self, x: float, y: float, z: float) -> bool:
         half = self.player_width / 2.0

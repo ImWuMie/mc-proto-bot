@@ -124,6 +124,7 @@ How your world reaches you:
 - If the configured bot session is stopped or disconnected, an admin may use `start_bot` to start its configured server connection; wait for `session_ready`/a connected status before movement tools.
 - Movement coordinates: a three-number XYZ target (for example `1895 71 -4169` or `1895 71-4169`) must use `fly_to` or `fly_to_bypass_permission`; `navigate_to` is only for a two-number X/Z ground target. When the target is far away or the bot is directly below it, prefer the flight tool.
 - `fly_to` always force-flies with the original flight physics and `MovementInput` while suppressing abilities packets. Never check `allow_flying`, never wait for permission, and never replace an XYZ flight request with `navigate_to`. It stops forced flight after arrival unless `keep_flying=true`; use `stop_flying` to end a deliberate hover.
+- Flight navigation is path-quality-first by default: let `fly_to` finish its full background plan before moving. Do not enable `realtime` unless the caller explicitly asks for rolling/immediate planning or the full route repeatedly cannot be planned from loaded world data.
 - Save anything worth remembering long-term with save_memory (append a note) or write_memory (rewrite the file): server rules, who people are, agreements, plans of your own. Memory is per server and comes back to you in every later conversation.
 - Keep promises on a todo list rather than in your head: todo_add when you take something on, todo_done when it is finished, todo_list to check. Open items are shown to you in every conversation, so anything you agreed to do survives a restart.
 - When this conversation nears its token limit the older part is compacted into a summary; a "[Auto-compacted history]" message marks one.
@@ -378,7 +379,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "fly_to",
-            "description": "Force-fly through 3D space to X/Y/Z using original flight physics and MovementInput without checking permission or sending abilities packets; optional vertical VClip can pass through walls within configured limits",
+            "description": "Plan a high-quality complete 3D route, then force-fly it continuously using original flight physics and MovementInput without checking permission or sending abilities packets; optional vertical VClip can pass through walls within configured limits",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -387,11 +388,15 @@ TOOLS: list[dict] = [
                     "z": {"type": "number", "description": "Target Z coordinate"},
                     "timeout": {
                         "type": "number",
-                        "description": "Total flight navigation timeout in seconds; default 60",
+                        "description": "Total flight navigation timeout in seconds; default 180",
                     },
                     "planning_timeout": {
                         "type": "number",
-                        "description": "Maximum time for each background path plan in seconds; default 10",
+                        "description": "Maximum time for each background path plan in seconds; default 30",
+                    },
+                    "max_nodes": {
+                        "type": "integer",
+                        "description": "Maximum A* search nodes; default 65536 for path quality",
                     },
                     "vclip": {
                         "type": "boolean",
@@ -431,11 +436,11 @@ TOOLS: list[dict] = [
                     },
                     "realtime": {
                         "type": "boolean",
-                        "description": "Replan in short rolling segments while moving; default true",
+                        "description": "Use rolling planning instead of a complete route; default false",
                     },
                     "planning_horizon": {
                         "type": "number",
-                        "description": "Rolling flight planning distance in blocks; default 8",
+                        "description": "Rolling flight planning distance in blocks; default 32 when realtime is enabled",
                     },
                     "lookahead": {
                         "type": "boolean",
@@ -457,8 +462,9 @@ TOOLS: list[dict] = [
                     "x": {"type": "number", "description": "Target X coordinate"},
                     "y": {"type": "number", "description": "Target Y coordinate"},
                     "z": {"type": "number", "description": "Target Z coordinate"},
-                    "timeout": {"type": "number", "description": "Total flight navigation timeout in seconds; default 60"},
-                    "planning_timeout": {"type": "number", "description": "Maximum time for each path plan in seconds; default 10"},
+                    "timeout": {"type": "number", "description": "Total flight navigation timeout in seconds; default 180"},
+                    "planning_timeout": {"type": "number", "description": "Maximum time for each path plan in seconds; default 30"},
+                    "max_nodes": {"type": "integer", "description": "Maximum A* search nodes; default 65536"},
                     "vclip": {
                         "type": "boolean",
                         "description": "Enable vertical-only wall clipping; default uses local navigation.vclip config",
@@ -479,8 +485,8 @@ TOOLS: list[dict] = [
                     "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
                     "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
                     "force_flight": {"type": "boolean", "description": "Legacy option ignored; force flight is always enabled"},
-                    "realtime": {"type": "boolean", "description": "Replan while moving; default true"},
-                    "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 8"},
+                    "realtime": {"type": "boolean", "description": "Use rolling planning instead of a complete route; default false"},
+                    "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 32"},
                     "lookahead": {"type": "boolean", "description": "Precompute the next segment while moving; default true"},
                 },
                 "required": ["x", "y", "z"],
@@ -499,8 +505,9 @@ TOOLS: list[dict] = [
                         "type": "string",
                         "description": "Three coordinates in X Y Z order; spaces, commas, and signed values are accepted",
                     },
-                    "timeout": {"type": "number", "description": "Total flight navigation timeout in seconds; default 60"},
-                    "planning_timeout": {"type": "number", "description": "Maximum time for each path plan in seconds; default 10"},
+                    "timeout": {"type": "number", "description": "Total flight navigation timeout in seconds; default 180"},
+                    "planning_timeout": {"type": "number", "description": "Maximum time for each path plan in seconds; default 30"},
+                    "max_nodes": {"type": "integer", "description": "Maximum A* search nodes; default 65536"},
                     "vclip": {
                         "type": "boolean",
                         "description": "Enable vertical-only wall clipping; default uses local navigation.vclip config",
@@ -512,8 +519,8 @@ TOOLS: list[dict] = [
                     "anti_kick_interval": {"type": "number", "description": "Anti-kick heartbeat interval in seconds"},
                     "allow_diagonal": {"type": "boolean", "description": "Allow diagonal flight path segments; default true"},
                     "force_flight": {"type": "boolean", "description": "Legacy option ignored; force flight is always enabled"},
-                    "realtime": {"type": "boolean", "description": "Replan while moving; default true"},
-                    "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 8"},
+                    "realtime": {"type": "boolean", "description": "Use rolling planning instead of a complete route; default false"},
+                    "planning_horizon": {"type": "number", "description": "Rolling planning distance in blocks; default 32"},
                     "lookahead": {"type": "boolean", "description": "Precompute the next segment while moving; default true"},
                 },
                 "required": ["coordinates"],
@@ -2146,9 +2153,9 @@ class LLMAgent(Plugin):
                 )
                 if tool_name in {"fly_to", "fly_to_bypass_permission", "fly_to_xyz"}:
                     try:
-                        requested_timeout = float(arguments.get("timeout", 60.0))
+                        requested_timeout = float(arguments.get("timeout", 180.0))
                     except (TypeError, ValueError):
-                        requested_timeout = 60.0
+                        requested_timeout = 180.0
                     if math.isfinite(requested_timeout) and requested_timeout > 0.0:
                         # The movement tool owns its own deadline.  Keep the
                         # dispatcher alive slightly longer so a valid custom
@@ -2906,8 +2913,8 @@ class LLMAgent(Plugin):
                 return "A flight navigation to this target is already in progress"
         kwargs: dict[str, object] = {"force_flight": True, "bypass_permission": True}
         try:
-            timeout = float(args.get("timeout", 60.0))
-            planning_timeout = float(args.get("planning_timeout", 10.0))
+            timeout = float(args.get("timeout", 180.0))
+            planning_timeout = float(args.get("planning_timeout", 30.0))
         except (TypeError, ValueError):
             return "Arguments timeout and planning_timeout must be numbers"
         if (
@@ -2918,6 +2925,19 @@ class LLMAgent(Plugin):
         ):
             return "Arguments timeout and planning_timeout must be positive"
         kwargs["planning_timeout"] = planning_timeout
+        if "max_nodes" in args and args["max_nodes"] is not None:
+            raw_max_nodes = args["max_nodes"]
+            try:
+                max_nodes = int(raw_max_nodes)
+            except (TypeError, ValueError):
+                return "Argument max_nodes must be a positive integer"
+            if (
+                isinstance(raw_max_nodes, bool)
+                or max_nodes <= 0
+                or max_nodes != raw_max_nodes
+            ):
+                return "Argument max_nodes must be a positive integer"
+            kwargs["max_nodes"] = max_nodes
         keep_flying = bool(args.get("keep_flying", False))
         if "vclip" in args:
             kwargs["vclip"] = bool(args["vclip"])
@@ -2960,7 +2980,7 @@ class LLMAgent(Plugin):
             detail = str(error).strip()
             if detail:
                 return f"Flight navigation timed out: {detail}"
-            return "Failed to reach the flight target within 50 s; check get_status"
+            return f"Failed to reach the flight target within {timeout:g} s; check get_status"
         except Exception as error:
             return f"Flight navigation failed: {error}"
         finally:
@@ -3001,7 +3021,14 @@ class LLMAgent(Plugin):
             forwarded["allow_diagonal"] = args["allow_diagonal"]
         if "force_flight" in args:
             forwarded["force_flight"] = args["force_flight"]
-        for key in ("realtime", "planning_horizon", "lookahead", "timeout", "planning_timeout"):
+        for key in (
+            "realtime",
+            "planning_horizon",
+            "lookahead",
+            "timeout",
+            "planning_timeout",
+            "max_nodes",
+        ):
             if key in args:
                 forwarded[key] = args[key]
         return await self._tool_fly_to(forwarded)
