@@ -689,7 +689,9 @@ class World:
         # Protocol 775 is shared by three releases whose registry tables must
         # never be guessed from the protocol number alone. Bot supplies its
         # exact release; standalone World users can do the same explicitly.
-        bundled_release = release or {774: "1.21.11", 776: "26.2"}.get(protocol)
+        bundled_release = release or {774: "1.21.11", 776: "26.2", 777: "26.3"}.get(
+            protocol
+        )
         if block_states is None and bundled_release is not None:
             builtin = (
                 Path(__file__).with_name("data")

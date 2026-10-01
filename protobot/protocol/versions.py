@@ -87,6 +87,30 @@ class PlayPacketIds:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfigurationPacketIds:
+    """Clientbound configuration IDs that moved between releases.
+
+    The remaining configuration IDs (cookie request, custom payload,
+    disconnect, finish, keep-alive, ping, registry data) and every
+    serverbound configuration ID are identical in all supported releases.
+    """
+
+    clientbound_transfer: int = 0x0B
+    clientbound_select_known_packs: int = 0x0E
+    clientbound_code_of_conduct: int = 0x13
+
+
+#: 1.21.11 through 26.2 share this numbering. 26.3 inserts ``post_effects``
+#: at 0x0A, shifting every later clientbound configuration packet by one.
+_CONFIGURATION_774_776 = ConfigurationPacketIds()
+_CONFIGURATION_777 = ConfigurationPacketIds(
+    clientbound_transfer=0x0C,
+    clientbound_select_known_packs=0x0F,
+    clientbound_code_of_conduct=0x14,
+)
+
+
+@dataclass(frozen=True, slots=True)
 class VersionSpec:
     name: str
     protocol: int
@@ -97,6 +121,10 @@ class VersionSpec:
     boat_entities: tuple[int, ...] = ()
     chest_boat_entities: tuple[int, ...] = ()
     raft_entities: tuple[int, ...] = ()
+    #: Entity-type registry IDs with bespoke collision/metadata handling.
+    happy_ghast_entity: int = 58
+    shulker_entity: int = 112
+    configuration: ConfigurationPacketIds = _CONFIGURATION_774_776
 
     def item_identifier(self, registry_id: int) -> str | None:
         """Resolve an item ID using this exact release's static registry."""
@@ -154,6 +182,44 @@ _HARD_COLLISION_ENTITIES = (
     *((entity_id, 1.375, 0.5625) for entity_id in _BOAT_ENTITIES),
     (58, 4.0, 4.0),
     (112, 1.0, 1.0),
+)
+
+# 26.3 adds the cushion (33) and poplar boats (106/107) to the entity-type
+# registry, which shifts every later ID (happy_ghast 58 -> 59, shulker
+# 112 -> 115, spruce boats 125/126 -> 128/129, ...).
+_BOAT_ENTITIES_777 = (
+    0,
+    1,
+    8,
+    9,
+    12,
+    13,
+    23,
+    24,
+    34,
+    35,
+    75,
+    76,
+    82,
+    83,
+    90,
+    91,
+    95,
+    96,
+    106,
+    107,
+    128,
+    129,
+)
+_CHEST_BOAT_ENTITIES_777 = (1, 8, 13, 24, 35, 76, 83, 91, 96, 107, 129)
+_RAFT_ENTITIES_777 = (8, 9)
+_HAPPY_GHAST_ENTITY_777 = 59
+_SHULKER_ENTITY_777 = 115
+
+_HARD_COLLISION_ENTITIES_777 = (
+    *((entity_id, 1.375, 0.5625) for entity_id in _BOAT_ENTITIES_777),
+    (_HAPPY_GHAST_ENTITY_777, 4.0, 4.0),
+    (_SHULKER_ENTITY_777, 1.0, 1.0),
 )
 
 
@@ -296,6 +362,82 @@ _PLAY_775_776 = PlayPacketIds(
     serverbound_use_item=0x43,
 )
 
+# Generated from the 26.3 server's ``reports/packets.json``.  New clientbound
+# packets (add_transient_block, swing_animation, ...) shift most IDs after
+# 0x25.  Serverbound, ``punch`` is inserted at 0x2E and ``swing`` (formerly
+# the last ID) is removed, so only IDs 0x2E..0x3E move -- of which ProtoBot
+# uses set_carried_item.
+_PLAY_777 = PlayPacketIds(
+    clientbound_sound=0x77,
+    clientbound_set_health=0x6A,
+    clientbound_player_combat_kill=0x45,
+    serverbound_client_command=0x0C,
+    clientbound_player_info_remove=0x46,
+    clientbound_player_info_update=0x47,
+    clientbound_add_entity=0x01,
+    clientbound_custom_payload=0x18,
+    clientbound_container_close=0x11,
+    clientbound_container_set_content=0x12,
+    clientbound_container_set_slot=0x14,
+    clientbound_open_screen=0x3C,
+    clientbound_profileless_chat=0x21,
+    clientbound_remove_mob_effect=0x4F,
+    clientbound_remove_entities=0x4E,
+    clientbound_block_update=0x08,
+    clientbound_chunk_batch_finished=0x0B,
+    clientbound_chunk_data=0x2E,
+    clientbound_disconnect=0x20,
+    clientbound_game_event=0x27,
+    clientbound_keep_alive=0x2D,
+    clientbound_login=0x32,
+    clientbound_move_vehicle=0x3A,
+    clientbound_move_entity_pos=0x36,
+    clientbound_move_entity_pos_rot=0x37,
+    clientbound_move_entity_rot=0x39,
+    clientbound_ping=0x3E,
+    clientbound_player_abilities=0x41,
+    clientbound_player_chat=0x42,
+    clientbound_position=0x49,
+    clientbound_respawn=0x54,
+    clientbound_section_blocks_update=0x56,
+    clientbound_set_entity_data=0x65,
+    clientbound_set_entity_motion=0x67,
+    clientbound_set_equipment=0x68,
+    clientbound_set_passengers=0x6D,
+    clientbound_set_player_inventory=0x6E,
+    clientbound_start_configuration=0x78,
+    clientbound_system_chat=0x7C,
+    clientbound_teleport_entity=0x80,
+    clientbound_transfer=0x84,
+    clientbound_unload_chunk=0x26,
+    clientbound_update_attributes=0x86,
+    clientbound_update_mob_effect=0x87,
+    serverbound_chat_ack=0x06,
+    serverbound_chunk_batch_received=0x0B,
+    serverbound_chat=0x09,
+    serverbound_chat_command=0x07,
+    serverbound_chat_session_update=0x0A,
+    serverbound_custom_payload=0x16,
+    serverbound_container_click=0x12,
+    serverbound_container_close=0x13,
+    serverbound_configuration_acknowledged=0x10,
+    serverbound_keep_alive=0x1C,
+    serverbound_move_vehicle=0x22,
+    serverbound_paddle_boat=0x23,
+    serverbound_position=0x1E,
+    serverbound_position_look=0x1F,
+    serverbound_look=0x20,
+    serverbound_flying=0x21,
+    serverbound_player_abilities=0x28,
+    serverbound_player_command=0x2A,
+    serverbound_player_input=0x2B,
+    serverbound_player_loaded=0x2C,
+    serverbound_pong=0x2D,
+    serverbound_set_carried_item=0x36,
+    serverbound_tick_end=0x0D,
+    serverbound_use_item=0x43,
+)
+
 SUPPORTED_VERSIONS: dict[str, VersionSpec] = {
     "1.21.11": VersionSpec(
         "1.21.11",
@@ -351,6 +493,20 @@ SUPPORTED_VERSIONS: dict[str, VersionSpec] = {
         _BOAT_ENTITIES,
         _CHEST_BOAT_ENTITIES,
         _RAFT_ENTITIES,
+    ),
+    "26.3": VersionSpec(
+        "26.3",
+        777,
+        5023,
+        _PLAY_777,
+        ((974, "minecraft:elytra"), (1071, "minecraft:leather_boots")),
+        _HARD_COLLISION_ENTITIES_777,
+        _BOAT_ENTITIES_777,
+        _CHEST_BOAT_ENTITIES_777,
+        _RAFT_ENTITIES_777,
+        happy_ghast_entity=_HAPPY_GHAST_ENTITY_777,
+        shulker_entity=_SHULKER_ENTITY_777,
+        configuration=_CONFIGURATION_777,
     ),
 }
 
