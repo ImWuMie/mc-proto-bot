@@ -123,6 +123,8 @@ _MOVEMENT_ATTRIBUTES = {
     774: _MOVEMENT_ATTRIBUTES_774,
     775: _MOVEMENT_ATTRIBUTES_775_776,
     776: _MOVEMENT_ATTRIBUTES_775_776,
+    # 26.3 leaves the attribute registry untouched.
+    777: _MOVEMENT_ATTRIBUTES_775_776,
 }
 
 _MOVEMENT_ATTRIBUTE_RANGES = {
@@ -154,7 +156,6 @@ _CONTAINER_CLICK_TYPES = {
     "pickup_all": 6,
 }
 _INTERACTION_HANDS = {"main_hand": 0, "mainhand": 0, "off_hand": 1, "offhand": 1}
-_CLIENTBOUND_CONFIGURATION_TRANSFER = 0x0B
 DEFAULT_MINECRAFT_PORT = 25565
 _LAST_SEEN_MESSAGE_COUNT = 20
 _CHAT_ACKNOWLEDGEMENT_THRESHOLD = 64
@@ -523,6 +524,9 @@ class Bot:
         self._navigation_vclip_active = False
         self._navigation_vertical_active = False
         self._position_update_serial = 0
+        # 26.3 kicks a client that sends two position-bearing movement packets
+        # without a client_tick_end in between; see _send_position_packet.
+        self._position_sent_this_tick = False
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -1309,7 +1313,7 @@ class Bot:
             .write_unsigned_byte(self._movement_flags())
             .to_bytes()
         )
-        await self.send_raw(self.version.packets.serverbound_position, payload)
+        await self._send_position_packet(self.version.packets.serverbound_position, payload)
 
     async def send_position_and_rotation(
         self,
@@ -1341,7 +1345,25 @@ class Bot:
             .write_unsigned_byte(self._movement_flags())
             .to_bytes()
         )
-        await self.send_raw(self.version.packets.serverbound_position_look, payload)
+        await self._send_position_packet(
+            self.version.packets.serverbound_position_look, payload
+        )
+
+    async def _send_position_packet(self, packet_id: int, payload: bytes) -> None:
+        """Send a position-bearing movement packet within the tick budget.
+
+        Protocol 777 (26.3) disconnects a client whose second Pos/PosRot packet
+        arrives before ``client_tick_end``.  Callers that drive movement
+        manually (several ``send_position`` calls without ``end_tick``) would
+        trip that check, so close the current tick first, exactly like a
+        vanilla client that moves once per tick.  Older protocols are
+        unaffected.
+        """
+
+        if self.version.protocol >= 777 and self._position_sent_this_tick:
+            await self.end_tick()
+        await self.send_raw(packet_id, payload)
+        self._position_sent_this_tick = True
 
     async def send_vehicle_position_and_rotation(
         self,
@@ -1674,6 +1696,7 @@ class Bot:
     async def end_tick(self) -> None:
         self._require_play()
         await self.send_raw(self.version.packets.serverbound_tick_end)
+        self._position_sent_this_tick = False
 
     async def send_look(
         self,
@@ -1703,7 +1726,9 @@ class Bot:
                 .write_unsigned_byte(self._movement_flags())
                 .to_bytes()
             )
-            await self.send_raw(self.version.packets.serverbound_position_look, payload)
+            await self._send_position_packet(
+                self.version.packets.serverbound_position_look, payload
+            )
             return
         payload = (
             PacketWriter()
@@ -1736,7 +1761,9 @@ class Bot:
                 .write_unsigned_byte(self._movement_flags())
                 .to_bytes()
             )
-            await self.send_raw(self.version.packets.serverbound_position, payload)
+            await self._send_position_packet(
+                self.version.packets.serverbound_position, payload
+            )
             return
         await self.send_raw(
             self.version.packets.serverbound_flying,
@@ -2843,6 +2870,7 @@ class Bot:
         self._navigation_vertical_active = False
         self._next_anti_kick = 0.0
         self._anti_kick_last_packet_y = None
+        self._position_sent_this_tick = False
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -3046,6 +3074,8 @@ class Bot:
         return signature + body
 
     async def _handle_configuration(self, packet: RawPacket) -> None:
+        # IDs 0x00-0x07 are stable; later clientbound IDs moved in 26.3.
+        configuration = self.version.configuration
         if packet.packet_id == 0x00:
             reader = PacketReader(packet.payload)
             key = reader.read_string(max_chars=32767)
@@ -3081,11 +3111,11 @@ class Bot:
         elif packet.packet_id == 0x07:
             registry_id = self.registries.apply_packet(packet.payload)
             await self.events.emit("registry", registry_id)
-        elif packet.packet_id == 0x0E:
+        elif packet.packet_id == configuration.clientbound_select_known_packs:
             await self.send_raw(0x07, PacketWriter().write_varint(0).to_bytes())
-        elif packet.packet_id == 0x13:
+        elif packet.packet_id == configuration.clientbound_code_of_conduct:
             await self.send_raw(0x09)
-        elif packet.packet_id == _CLIENTBOUND_CONFIGURATION_TRANSFER:
+        elif packet.packet_id == configuration.clientbound_transfer:
             await self._handle_transfer(packet.payload)
 
     async def _handle_play(self, packet: RawPacket) -> None:
@@ -3298,11 +3328,7 @@ class Bot:
             unsigned_content = read_anonymous_nbt(reader)
         filter_mask = reader.read_varint()
         if filter_mask == 2:
-            mask_count = reader.read_varint()
-            if mask_count < 0 or mask_count > 1024:
-                raise ProtocolError(f"invalid chat filter mask length {mask_count}")
-            for _ in range(mask_count):
-                reader.read_long()
+            self._skip_bit_set(reader)
         chat_type_id = self._read_chat_type_holder(reader)
         name = read_anonymous_nbt(reader)
         target_name = read_anonymous_nbt(reader) if reader.read_bool() else None
@@ -3403,7 +3429,7 @@ class Bot:
             read_anonymous_nbt(reader)
 
         for _ in range(4):
-            self._skip_long_array(reader, limit=1024)
+            self._skip_bit_set(reader)
         for _ in range(2):
             light_count = reader.read_varint()
             if not 0 <= light_count <= 1024:
@@ -3606,7 +3632,7 @@ class Bot:
 
     def _tick_remote_entity_metadata(self) -> None:
         for entity in self.entities.values():
-            if entity.type_id != 112:
+            if entity.type_id != self.version.shulker_entity:
                 continue
             previous = entity.shulker_current_peek
             entity.shulker_previous_peek = previous
@@ -3685,7 +3711,7 @@ class Bot:
                 and local_root == self._root_vehicle_id(entity.entity_id)
             ):
                 continue
-            if entity.type_id == 58:
+            if entity.type_id == self.version.happy_ghast_entity:
                 if not self._happy_ghast_collides_with_player(entity):
                     continue
                 half_width = width / 2.0
@@ -3697,7 +3723,7 @@ class Bot:
                     entity.y + height,
                     entity.z + half_width,
                 )
-            elif entity.type_id == 112:
+            elif entity.type_id == self.version.shulker_entity:
                 health = self._metadata_value(entity, 9, 30.0)
                 if not isinstance(health, (float, int)) or health <= 0.0:
                     continue
@@ -3767,20 +3793,25 @@ class Bot:
     ) -> None:
         reader = PacketReader(payload)
         entity_id = reader.read_varint()
-        delta = (
-            tuple(reader.read_short() / 4096.0 for _ in range(3))
-            if position
-            else None
-        )
-        angles = (
-            (
-                self._unpack_degrees(reader.read_byte()),
-                self._unpack_degrees(reader.read_byte()),
+        if self.version.protocol >= 777:
+            delta, angles, on_ground = self._read_move_entity_777(
+                reader, position=position, rotation=rotation
             )
-            if rotation
-            else None
-        )
-        on_ground = reader.read_bool()
+        else:
+            delta = (
+                tuple(reader.read_short() / 4096.0 for _ in range(3))
+                if position
+                else None
+            )
+            angles = (
+                (
+                    self._unpack_degrees(reader.read_byte()),
+                    self._unpack_degrees(reader.read_byte()),
+                )
+                if rotation
+                else None
+            )
+            on_ground = reader.read_bool()
         reader.expect_end()
 
         entity = self.entities.get(entity_id)
@@ -3793,6 +3824,56 @@ class Bot:
                 entity.yaw, entity.pitch = angles
             entity.on_ground = on_ground
         await self.events.emit("entity_move", entity_id, entity)
+
+    def _read_move_entity_777(
+        self,
+        reader: PacketReader,
+        *,
+        position: bool,
+        rotation: bool,
+    ) -> tuple[
+        tuple[float, float, float] | None, tuple[float, float] | None, bool
+    ]:
+        """Decode the 26.3 ``ClientboundMoveEntityPacket`` body after the id.
+
+        Pos/PosRot carry a ``properties`` VarInt (bit 0 = on ground, the
+        remaining bits = step count) followed by a ``VecDelta``: three shorts
+        when the step count is zero, otherwise ``step count`` entries of
+        ``(ticks VarInt, 3 shorts)`` that each chain from the previous step.
+        Rot moved its on-ground flag in front of the two angle bytes.
+        """
+
+        delta: tuple[float, float, float] | None = None
+        if position:
+            properties = reader.read_varint()
+            on_ground = bool(properties & 1)
+            step_count = (properties & 0xFFFFFFFF) >> 1
+            if step_count == 0:
+                delta = tuple(reader.read_short() / 4096.0 for _ in range(3))
+            else:
+                # Each step is at least 7 bytes (1-byte VarInt + 3 shorts);
+                # vanilla rejects counts that cannot fit the remaining data.
+                if step_count > reader.remaining // 7:
+                    raise ProtocolError(
+                        f"entity movement with {step_count} steps exceeds payload"
+                    )
+                total = [0, 0, 0]
+                for _ in range(step_count):
+                    reader.read_varint()  # Interpolation ticks for this step.
+                    for axis in range(3):
+                        total[axis] += reader.read_short()
+                delta = (total[0] / 4096.0, total[1] / 4096.0, total[2] / 4096.0)
+        else:
+            on_ground = reader.read_bool()
+        angles = (
+            (
+                self._unpack_degrees(reader.read_byte()),
+                self._unpack_degrees(reader.read_byte()),
+            )
+            if rotation
+            else None
+        )
+        return delta, angles, on_ground
 
     async def _handle_move_vehicle(self, payload: bytes) -> None:
         reader = PacketReader(payload)
@@ -3894,6 +3975,9 @@ class Bot:
             )
         if serializer_id == arm:
             return reader.read_varint()
+        if self.version.protocol >= 777 and serializer_id == 43:
+            # 26.3 appends DYE_COLOR (a VarInt id-mapped enum) after HUMANOID_ARM.
+            return reader.read_varint()
         raise ProtocolError(f"unknown entity metadata serializer {serializer_id}")
 
     async def _handle_set_entity_data(self, payload: bytes) -> None:
@@ -3931,7 +4015,7 @@ class Bot:
         if metadata is not None:
             for index, value in updates:
                 metadata[index] = value
-        if entity is not None and entity.type_id == 112:
+        if entity is not None and entity.type_id == self.version.shulker_entity:
             for index, value in updates:
                 if index == 16 and value.serializer_id == 12:
                     entity.shulker_attach_face = int(value.value)
@@ -4551,8 +4635,16 @@ class Bot:
         self.session.dimension_type_id = dimension_type_id
         self.session.dimension_name = reader.read_string(max_chars=32767)
         reader.read_long()  # Hashed seed.
-        self._set_game_mode(reader.read_byte())
-        self.session.previous_game_mode = reader.read_byte()
+        if self.version.protocol >= 777:
+            # 26.3 encodes GameType through its VarInt id mapper and the
+            # previous mode as OPTIONAL_VAR_INT; keep the historical -1
+            # sentinel for "no previous mode".
+            self._set_game_mode(reader.read_varint())
+            previous = self._read_optional_varint(reader)
+            self.session.previous_game_mode = -1 if previous is None else previous
+        else:
+            self._set_game_mode(reader.read_byte())
+            self.session.previous_game_mode = reader.read_byte()
         self.session.is_debug = reader.read_bool()
         self.session.is_flat = reader.read_bool()
         if reader.read_bool():
@@ -4581,6 +4673,26 @@ class Bot:
             raise ProtocolError(f"invalid long array count {count}")
         for _ in range(count):
             reader.read_long()
+
+    def _skip_bit_set(self, reader: PacketReader) -> None:
+        """Skip a vanilla ``BitSet`` (light masks, chat filter masks).
+
+        Up to 26.2 a BitSet is a VarInt long count followed by the longs.
+        26.3 switched ``ByteBufCodecs.BIT_SET`` to ``BitSet.toByteArray``
+        framed as an ordinary VarInt-prefixed byte array.
+        """
+
+        if self.version.protocol >= 777:
+            reader.read_bytes(max_length=1024 * 8)
+        else:
+            self._skip_long_array(reader, limit=1024)
+
+    @staticmethod
+    def _read_optional_varint(reader: PacketReader) -> int | None:
+        """Decode ``ByteBufCodecs.OPTIONAL_VAR_INT`` (0 = empty, else value + 1)."""
+
+        encoded = reader.read_varint()
+        return None if encoded == 0 else encoded - 1
 
     @staticmethod
     def _signed_bits(value: int, bits: int) -> int:
@@ -4660,9 +4772,16 @@ class Bot:
             self.physics_state.flying = True
             self.physics_state.velocity = Vec3(*velocity)
         self._position_update_serial += 1
+        confirm = PacketWriter().write_varint(teleport_id)
+        if self.version.protocol >= 777:
+            # 26.3 echoes the resolved position/rotation in the accept packet;
+            # the server snaps to its own target and then validates these
+            # values like a regular movement packet.
+            confirm.write_double(position[0]).write_double(position[1])
+            confirm.write_double(position[2]).write_float(yaw).write_float(pitch)
         await self.send_raw(
             self.version.packets.serverbound_teleport_confirm,
-            PacketWriter().write_varint(teleport_id).to_bytes(),
+            confirm.to_bytes(),
         )
         if not self.player.loaded:
             self.player.loaded = True
